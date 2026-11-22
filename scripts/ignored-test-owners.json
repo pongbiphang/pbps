@@ -966,6 +966,7 @@
         "exclude2448_partitions::a_parents_exclusion_is_held_to_the_engines_rules_and_a_failed_add_changes_nothing",
         "exclude2448_partitions::a_partitions_own_exclusion_is_read_declared_created_replaced_and_dropped",
         "exclude2448_partitions::a_partitions_own_exclusion_the_parents_would_take_is_refused_and_one_it_would_not_stays",
+        "exclude2448_partitions::a_cross_schema_partitions_own_exclusion_may_take_its_parents_name_on_18",
         "exclude2448_partitions::a_rebuild_keeps_a_partitions_own_exclusion_and_builds_a_parents_again_on_18",
         "exclude2448_partitions::a_rebuild_with_a_parents_exclusion_is_refused_by_name_on_16_before_any_statement",
         "exclude2448_partitions::a_rebuild_keeps_the_record_of_a_partitions_retired_own_exclusion",

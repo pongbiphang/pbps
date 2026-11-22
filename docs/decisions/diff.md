@@ -10199,7 +10199,11 @@ backed by an unattached index); only a parent's is 18's.
   written by `render_exclusions`; the published schema set's fingerprint moves, its number does not (DEC-2412.3). `validate_partition` runs the
   exclusion validation with the parent's columns lent and refuses an own that `adopts_exclusion` its
   parent's (the engine would make it a clone that goes with the parent's, as #1632 holds for a foreign
-  key), and an own named as its parent's constraint (the name is a relation of the schema). A partition
+  key), and an own check or foreign key named as its parent's, or an own exclusion named as its parent's
+  check or foreign key (a constraint name is per table, and those clones keep it); an own exclusion named
+  as its parent's exclusion is refused only in the parent's schema, as a relation name, by the whole-schema
+  check, since the parent's clone takes a generated name in the partition's schema (measured,
+  cross schema it is free, on 18.6 and 18.7; #2989). A partition
   read back whose own the engine kept apart from an equal parent's is refused by `validate` as the
   foreign-key twin is: the declaration cannot say a state the engine only reaches by order.
 - **Differ.** A standing partition's own exclusion is its own change (`SetExclusion`, and

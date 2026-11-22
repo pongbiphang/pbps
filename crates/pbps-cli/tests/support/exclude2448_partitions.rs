@@ -1490,3 +1490,77 @@ fn a_standing_own_exclusion_the_plan_replaces_is_dropped_before_the_parents_new_
     );
     settled(&d, connection);
 }
+
+/// A parent's exclusion is cloned under a name generated in the partition's own schema, so a
+/// partition in another schema may hold an own exclusion of the parent's name and another shape
+/// (measured on 18.7, DEC-2448.7, #2989). It plans, applies and re-plans empty, the parent's
+/// clone and the own side by side. In the parent's schema the same declaration is a relation-name
+/// collision, refused by name before any statement (`relation "one_per_slot" already exists`).
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_cross_schema_partitions_own_exclusion_may_take_its_parents_name_on_18() {
+    let _ = server();
+    let url = std::env::var("PBPS_TEST_PG_DB").expect("PBPS_TEST_PG_DB");
+    let own = OwnDatabase::new(&url, "exclude-own-name");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "{TREE}; CREATE SCHEMA other; ALTER TABLE app.ev ADD CONSTRAINT one_per_slot EXCLUDE \
+             USING btree (k WITH =, v WITH =)"
+        ),
+    );
+    let d = adopt("exclude-own-name", connection);
+    let path = d.dir.join("schema/app.ev.yml");
+    let tree = std::fs::read_to_string(&path).unwrap();
+    let with = |partition: &str| {
+        tree.replacen(
+            "  ev_rest: default",
+            &format!(
+                "  {partition}:\n    from: [\"10\"]\n    to: [\"20\"]\n    exclude:\n      one_per_slot:\n        \
+                 method: btree\n        keys:\n          - column: k\n            operator: \"=\"\n          \
+                 - column: v\n            operator: \"=\"\n        include: [note]\n  ev_rest: default"
+            ),
+            1,
+        )
+    };
+
+    // In the parent's schema: one relation name twice, refused by name.
+    std::fs::write(&path, with("ev_2")).unwrap();
+    let refused = d.run(&["validate"]);
+    assert_ne!(code(&refused), 0, "{}", said(&refused));
+    assert!(
+        said(&refused).contains("both named `app.one_per_slot`"),
+        "{}",
+        said(&refused)
+    );
+
+    // In another schema: planned, applied, and settled.
+    std::fs::write(&path, with("other.ev_2")).unwrap();
+    succeeds(d.run(&["validate"]));
+    d.commit();
+    let (plan, script) = plan_sql(&d, connection);
+    assert!(
+        script.contains("ADD CONSTRAINT \"one_per_slot\" EXCLUDE"),
+        "{script}"
+    );
+    succeeds(approved_apply(&d, connection, &plan, BOTH));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE contype = 'x' \
+             AND conrelid = 'other.ev_2'::regclass"
+        ),
+        2,
+        "the parent's clone beside the partition's own"
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE conname = 'one_per_slot' \
+             AND conrelid = 'other.ev_2'::regclass AND conislocal AND conparentid = 0"
+        ),
+        1
+    );
+    settled(&d, connection);
+}

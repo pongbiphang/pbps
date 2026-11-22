@@ -1890,13 +1890,18 @@ impl Dialect for Postgres {
                     .keys()
                     .map(|name| ("exclusion constraint", name)),
             );
+        // Only a parent's check or foreign key is cloned onto a partition under its own name,
+        // so only they take the name of an own constraint of the partition (a constraint name
+        // is per table: "constraint already exists", measured on 16 and 18). A parent's
+        // exclusion is cloned under a name generated in the partition's schema, so an own
+        // check or foreign key of its name is free, and an own exclusion of it is a relation
+        // of the schema, which collides only in the parent's schema, where the whole-schema
+        // relation-name check reports it (measured on 18, DEC-2448.7).
         for (own, name) in own {
             let kind = if parent.checks.contains_key(name) {
                 "check"
             } else if parent.foreign_keys.contains_key(name) {
                 "foreign key"
-            } else if parent.exclude.contains_key(name) {
-                "exclusion constraint"
             } else {
                 continue;
             };
@@ -3636,13 +3641,117 @@ mod tests {
             let said = found(&leaf("own", other));
             assert!(said.is_empty(), "{said:?}");
         }
-        // The parent's own name is taken, and a column the parent lacks is no key.
-        assert!(
-            found(&leaf("slot", exclusion(&["v", "id"])))
-                .iter()
-                .any(|m| m.contains("named as its parent's exclusion constraint"))
-        );
+        // A column the parent lacks is no key. The parent's exclusion's own name is not
+        // this check's to refuse: see the naming test below.
         assert!(!found(&leaf("own", exclusion(&["ghost"]))).is_empty());
+        let said = found(&leaf("slot", exclusion(&["v", "id"])));
+        assert!(said.is_empty(), "{said:?}");
+    }
+
+    /// A parent's check and foreign key are cloned onto a partition under their own names, so a
+    /// partition's own constraint of that name collides (a constraint name is per table:
+    /// `constraint "c" for relation "p1" already exists`, measured on 16 and 18, in the parent's
+    /// schema and another). A parent's exclusion is cloned under a name generated in the
+    /// partition's schema, so an own check or foreign key named as it is free (measured on 18),
+    /// and an own exclusion named as it, of another shape, collides only as a relation of the
+    /// parent's schema (`relation "x" already exists`), which the whole-schema relation-name
+    /// check reports and a partition in another schema escapes (#2989).
+    #[test]
+    fn a_partitions_own_constraint_named_as_its_parents_collides_only_where_the_engine_does() {
+        use pbps_model::{
+            CheckConstraint, ExclusionConstraint, ExclusionKey, ExclusionTiming, ForeignKey,
+            IndexColumn, OperatorRef, PartitionBound, PartitionOf,
+        };
+        let exclusion = |keys: &[&str]| ExclusionConstraint {
+            method: pbps_model::IndexMethod::Btree,
+            keys: keys
+                .iter()
+                .map(|k| ExclusionKey {
+                    key: IndexColumn::column(*k),
+                    operator: OperatorRef::symbol("=").unwrap(),
+                })
+                .collect(),
+            include: Vec::new(),
+            filter: None,
+            storage_parameters: Default::default(),
+            timing: ExclusionTiming::Immediate,
+        };
+        let check = CheckConstraint {
+            expression: "v > 0".into(),
+        };
+        let fk = ForeignKey {
+            columns: vec!["v".into()],
+            references_table: "app.r".parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        };
+        let mut parent = partitioned(&["id", "v"], &["id"]);
+        parent.exclude.insert("x".into(), exclusion(&["id"]));
+        parent.checks.insert("c".into(), check.clone());
+        parent.foreign_keys.insert("f".into(), fk.clone());
+        let child = || Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.t".parse().unwrap(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let name = "app.p1".parse().unwrap();
+        let found = |partition: &Table| -> Vec<String> {
+            Postgres::new()
+                .validate_partition(&name, partition, &parent)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        // Free: an own check, foreign key and exclusion of another shape under the parent's
+        // exclusion's name.
+        let mut free = child();
+        free.checks.insert("x".into(), check.clone());
+        assert!(found(&free).is_empty(), "{:?}", found(&free));
+        let mut free = child();
+        free.foreign_keys.insert("x".into(), {
+            let mut other = fk.clone();
+            other.on_delete = pbps_model::ReferentialAction::Cascade;
+            other
+        });
+        assert!(found(&free).is_empty(), "{:?}", found(&free));
+        let mut free = child();
+        free.exclude.insert("x".into(), exclusion(&["v", "id"]));
+        assert!(found(&free).is_empty(), "{:?}", found(&free));
+        // Negative: the names the parent's check and foreign key keep, for an exclusion too.
+        for (name, kind) in [("c", "check"), ("f", "foreign key")] {
+            let mut taken = child();
+            taken.exclude.insert(name.into(), exclusion(&["v", "id"]));
+            assert!(
+                found(&taken).iter().any(|m| m.contains(&format!(
+                    "exclusion constraint `{name}` is named as its parent's {kind}"
+                ))),
+                "{:?}",
+                found(&taken)
+            );
+        }
+        // The relation-name check is where the same-schema collision is reported, by name,
+        // and the other schema is free.
+        let relations = |partition_schema: &str| {
+            let mut s = Schema::default();
+            s.tables.insert(TableName::new("app", "t"), parent.clone());
+            let mut p = child();
+            p.exclude.insert("x".into(), exclusion(&["v", "id"]));
+            s.tables.insert(TableName::new(partition_schema, "p1"), p);
+            pbps_dialect::check_index_names(&s, &Postgres::new())
+        };
+        let same = relations("app");
+        assert_eq!(same.len(), 1, "{same:?}");
+        assert!(
+            same[0].contains("exclusion constraint `app.t.x`")
+                && same[0].contains("exclusion constraint `app.p1.x`")
+                && same[0].contains("both named `app.x`"),
+            "{same:?}"
+        );
+        assert!(relations("other").is_empty(), "{:?}", relations("other"));
     }
 
     /// An exclusion constraint is built on an index of its own name, a relation of its schema,
