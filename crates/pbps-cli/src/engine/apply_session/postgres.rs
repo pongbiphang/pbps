@@ -318,4 +318,122 @@ impl ApplySession for pbps_pg::Postgres {
     ) -> anyhow::Result<Vec<TableName>> {
         Ok(pbps_pg::catalog::matching_table_names(wanted, observed))
     }
+    async fn rebuild_window(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        before: pbps_diff::Side<'_>,
+        changes: &ChangeSet,
+    ) -> anyhow::Result<()> {
+        pbps_pg::rebuild::window(conn, admission, before, changes).await?;
+        Ok(())
+    }
+    async fn check_module_rebuilds(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        after: bool,
+    ) -> anyhow::Result<ConnectedCheck> {
+        plan_session::postgres::check_module_rebuilds(conn, changes, after).await
+    }
+    async fn check_domain_alterations(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        stored: &IdsFile,
+    ) -> anyhow::Result<Option<ConnectedCheck>> {
+        plan_session::postgres::check_domain_alterations(conn, changes, stored).await
+    }
+    async fn refuse_policy_dependents<D: ?Sized>(
+        &self,
+        conn: &mut Conn,
+        plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
+        ids: &IdsFile,
+        managed: &Schema,
+    ) -> anyhow::Result<()> {
+        let changes = pbps_dialect::PlanPayload::changes(plan);
+        let found = policy_dependents(conn, changes, ids, managed).await?;
+        crate::row_security::check_policy_releases(plan, ids, &found)?;
+        Ok(())
+    }
+    async fn check_module_dependency_facts(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        names: pbps_model::plan_names::PlanNames<'_>,
+        stored: &Schema,
+        stored_ids: &IdsFile,
+    ) -> anyhow::Result<()> {
+        let found = plan_session::postgres::module_dependents(conn, changes).await?;
+        refuse_unaccounted_dependents("PostgreSQL", changes, &found, names, stored, stored_ids)
+    }
+    async fn prepare_data_writes(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        changes: &ChangeSet,
+        baseline: &StateSnapshot,
+        planned_ids: &IdsFile,
+    ) -> anyhow::Result<DataWriteGuard> {
+        plan_session::postgres::prepare_data_writes(conn, admission, changes, baseline, planned_ids)
+            .await
+    }
+    async fn check_data_write(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        statement: &pbps_dialect::Statement,
+        guard: &DataWriteGuard,
+    ) -> anyhow::Result<()> {
+        let Some(write) = statement.row_write.as_ref().or(statement.rewrites.as_ref()) else {
+            return Ok(());
+        };
+        let empty = pbps_pg::data_triggers::Guard::default();
+        pbps_pg::data_triggers::check(
+            conn,
+            admission,
+            write,
+            guard.postgres.as_ref().unwrap_or(&empty),
+        )
+        .await?;
+        Ok(())
+    }
+    async fn settle_writes(&self, conn: &mut Conn) -> anyhow::Result<bool> {
+        pbps_pg::data_triggers::settle(conn).await?;
+        Ok(true)
+    }
+    async fn replay_type_pins(
+        &self,
+        conn: &mut Conn,
+        plan: &pbps_model::SavedPlan,
+        trusted: &BTreeSet<pbps_model::RoleName>,
+        within: pbps_db::TransactionOwner,
+    ) -> anyhow::Result<()> {
+        pbps_pg::type_refs::trusted_roles(conn, trusted).await?;
+        pbps_pg::type_refs::check(
+            conn,
+            within,
+            &plan.type_pins,
+            &plan.declared_type_pins,
+            &plan.changes,
+        )
+        .await?;
+        pbps_pg::class_pins::check(conn, within, &plan.provider_pins, &plan.changes).await?;
+        Ok(())
+    }
+    async fn reviewed_input_roots(
+        &self,
+        conn: &mut Conn,
+        approved: &Approved<'_>,
+        at: Check<'_>,
+    ) -> anyhow::Result<BTreeSet<i64>> {
+        plan_session::postgres::type_input_routines(
+            conn,
+            &approved.plan.type_pins,
+            &approved.project.config.trusted_roles,
+            approved.plan.pin_type_routines,
+            matches!(at.within(), pbps_db::TransactionOwner::CallersTransaction),
+        )
+        .await
+    }
 }

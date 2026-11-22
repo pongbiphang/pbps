@@ -620,7 +620,8 @@ pub(in crate::engine) async fn release_generated_inputs<S: Clone>(
         .map_err(|why| anyhow::anyhow!("generation_support (PostgreSQL): {why}"))
 }
 
-/// The PostgreSQL body of `engine::check_module_rebuilds`, which apply also calls.
+/// Called inside the transaction before the DROP and after the CREATE of a
+/// rebuilt module; apply asks it again (`ApplySession::check_module_rebuilds`).
 pub(in crate::engine) async fn check_module_rebuilds(
     conn: &mut Conn,
     changes: &ChangeSet,
@@ -651,6 +652,20 @@ pub(in crate::engine) async fn check_module_rebuilds(
             rebuilt.len()
         ),
     })
+}
+
+/// Every dependent of every module this plan drops, read inside the caller's
+/// transaction (`modules::dependents` refuses outside one).
+pub(in crate::engine) async fn module_dependents(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+) -> anyhow::Result<BTreeMap<pbps_model::ModuleId, Vec<pbps_pg::modules::Dependent>>> {
+    let mut found = BTreeMap::new();
+    for (id, kind) in crate::dependents::dropped_modules(changes) {
+        let deps = pbps_pg::modules::dependents(conn, &id, kind).await?;
+        found.insert(id, deps);
+    }
+    Ok(found)
 }
 
 /// Predicts existing table, column and key `DROP` dependencies in the caller's
@@ -784,7 +799,8 @@ pub(in crate::engine) async fn numbered_column_fills(
     Ok(fills_listed(&fills, &publications, &slots))
 }
 
-/// The PostgreSQL body of `engine::prepare_data_writes`, which apply also calls.
+/// Holds only trigger identities authenticated in the caller's open transaction;
+/// apply asks it again (`ApplySession::prepare_data_writes`).
 pub(in crate::engine) async fn prepare_data_writes(
     conn: &mut Conn,
     admission: &pbps_dialect::routines::RoutineAdmission,
@@ -1440,7 +1456,9 @@ pub(in crate::engine) fn edition_verdict() -> EditionVerdict {
     }
 }
 
-/// The PostgreSQL body of `check_domain_alterations`, which apply also calls.
+/// What a tightened domain validates, and a refusal where the engine would
+/// refuse (DEC-1635.8); apply asks it again
+/// (`ApplySession::check_domain_alterations`).
 pub(in crate::engine) async fn check_domain_alterations(
     conn: &mut Conn,
     changes: &ChangeSet,
@@ -2075,8 +2093,17 @@ impl PlanSession for pbps_pg::Postgres {
             project.config.pin_type_routines,
         )
         .await?;
+        let input_roots = type_input_routines(
+            conn,
+            &type_pins,
+            &project.config.trusted_roles,
+            project.config.pin_type_routines,
+            false,
+        )
+        .await?;
         let reviewed =
-            crate::pins::seal_selected(conn, project, target, &type_pins, &state.admission).await?;
+            crate::pins::seal_selected(conn, project, target, input_roots, &state.admission)
+                .await?;
         // Last, so that the routines are sealed as close to the gate as the
         // plan can get them. The managed set is the one `apply` rebuilds from
         // the ledger and the plan: what was recorded, and what is declared.

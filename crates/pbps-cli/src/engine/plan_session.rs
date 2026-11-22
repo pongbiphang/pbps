@@ -756,9 +756,16 @@ pub(crate) trait PlanSession: crate::emission::Engine {
             &project.config.trusted_roles,
             project.config.pin_type_routines,
         )?;
-        let reviewed =
-            crate::pins::seal_selected(conn, project, target, &[], self.site_admission(state))
-                .await?;
+        // `plan_prerequisites` refused `pin_type_routines`, and the plan names no
+        // type, so no type's input has a routine to read.
+        let reviewed = crate::pins::seal_selected(
+            conn,
+            project,
+            target,
+            BTreeSet::new(),
+            self.site_admission(state),
+        )
+        .await?;
         let routine_pins = crate::pins::seal(conn, project, target, managed).await?;
         Ok(SealedFacts {
             type_pins: Vec::new(),

@@ -368,19 +368,12 @@ pub async fn seal_selected(
     conn: &mut Conn,
     project: &Project,
     target: &Target,
-    types: &[pbps_model::TypePin],
+    mut roots: BTreeSet<i64>,
     sites: &RoutineAdmission,
 ) -> anyhow::Result<(Vec<pbps_model::TypeRoutine>, Option<RoutinePins>)> {
-    // The referenced types' routines, and those the plan's expressions reached
-    // (`sites`: conversions, requirements and copy conversions, vetted by now).
-    let mut roots = crate::engine::type_input_routines(
-        conn,
-        types,
-        &project.config.trusted_roles,
-        project.config.pin_type_routines,
-        false,
-    )
-    .await?;
+    // `roots` are the referenced types' routines, which the engine read; to
+    // them are added those the plan's expressions reached (`sites`:
+    // conversions, requirements and copy conversions, vetted by now).
     roots.extend(sites.reviewed());
     if roots.is_empty() {
         return Ok((Vec::new(), None));
