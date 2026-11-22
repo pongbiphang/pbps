@@ -52,9 +52,10 @@ pub(super) fn preflight<'v, 'p: 'v>(
                     unchecked,
                 ));
             };
-            Ok(vec![duplicate_probe(
-                &format!("(\n{rows}\n) AS r"),
-                &keys(columns.len()),
+            Ok(vec![count_probes::duplicates(
+                &COUNTS,
+                &count_probes::relation(&rows),
+                &count_probes::keys(columns.len()),
                 &format!(
                     "rows that would collide under the new unique index {name}",
                     name = name.shown(),

@@ -45,22 +45,11 @@ pub(super) fn preflight<'v, 'p: 'v>(
                     unchecked,
                 ));
             }
-            let mut sql = format!(
-                // A CHECK rejects a row only when its predicate is FALSE;
-                // UNKNOWN passes. `WHERE NOT (expr)` has exactly that
-                // behaviour, so the count matches what the engine will refuse.
-                //
-                // The expression is not rewritten for renames: rewriting SQL
-                // text by substitution is how a tool that promised never to
-                // parse SQL starts parsing it badly. Such a probe fails to run
-                // and is reported as unchecked, which is honest.
-                "SELECT COUNT(*) AS n FROM {} WHERE NOT ({})",
-                qualified(&stored)?,
-                verbatim(&constraint.expression)
-            );
+            let from = qualified(&stored)?;
             // Minus the rows it deletes: they will not be there to violate
             // anything, and counting them refused a plan that cleans up after
             // itself before tightening.
+            let mut gone = None;
             if let Some(m) = moved
                 && !m.deleted.is_empty()
             {
@@ -71,21 +60,16 @@ pub(super) fn preflight<'v, 'p: 'v>(
                         unchecked,
                     ));
                 };
-                let gone: BTreeSet<String> =
+                let literals: BTreeSet<String> =
                     m.deleted.iter().map(|k| literal(k.as_str())).collect();
-                sql.push_str(&format!(
-                    " AND {} NOT IN ({})",
-                    quote(key_column.name.raw())?,
-                    gone.into_iter().collect::<Vec<_>>().join(", ")
-                ));
+                gone = Some((quote(key_column.name.raw())?, literals));
             }
-            sql.push(';');
-            Ok(vec![Probe::new(
-                format!(
-                    "rows that violate the new check {name}",
-                    name = name.shown(),
-                ),
-                sql,
+            Ok(vec![count_probes::check_violations(
+                &COUNTS,
+                name,
+                &from,
+                &verbatim(&constraint.expression),
+                gone.as_ref().map(|(key, literals)| Gone { key, literals }),
             )])
         }
         ConstraintChange::AddUnique {
@@ -109,14 +93,15 @@ pub(super) fn preflight<'v, 'p: 'v>(
                     unchecked,
                 ));
             };
-            Ok(vec![duplicate_probe(
-                &format!("(\n{rows}\n) AS r"),
+            Ok(vec![count_probes::duplicates(
+                &COUNTS,
+                &count_probes::relation(&rows),
                 &collated_keys(names, table, &constraint.columns)?,
                 &format!(
                     "rows that would collide under the new unique constraint {name}",
                     name = name.shown(),
                 ),
-            )?])
+            )])
         }
         ConstraintChange::SetPrimaryKey {
             table,
@@ -144,20 +129,22 @@ pub(super) fn preflight<'v, 'p: 'v>(
                     unchecked,
                 ));
             };
-            let from = format!("(\n{rows}\n) AS r");
+            let from = count_probes::relation(&rows);
             let mut out = Vec::new();
             for (i, declared) in pk.columns.iter().enumerate() {
-                out.push(null_probe(
+                out.push(count_probes::nulls(
+                    &COUNTS,
                     &table.column(declared),
                     &from,
                     &format!("r.k{i}"),
-                )?);
+                ));
             }
-            out.push(duplicate_probe(
+            out.push(count_probes::duplicates(
+                &COUNTS,
                 &from,
                 &collated_keys(names, table, &pk.columns)?,
                 "rows that would collide under the new primary key",
-            )?);
+            ));
             Ok(out)
         }
         ConstraintChange::AddForeignKey {
@@ -200,12 +187,6 @@ pub(super) fn preflight<'v, 'p: 'v>(
                 ));
             };
 
-            // A row with any NULL in the key is exempt from the constraint
-            // (MATCH SIMPLE, which is what SQL Server implements), so excluding
-            // them is not leniency — it is the rule.
-            let not_null: Vec<String> = (0..constraint.columns.len())
-                .map(|i| format!("r.k{i} IS NOT NULL"))
-                .collect();
             // Compared under the collation both sides will have, where this
             // plan changes either (#1175): the rebuilt key is checked by the
             // engine under the columns' new collation, which both sides share
@@ -238,10 +219,13 @@ pub(super) fn preflight<'v, 'p: 'v>(
                     "rows with no matching parent for the new foreign key {name}",
                     name = name.shown(),
                 ),
+                // A row with any NULL in the key is exempt from the
+                // constraint (MATCH SIMPLE, which is what SQL Server
+                // implements), and `orphaned` leaves those out.
                 format!(
-                    "SELECT COUNT(*) AS n FROM (\n{child}\n) AS r\n WHERE {}\n   AND NOT EXISTS (SELECT 1 FROM (\n{parent}\n) AS q WHERE {});",
-                    not_null.join("\n   AND "),
-                    join.join(" AND ")
+                    "SELECT {} AS n {};",
+                    COUNTS.rows,
+                    count_probes::orphaned(&child, &parent, constraint.columns.len(), &join)
                 ),
             )])
         }

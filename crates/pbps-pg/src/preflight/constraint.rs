@@ -60,31 +60,11 @@ pub(super) fn preflight<'v, 'p: 'v>(
                     unchecked,
                 ));
             }
-            let mut sql = format!(
-                // A CHECK rejects a row only when its predicate is FALSE;
-                // UNKNOWN passes. `WHERE NOT (expr)` has exactly that
-                // behaviour — measured, a row holding NULL is accepted by
-                // `CHECK (v > 0)` and `WHERE NOT (v > 0)` counts none of them.
-                //
-                // The expression is not rewritten for renames: rewriting SQL
-                // text by substitution is how a tool that promised never to
-                // parse SQL starts parsing it badly. Such a probe fails to run
-                // and is reported as unchecked, which is honest.
-                //
-                // An unqualified name in it binds under the write path the
-                // emitted statement carries (DECISIONS 259) and this probe
-                // does not, because a probe is one `SELECT` and a `SET` cannot
-                // ride in one. A column reference needs no path and is the
-                // common case; an unqualified *function* or table makes the
-                // probe unchecked, and the runner says so.
-                "SELECT {} AS n FROM {} WHERE NOT ({})",
-                saturated_count("count(*)"),
-                qualified(&stored)?,
-                constraint.expression
-            );
+            let from = qualified(&stored)?;
             // Minus the rows it deletes: they will not be there to violate
             // anything, and counting them refuses a plan that cleans up after
             // itself before tightening.
+            let mut gone = None;
             if let Some(m) = moved
                 && !m.deleted.is_empty()
             {
@@ -95,24 +75,28 @@ pub(super) fn preflight<'v, 'p: 'v>(
                         unchecked,
                     ));
                 };
-                let gone: BTreeSet<String> = m
+                let literals: BTreeSet<String> = m
                     .deleted
                     .iter()
                     .map(|k| value_literal(k.as_str()))
                     .collect();
-                sql.push_str(&format!(
-                    " AND {} NOT IN ({})",
-                    quote(key_column.name.raw())?,
-                    gone.into_iter().collect::<Vec<_>>().join(", ")
-                ));
+                gone = Some((quote(key_column.name.raw())?, literals));
             }
-            sql.push(';');
-            Ok(vec![Probe::new(
-                format!(
-                    "rows that violate the new check {name}",
-                    name = name.shown(),
-                ),
-                sql,
+            // Only FALSE is counted — measured, a row holding NULL is accepted
+            // by `CHECK (v > 0)` and `WHERE NOT (v > 0)` counts none of them.
+            //
+            // An unqualified name in the predicate binds under the write path
+            // the emitted statement carries (DECISIONS 259) and this probe does
+            // not, because a probe is one `SELECT` and a `SET` cannot ride in
+            // one. A column reference needs no path and is the common case; an
+            // unqualified *function* or table makes the probe unchecked, and
+            // the runner says so.
+            Ok(vec![count_probes::check_violations(
+                &COUNTS,
+                name,
+                &from,
+                &constraint.expression,
+                gone.as_ref().map(|(key, literals)| Gone { key, literals }),
             )])
         }
         // The engine's own build checks every pair of rows under the table's
@@ -147,9 +131,10 @@ pub(super) fn preflight<'v, 'p: 'v>(
                     unchecked,
                 ));
             };
-            Ok(vec![duplicate_probe(
-                &format!("(\n{rows}\n) AS r"),
-                &keys(constraint.columns.len()),
+            Ok(vec![count_probes::duplicates(
+                &COUNTS,
+                &count_probes::relation(&rows),
+                &count_probes::keys(constraint.columns.len()),
                 &format!(
                     "rows that would collide under the new unique constraint {name}",
                     name = name.shown(),
@@ -176,7 +161,7 @@ pub(super) fn preflight<'v, 'p: 'v>(
                     unchecked,
                 ));
             };
-            let from = format!("(\n{rows}\n) AS r");
+            let from = count_probes::relation(&rows);
             // Both questions, because a primary key asks both: this engine
             // sets `NOT NULL` on every column of one itself — measured, which
             // is why a nullable primary key column is refused offline
@@ -185,11 +170,14 @@ pub(super) fn preflight<'v, 'p: 'v>(
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(i, declared)| null_probe(&table.column(declared), &from, &format!("r.k{i}")))
+                .map(|(i, declared)| {
+                    count_probes::nulls(&COUNTS, &table.column(declared), &from, &format!("r.k{i}"))
+                })
                 .collect();
-            out.push(duplicate_probe(
+            out.push(count_probes::duplicates(
+                &COUNTS,
                 &from,
-                &keys(pk.columns.len()),
+                &count_probes::keys(pk.columns.len()),
                 "rows that would collide under the new primary key",
             ));
             Ok(out)

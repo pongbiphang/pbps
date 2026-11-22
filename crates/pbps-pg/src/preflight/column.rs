@@ -89,7 +89,7 @@ pub(super) fn preflight<'v, 'p: 'v>(
         } => {
             if let Some(sources) = sources {
                 let (from, reads) = scalar_read(sources)?;
-                return Ok(vec![null_probe(column, &from, &reads)]);
+                return Ok(vec![count_probes::nulls(&COUNTS, column, &from, &reads)]);
             }
             let Some(rows) = rows_after(
                 names,
@@ -102,7 +102,12 @@ pub(super) fn preflight<'v, 'p: 'v>(
             else {
                 return Ok(skip(change, "the planned values of the column cannot be evaluated before apply", unchecked));
             };
-            Ok(vec![null_probe(column, &format!("(\n{rows}\n) AS r"), "r.k0")])
+            Ok(vec![count_probes::nulls(
+                &COUNTS,
+                column,
+                &count_probes::relation(&rows),
+                "r.k0",
+            )])
         }
         ColumnChange::AlterColumnType {
             column,
@@ -204,7 +209,7 @@ pub(super) fn preflight<'v, 'p: 'v>(
                 // says nothing about the new one.
                 if !*to_nullable {
                     out.push(
-                        null_probe(column, &table, &value).refusing_when_it_fails(),
+                        count_probes::nulls(&COUNTS, column, &table, &value).refusing_when_it_fails(),
                     );
                 }
                 return Ok(out);
@@ -213,7 +218,7 @@ pub(super) fn preflight<'v, 'p: 'v>(
             // so a type change that also tightens the column carries the other
             // change's probe too.
             if *from_nullable && !*to_nullable {
-                out.push(null_probe(column, &table, &quoted));
+                out.push(count_probes::nulls(&COUNTS, column, &table, &quoted));
             }
             let material = match change.value_change() {
                 Some(values) => crate::Postgres::new().value_change(&values, &quoted).probe,
