@@ -9,6 +9,10 @@
     "exclusions": "Exclusion constraints: their diff, the hazards a change carries, and when one adopts another.",
     "modules": "Views, routines and triggers: what changes hands and what changes.",
     "numbering": "Numbering sources (identities and sequences) and the order they release in.",
+    "partitions": "Partitions: attaching a table to a parent, detaching a partition, and the changes to a partitioned table that are refused.",
+    "partitions/attach": "Attaching a table as a partition, and a standing partition's own defaults and NOT NULLs.",
+    "partitions/detach": "Detaching a partition: what its keys, constraints and indexes are called once it stands alone.",
+    "partitions/refusals": "Changes to a partitioned table the engine does not carry through its partitions, and why they are refused.",
     "restoration": "The comparison schema a restoration is diffed against.",
     "roles": "Roles, memberships and grants.",
     "rows": "Rows: the row changes of a table and the facts about them.",
@@ -21,7 +25,11 @@
     "ForeignKeyGraph::of",
     "ForeignKeyGraph::depth",
     "ForeignKeyGraph::same_component",
-    "ForeignKeyGraph::deepest"
+    "ForeignKeyGraph::deepest",
+    "Attached.table",
+    "Attached.defaultless",
+    "Attached.displaced",
+    "Attached.released"
   ],
   "_no_reexport": ["dropped_search"],
   "error": ["DiffError", "last_column_reason"],
@@ -105,5 +113,17 @@
     "released_search",
     "diff_search",
     "search_depth"
+  ],
+  "partitions/attach": [
+    "Attached",
+    "attached",
+    "diff_partition_columns",
+    "partition_default"
+  ],
+  "partitions/detach": ["detached_names", "parent_shape_changes"],
+  "partitions/refusals": [
+    "refuse_partition_changes",
+    "refuse_parent_index",
+    "parent_column"
   ]
 }
