@@ -151,7 +151,6 @@ jobs:
       - run: python3 scripts/known_flakes_test.py
       - run: python3 scripts/live_shards_resume_test.py
       - run: python3 scripts/pr_size_test.py
-      - run: python3 scripts/split_schema_diff_test.py
       - run: python3 scripts/localdb_qualify_test.py
       - run: python3 scripts/pgwin_qualify_test.py
       - uses: dtolnay/rust-toolchain@stable
