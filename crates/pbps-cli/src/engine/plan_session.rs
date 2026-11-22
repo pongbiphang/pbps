@@ -321,6 +321,21 @@ pub(crate) trait PlanSession: crate::emission::Engine {
         at: &CatalogNames,
     ) -> Result<Spellings, RowsError>;
 
+    /// The planning dialect, carrying what the connection says of the server
+    /// that the dialect's pure steps depend on. Required: an engine whose
+    /// dialect depends on the server's version must read it, and one that was
+    /// never asked would plan for a server it never looked at.
+    async fn planning_dialect(&self, conn: &mut Conn) -> anyhow::Result<Self>;
+
+    /// Every securable each user-defined role owns, which the engine will not
+    /// drop the role over. Required: an engine whose roles are not this tool's
+    /// to drop refuses by name, and an empty answer from one never asked would
+    /// read as "owns nothing".
+    async fn role_owned_securables(
+        &self,
+        conn: &mut Conn,
+    ) -> anyhow::Result<BTreeMap<pbps_model::RoleName, Vec<String>>>;
+
     /// How the database spells each declared schema name (DECISIONS 142).
     /// Required, for the same reason as [`Self::misspelt`].
     async fn schema_spellings(

@@ -25,6 +25,7 @@
 //! out, and a DEFAULT partition holding rows of a partition not created yet,
 //! are warnings. A plan reads no data (SPEC 7.2), so they are `doctor`'s.
 
+use crate::engine::ApplySession as _;
 use pbps_config::Project;
 use pbps_db::Conn;
 #[cfg(all(test, unix))]
@@ -1027,7 +1028,12 @@ async fn examine(
     // the declarations are compared as this database reads them back. Unread,
     // it is not "no default": the keys fall back to the over-demand too.
     let surviving = match crate::engine::latest(&mut conn).await {
-        Ok(Some(entry)) => match crate::engine::database_collation(&mut conn).await {
+        Ok(Some(entry)) => match {
+            let selected = crate::engine::apply_session::selected(conn.driver());
+            pbps_cli::with_plan_dialect!(&selected, |session| {
+                session.baseline_collation(&mut conn).await
+            })
+        } {
             Ok(collation) => surviving_keys(declared, &entry, collation.as_deref()),
             Err(_) => None,
         },

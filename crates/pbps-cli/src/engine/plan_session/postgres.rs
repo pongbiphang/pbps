@@ -1581,6 +1581,22 @@ impl PlanSession for pbps_pg::Postgres {
         pbps_pg::catalog::schema_spellings(conn, names).await
     }
 
+    /// Preserve the concrete selected engine while observing the same capability.
+    async fn planning_dialect(&self, conn: &mut Conn) -> anyhow::Result<Self> {
+        Ok(crate::emission::Engine::with_planning_version(
+            self,
+            pbps_pg::roles::server_version_num(conn).await?,
+        ))
+    }
+
+    async fn role_owned_securables(
+        &self,
+        _conn: &mut Conn,
+    ) -> anyhow::Result<BTreeMap<pbps_model::RoleName, Vec<String>>> {
+        // A PostgreSQL role is the cluster's, so a plan for it drops none.
+        Err(roles_are_the_clusters("reading what the roles own"))
+    }
+
     /// PostgreSQL declares no column collation: `validate` refuses the field
     /// there, so there is nothing to ask the server.
     async fn refuse_unknown_collations(
@@ -1976,7 +1992,7 @@ impl PlanSession for pbps_pg::Postgres {
         names: &pbps_model::plan_names::PlanNames<'_>,
         on_note: &mut dyn FnMut(String),
     ) -> anyhow::Result<()> {
-        vet_drop_requirements(conn, &state.admission, names).await?;
+        vet_drop_requirements(self, conn, &state.admission, names).await?;
         // A conversion is judged at apply, before its first evaluation
         // (DEC-2331.1). Here it only tells which routines the review admits, so
         // the plan can show and pin them; a refusal waits for apply, which

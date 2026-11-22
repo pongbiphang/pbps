@@ -1,5 +1,6 @@
 //! Recording is connected: unsafe predicates are refused before the ids write.
 use super::*;
+use crate::engine::ApplySession as _;
 
 #[derive(clap::Args)]
 pub(super) struct Args {
@@ -91,7 +92,12 @@ pub(super) fn record(
                         )
                     })?;
                 let admission = crate::pins::admission(project);
-                engine::vet_drop_requirement(&mut conn, &admission, table, predicate).await?;
+                let selected = engine::apply_session::selected(conn.driver());
+                pbps_cli::with_plan_dialect!(&selected, |session| {
+                    session
+                        .requirement(&mut conn, &admission, table, predicate)
+                        .await?
+                });
                 return Ok(Some(table_uid));
             }
             Ok::<_, anyhow::Error>(None)

@@ -358,7 +358,7 @@ pub(super) async fn bootstrap_async(
         if let Some(target) = target {
             loaded.schema = Box::pin(async {
                 let mut conn = db::connect(target).await?;
-                dialect = crate::engine::planning_dialect_for(&mut conn, &dialect).await?;
+                dialect = dialect.planning_dialect(&mut conn).await?;
                 bootstrap_type_pins(
                     &dialect,
                     &mut conn,
@@ -369,11 +369,11 @@ pub(super) async fn bootstrap_async(
                 .await?;
                 let mut unasked = Vec::new();
                 let refused = refuse_misspelt(
+                    &dialect,
                     &mut conn,
                     &loaded.schema,
                     &Default::default(),
                     &mut unasked,
-                    false,
                 )
                 .await;
                 // Printed before the refusal, beside it, as the plan prints them.
@@ -579,7 +579,7 @@ pub(super) async fn bootstrap_async(
             crate::engine::lock(&mut conn, operator).await?;
             let mut transaction_attempted = false;
             let result = async {
-                refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
+                refuse_wrongly_spelt_schemas(&dialect, &mut conn, &loaded.schema).await?;
 
                 // The empty-target check is protected by the same lock as the
                 // build. Checking before it would let two bootstraps both observe
@@ -604,10 +604,7 @@ pub(super) async fn bootstrap_async(
                 // Unsupported grants are outside role.grants, so an apparently
                 // empty role is not proof that the database is empty (110).
                 refuse_unexpressible(&existing.scoped, &target.label, "bootstrap again")?;
-                crate::engine::refuse_missing_cluster_roles(
-                    conn.driver(),
-                    &existing.scoped.missing_roles,
-                )?;
+                dialect.refuse_missing_cluster_roles(&existing.scoped.missing_roles)?;
                 // This command builds what it grants on, so the role running it
                 // owns every object the declarations name. A grant to that role
                 // is the impossible line a connected plan is refused for, and
@@ -716,7 +713,7 @@ pub(super) async fn bootstrap_async(
                     dialect.as_ref(),
                     "bootstrap",
                 )?;
-                crate::engine::refuse_missing_cluster_roles(conn.driver(), &built.missing_roles)?;
+                dialect.refuse_missing_cluster_roles(&built.missing_roles)?;
                 // And it can take one back. `ddl_command_end` fires on `GRANT`
                 // and on `REVOKE` (measured), so a trigger already in the
                 // database can reverse what this build just settled about
