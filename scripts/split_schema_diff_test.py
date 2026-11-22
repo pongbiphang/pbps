@@ -464,6 +464,23 @@ class Nested(Tree):
             self.apply()
         self.assertIn("fn stray", self.module("group").read_text())
 
+    def test_a_group_file_with_a_line_the_script_did_not_write_is_not_overwritten(self) -> None:
+        mine = "//! The group.\n\npub(super) mod one;\n#[cfg(test)]\nmod tests;\n"
+        self.module("group").write_text(mine)
+        with self.assertRaisesRegex(ssd.SplitError, "group.rs.*did not write.*cfg"):
+            self.apply()
+        self.assertEqual(self.module("group").read_text(), mine)
+
+    def test_a_visibility_of_another_depth_in_a_nested_part_is_refused(self) -> None:
+        self.apply()
+        for other in ("pub(super)", "pub(in super)", "pub(in super::super::super)"):
+            with self.subTest(other):
+                text = self.module("group/one").read_text()
+                self.edit(self.module("group/one"), f"{WIDE} fn alpha", f"{other} fn alpha")
+                self.assertRefused(self.check(), "differs from the base", "alpha")
+                self.module("group/one").write_text(text)
+        self.assertEqual(self.check(), [])
+
     def test_a_pub_super_in_a_nested_item_body_is_still_refused(self) -> None:
         self.apply()
         self.edit(self.module("group/two"), "self.left + self.right", f"self.left + {WIDE} self.right")
@@ -501,6 +518,10 @@ class Refusals(Tree):
     def setUp(self) -> None:
         super().setUp()
         self.apply()
+
+    def test_the_nested_visibility_in_a_flat_module_is_refused(self) -> None:
+        self.edit(self.module("first"), "pub(super) fn alpha", f"{WIDE} fn alpha")
+        self.assertRefused(self.check(), "differs from the base", "alpha")
 
     def test_a_token_changed_inside_a_moved_item(self) -> None:
         self.edit(self.module("second"), "self.left + self.right", "self.left - self.right")

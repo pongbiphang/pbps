@@ -25,7 +25,7 @@ writes `foo.rs` beside `foo/`, not `foo/mod.rs`). The plan gives `group` a line
 in `_docs` and no item list; a flat module of that name is an error, and so is
 a name nested deeper. The script owns `group.rs`: it holds the `//!` line and
 one `pub(super) mod part;` line per planned part, and nothing else (a file that
-holds an item is an error). The parent file declares `mod group;` and imports
+holds an item or any other line is an error, never overwritten). The parent file declares `mod group;` and imports
 `group::part::item`, so the parent stays the one place every module reaches
 the others through, as for a flat module: a nested module opens with
 `use super::super::*;`, which is the parent's namespace, its imports included.
@@ -78,7 +78,8 @@ Visibility, the one edit an item gets:
 The check (`--check BASE_FILE`, a saved copy of the file before the move) lexes
 both trees, cuts them into items and requires: every base item appears exactly
 once in the new tree; its tokens equal the base item's after deleting an
-inserted `pub(super)` (or `pub(in super::super)`) at an item head, a
+inserted `pub(super)` (`pub(in super::super)` in a nested module, and no
+other depth) at an item head, a
 struct-field head or an impl-method head, and an inserted trailing `,` before
 the `)` of a signature; items left in the parent and items of each module keep
 their order; no extra item exists; the `use`/`mod` lines are the only other
@@ -659,6 +660,11 @@ def apply(root: Path, parent_rel: str, plan_path: Path) -> list[str]:
         if path.is_file():
             if held := [it for it in cut_items(path.read_text()) if not it.glue]:
                 raise SplitError(f"`{path.name}` is the group of {parts} and holds the item `{held[0].display or held[0].name}`")
+            # The file is rewritten whole, so a line the script did not write
+            # (a test module, an import) would be dropped without a word.
+            own = re.compile(rf"//!.*|pub\(super\) mod {_MODULE_NAME};")
+            if stray := [line for line in path.read_text().splitlines() if line.strip() and not own.fullmatch(line)]:
+                raise SplitError(f"`{path.name}` is the group of {parts} and holds a line the script did not write: `{stray[0].strip()}`")
             if path.read_text() == body:
                 continue
         written.append((path, body))
@@ -728,30 +734,27 @@ def _git_show(root: Path, ref: str, rel: str) -> str | None:
     return r.stdout if r.returncode == 0 else None
 
 
-def _inserted_visibility(n: list[str], j: int) -> int:
-    """How many tokens of an inserted `pub(super)` or `pub(in super::super)`
-    start at `n[j]`; 0 when none does."""
-    if n[j : j + 4] == PUB_SUPER:
-        return 4
-    if n[j : j + 4] != ["pub", "(", "in", "super"]:
-        return 0
-    k = j + 4
-    while n[k : k + 3] == [":", ":", "super"]:
-        k += 3
-    return k + 1 - j if n[k : k + 1] == [")"] else 0
+def _inserted_visibility(home: str) -> list[str]:
+    """The tokens of the one visibility the script inserts in `home`: a module
+    name, or anything without a `/` for the parent and a flat module. A path
+    of another depth is not it: one `super` short does not reach the parent,
+    one more reaches past the file."""
+    return [t.text for t in tokenize(_super_vis(home))]
 
 
-def _align(base: Item, new: Item) -> str | None:
-    """None when `new` is `base` plus allowed insertions; else where they differ."""
+def _align(base: Item, new: Item, home: str = "") -> str | None:
+    """None when `new` is `base` plus allowed insertions; else where they
+    differ. `home` is the module `new` stands in."""
     b, n = base.tokens(), new.tokens()
+    vis = _inserted_visibility(home)
     heads = {new.head - new.lead} | {h - new.lead for _, h, _, _ in members(new)}
     closers = signature_closers(new)
     i = j = 0
     while i < len(b) or j < len(n):
         if i < len(b) and j < len(n) and b[i] == n[j]:
             i, j = i + 1, j + 1
-        elif j in heads and (size := _inserted_visibility(n, j)):
-            j += size
+        elif j in heads and n[j : j + len(vis)] == vis:
+            j += len(vis)
         elif j + 1 in closers and n[j] == "," and i < len(b) and b[i] == ")":
             j += 1
         else:
@@ -840,11 +843,11 @@ def check(root: Path, parent_rel: str, base_text: str, base_ref: str | None = No
         if len(nl) > len(bl):
             problems.append(f"item `{label}` is present {len(nl)} times (base: {len(bl)}): " + ", ".join(e[0] for e in nl))
         for b in bl:
-            hit = next((e for e in nl if _align(b[2], e[2]) is None), None)
+            hit = next((e for e in nl if _align(b[2], e[2], e[0]) is None), None)
             if hit is None and not nl:
                 problems.append(f"item `{label}` is missing from the new tree")
             elif hit is None:
-                problems.append(f"item `{label}` differs from the base: {_align(b[2], nl[0][2])}")
+                problems.append(f"item `{label}` differs from the base: {_align(b[2], nl[0][2], nl[0][0])}")
             else:
                 nl.remove(hit)
                 pairs.append((b, hit))
@@ -906,23 +909,23 @@ def move_map(
     of them may move in a different PR."""
     modules, _, _, _ = load_plan(plan_path)
     items = cut_items(base_text)
-    earlier: list[Item] = []
+    earlier: list[tuple[str, Item]] = []
     if root is not None and base_ref:
         mod_dir = Path(parent_rel).with_suffix("")
         for mod in modules:
             body = _git_show(root, base_ref, f"{mod_dir}/{mod}.rs")
             if body is not None:
-                earlier += [x for x in cut_items(body) if not x.glue]
+                earlier += [(mod, x) for x in cut_items(body) if not x.glue]
 
     def moved_before(it: Item) -> bool:
-        return any((x.display or x.name) == (it.display or it.name) and _align(it, x) is None for x in earlier)
+        return any((x.display or x.name) == (it.display or it.name) and _align(it, x, mod) is None for mod, x in earlier)
 
     rows = []
     for mod, names in modules.items():
         for name in names:
             found = [it for it in items if _matches(it, name)]
             hits = [it for it in found if not moved_before(it)]
-            if not found and not any(_matches(x, name) for x in earlier):
+            if not found and not any(_matches(x, name) for _, x in earlier):
                 raise SplitError(f"the plan names `{name}` and the base file has no such item")
             rows += [(it.start, f"{it.display or name}: {line_of(base_text, it.start)}-{line_of(base_text, it.stop)} -> {mod}") for it in hits]
     return [r for _, r in sorted(rows)]
