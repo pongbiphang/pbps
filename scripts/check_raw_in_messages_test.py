@@ -505,7 +505,7 @@ class TheAllowlist(unittest.TestCase):
             'crates/pbps-dialect/src/predicate/render.rs',
             'crates/pbps-dialect/tests/support/positional_preflight.rs',
             'crates/pbps-diff/src/identity.rs',
-            'crates/pbps-diff/src/schema_diff.rs',
+            'crates/pbps-diff/src/schema_diff/error.rs',
             'crates/pbps-diff/src/schema_diff/tests.rs',
             'crates/pbps-docs/src/erd.rs',
             'crates/pbps-model/src/change.rs',

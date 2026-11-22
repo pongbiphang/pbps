@@ -301,7 +301,7 @@ ALLOWED = {
         1,
         "builds a dropped routine signature as SQL; its names and arguments remain raw",
     ),
-    "crates/pbps-diff/src/schema_diff.rs": (
+    "crates/pbps-diff/src/schema_diff/error.rs": (
         1,
         "One Rust Debug projection escapes a baseline-key list.",
     ),
