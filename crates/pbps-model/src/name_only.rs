@@ -31,7 +31,7 @@
 use crate::SearchChange;
 use crate::{
     Change, ChangeSet, ColumnType, IdsFile, ManagedType, ObjectName, Schema, SearchObject,
-    SearchRef, Sequence,
+    SearchRef, Sequence, Uid,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -251,16 +251,19 @@ impl NameOnly {
             .collect();
         // A rename moves an object's name and nothing else, so the record it had under the
         // old name is the one it keeps under the new one (DEC-2728.5). Without this the
-        // new name has no record and the read-back would be recorded in its place. At a
-        // staged checkpoint the identities may still hold the old name, which `previous`
-        // answers directly, so the carry is only for the name the rename has reached.
-        let renamed: BTreeMap<&SearchRef, &SearchRef> = applied
+        // new name has no record and the read-back would be recorded in its place. The record
+        // is found by identity, not by name: in a chain (`a` to `b`, `b` to `c`) the name `b`
+        // ends up holding what was `a`, and its own old record belongs to `c`. At a staged
+        // checkpoint an identity the rename has not reached still holds the old name, which
+        // the same lookup answers.
+        let renamed: BTreeMap<&Uid, &SearchRef> = applied
             .changes
             .iter()
             .filter_map(|planned| {
-                if let Change::Search(SearchChange::RenameSearch { from, to, .. }) = &planned.change
+                if let Change::Search(SearchChange::RenameSearch { uid, from, .. }) =
+                    &planned.change
                 {
-                    Some((to, from))
+                    Some((uid, from))
                 } else {
                     None
                 }
@@ -269,20 +272,28 @@ impl NameOnly {
         // And a configuration that maps a dictionary the plan renamed keeps the record it had,
         // under the dictionary's new spelling: the read-back spells it that way, and a record
         // left at the old name would read as drift.
-        let moved: BTreeMap<SearchRef, SearchRef> = renamed
+        let moved: BTreeMap<SearchRef, SearchRef> = applied
+            .changes
             .iter()
-            .map(|(to, from)| ((*from).clone(), (*to).clone()))
+            .filter_map(|planned| {
+                if let Change::Search(SearchChange::RenameSearch { from, to, .. }) = &planned.change
+                {
+                    Some((from.clone(), to.clone()))
+                } else {
+                    None
+                }
+            })
             .collect();
         let search = live
             .search
-            .values()
-            .filter_map(|name| {
+            .iter()
+            .filter_map(|(uid, name)| {
                 let object = if made.contains(name) {
                     read.get(name).or_else(|| previous.get(name)).cloned()
                 } else {
-                    previous
-                        .get(name)
-                        .or_else(|| renamed.get(name).and_then(|from| previous.get(*from)))
+                    renamed
+                        .get(uid)
+                        .map_or_else(|| previous.get(name), |from| previous.get(*from))
                         .map(|held| held.respelled(&moved))
                         .or_else(|| read.get(name).cloned())
                 };
