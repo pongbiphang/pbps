@@ -298,7 +298,42 @@ pub(in crate::engine) async fn refuse_created_name_occupants<S: Clone>(
     Ok(facts)
 }
 
-/// The PostgreSQL body of `engine::refuse_unlogged_partition_referencers`, which apply also calls.
+/// Binds and vets every recorded conversion's expression, before the
+/// pre-flight evaluates it over the rows or the `ALTER` runs it (#2331,
+/// DEC-2331.1), which apply also asks.
+pub(in crate::engine) async fn vet_conversions(
+    conn: &mut Conn,
+    admission: &pbps_dialect::routines::RoutineAdmission,
+    changes: &[pbps_model::PlannedChange],
+) -> anyhow::Result<std::collections::BTreeSet<pbps_model::ColumnRef>> {
+    let mut immutable = std::collections::BTreeSet::new();
+    for planned in changes {
+        let pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
+            column,
+            from,
+            to,
+            using: Some(using),
+            ..
+        }) = &planned.change
+        else {
+            continue;
+        };
+        if pbps_pg::input_path::vet_conversion_for_probe(conn, admission, column, from, to, using)
+            .await
+            .map_err(|why| anyhow::anyhow!("{why}"))?
+        {
+            immutable.insert(column.clone());
+        }
+    }
+    Ok(immutable)
+}
+
+/// Refuses an `UNLOGGED` partition this plan creates under a parent that a
+/// permanent table outside the declarations references (#1595,
+/// DEC-1595.1), asked of the catalog in the caller's transaction. A failed
+/// read is an error, never "no referencers": the engine accepts the
+/// partition, so nothing later would catch what this missed. Apply asks it
+/// again.
 pub(in crate::engine) async fn refuse_unlogged_partition_referencers(
     conn: &mut Conn,
     cs: &ChangeSet,
@@ -323,7 +358,9 @@ pub(in crate::engine) async fn refuse_unlogged_partition_referencers(
     crate::deploy::refuse_permanent_referencers(cs, &names, &referencers, staged)
 }
 
-/// The PostgreSQL body of `engine::refuse_published_unlogged`, which apply also calls.
+/// Refuses making a table unlogged while a publication names it (#1489,
+/// DEC-1489.1), asked of the catalog in the caller's transaction. A failed
+/// read is an error, never "unpublished". Apply asks it again.
 pub(in crate::engine) async fn refuse_published_unlogged(
     conn: &mut Conn,
     cs: &ChangeSet,
@@ -616,8 +653,9 @@ pub(in crate::engine) async fn check_module_rebuilds(
     })
 }
 
-/// The PostgreSQL body of `engine::check_drop_blockers`, which apply also calls.
-pub(in crate::engine) async fn check_drop_blockers(
+/// Predicts existing table, column and key `DROP` dependencies in the caller's
+/// transaction (issue 254); apply asks it again (`ApplySession::drop_blockers`).
+pub(crate) async fn check_drop_blockers(
     conn: &mut Conn,
     changes: &ChangeSet,
     ids: &pbps_model::IdsFile,
@@ -889,7 +927,9 @@ pub(in crate::engine) async fn prepare_data_writes(
 }
 
 /// PostgreSQL's module rebuild keeps its catalog state only inside the one
-/// transaction a staged run does not have (ADR-0009 §3).
+/// transaction a staged run does not have (ADR-0009 §3). Rebuilds must keep
+/// their locks, checks and DDL in one transaction, and so must the revoke that
+/// closes a routine this plan creates.
 pub(in crate::engine) fn require_transactional_rebuilds(
     changes: &ChangeSet,
     staged: bool,
@@ -1042,7 +1082,9 @@ pub(in crate::engine) async fn permission_support(
     })
 }
 
-/// The PostgreSQL body of `generation_support`, which apply also calls.
+/// What a plan over generated columns needs of this server and of the columns
+/// already there, asked before anything is written (DEC-1168.1); apply asks it
+/// again (`ApplySession::generation_support`).
 // The two scans for a plan's exclusions and partitioned tables name the one change each wants.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(in crate::engine) async fn generation_support(

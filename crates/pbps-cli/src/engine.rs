@@ -118,6 +118,10 @@ pub(crate) use owned_test::OwnedTest;
 pub(crate) mod apply_session;
 pub(crate) use apply_session::ApplySession;
 mod plan_session;
+// The PostgreSQL drop-blocker read, for the live test that asks it of a bare
+// change set; apply and planning reach it through their sessions.
+#[cfg(test)]
+pub(crate) use plan_session::postgres::check_drop_blockers;
 pub(crate) use plan_session::{
     DeclaredTypes, DomainCode, ExtensionSeals, Frame, PlanSession, SealedFacts, ServerLimits,
     SupportReads, SupportRows, in_contract_order,
@@ -149,39 +153,6 @@ pub async fn execute_staged_statement(
     of(conn.driver())
         .execute_staged_statement(conn, statement)
         .await
-}
-
-/// Binds and vets every recorded conversion's expression, before the
-/// pre-flight evaluates it over the rows or the `ALTER` runs it (#2331,
-/// DEC-2331.1). Nothing to vet on an engine that records none.
-pub async fn vet_conversions(
-    conn: &mut Conn,
-    admission: &pbps_dialect::routines::RoutineAdmission,
-    changes: &[pbps_model::PlannedChange],
-) -> anyhow::Result<std::collections::BTreeSet<pbps_model::ColumnRef>> {
-    let mut immutable = std::collections::BTreeSet::new();
-    if conn.driver() == Driver::Mssql {
-        return Ok(immutable);
-    }
-    for planned in changes {
-        let pbps_model::Change::Column(pbps_model::ColumnChange::AlterColumnType {
-            column,
-            from,
-            to,
-            using: Some(using),
-            ..
-        }) = &planned.change
-        else {
-            continue;
-        };
-        if pbps_pg::input_path::vet_conversion_for_probe(conn, admission, column, from, to, using)
-            .await
-            .map_err(|why| anyhow::anyhow!("{why}"))?
-        {
-            immutable.insert(column.clone());
-        }
-    }
-    Ok(immutable)
 }
 
 /// Judges the table expressions a change introduces (DEC-2563.4).
@@ -890,37 +861,6 @@ mod type_slot_tests {
     }
 }
 
-/// Refuses an `UNLOGGED` partition this plan creates under a parent that a
-/// permanent table outside the declarations references (#1595,
-/// DEC-1595.1), asked of the catalog in the caller's transaction. A failed
-/// read is an error, never "no referencers": the engine accepts the
-/// partition, so nothing later would catch what this missed.
-pub async fn refuse_unlogged_partition_referencers(
-    conn: &mut Conn,
-    cs: &ChangeSet,
-    ids: &pbps_model::IdsFile,
-    staged: bool,
-) -> anyhow::Result<()> {
-    if conn.driver() != Driver::Postgres {
-        return Ok(());
-    }
-    plan_session::postgres::refuse_unlogged_partition_referencers(conn, cs, ids, staged).await
-}
-
-/// Refuses making a table unlogged while a publication names it (#1489,
-/// DEC-1489.1), asked of the catalog in the caller's transaction. A failed
-/// read is an error, never "unpublished".
-pub async fn refuse_published_unlogged(
-    conn: &mut Conn,
-    cs: &ChangeSet,
-    ids: &pbps_model::IdsFile,
-) -> anyhow::Result<()> {
-    if conn.driver() != Driver::Postgres {
-        return Ok(());
-    }
-    plan_session::postgres::refuse_published_unlogged(conn, cs, ids).await
-}
-
 /// Catalog reads precede the plan, while the caller names an object at its
 /// statement boundary. Keep that translation identical for the edge query,
 /// its visibility proof, and the preliminary computed-column presence read.
@@ -1022,54 +962,6 @@ fn absence_unproven(missing: &[TableName], error: DbError) -> anyhow::Error {
     ))
 }
 
-/// Which requested names occur in an already captured table inventory.
-pub async fn matching_table_names(
-    conn: &mut Conn,
-    wanted: &[TableName],
-    observed: &[TableName],
-) -> anyhow::Result<Vec<TableName>> {
-    match conn.driver() {
-        Driver::Mssql => {
-            Ok(pbps_mssql::catalog::matching_table_names(conn, wanted, observed).await?)
-        }
-        Driver::Postgres => Ok(pbps_pg::catalog::matching_table_names(wanted, observed)),
-    }
-}
-
-/// Among `names`, the pairs the database reads as one name (DECISIONS 123).
-pub async fn names_alike(conn: &mut Conn, names: &[&str]) -> anyhow::Result<Vec<(String, String)>> {
-    match conn.driver() {
-        Driver::Mssql => Ok(pbps_mssql::catalog::names_alike(conn, names).await?),
-        Driver::Postgres => Err(roles_are_the_clusters("comparing the declared role names")),
-    }
-}
-
-/// The database principals holding any of `names`, except the ones this plan
-/// vacates (DECISIONS 118, 119).
-pub async fn principals_holding(
-    conn: &mut Conn,
-    names: &[&str],
-    except: &[&str],
-) -> anyhow::Result<Vec<(String, String, String)>> {
-    match conn.driver() {
-        Driver::Mssql => Ok(pbps_mssql::catalog::principals_holding(conn, names, except).await?),
-        Driver::Postgres => Err(roles_are_the_clusters(
-            "reading which principals hold a name",
-        )),
-    }
-}
-
-/// Every user-defined role's members, for the `DROP ROLE` that has to remove
-/// them first (ADR-0005).
-pub async fn role_members(
-    conn: &mut Conn,
-) -> anyhow::Result<BTreeMap<pbps_model::RoleName, Vec<pbps_model::RoleName>>> {
-    match conn.driver() {
-        Driver::Mssql => plan_session::mssql::role_members(conn).await,
-        Driver::Postgres => Err(roles_are_the_clusters("reading the role memberships")),
-    }
-}
-
 /// Every securable each user-defined role owns, which the engine will not
 /// drop the role over.
 pub async fn role_owned_securables(
@@ -1118,19 +1010,6 @@ pub struct EditionVerdict {
     pub warnings: Vec<String>,
 }
 
-/// Asks the server about a plan's edition-dependent questions, the only place
-/// they can be answered honestly: the edition is a connection-time fact, and
-/// nothing binds a saved plan to an environment.
-pub async fn edition_verdict(
-    conn: &mut Conn,
-    changes: &ChangeSet,
-) -> Result<EditionVerdict, DbError> {
-    match conn.driver() {
-        Driver::Mssql => plan_session::mssql::edition_verdict(conn, changes).await,
-        Driver::Postgres => Ok(plan_session::postgres::edition_verdict()),
-    }
-}
-
 /// A connected capability answer, separate from the saved, checksum-pinned plan.
 #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct ConnectedCheck {
@@ -1166,26 +1045,6 @@ pub async fn check_domain_alterations(
         return Ok(None);
     }
     plan_session::postgres::check_domain_alterations(conn, changes, stored).await
-}
-
-/// Predict existing table/column/key DROP dependencies in the caller's transaction.
-/// The other engine's rename reader does not answer this question (issue 254).
-pub async fn check_drop_blockers(
-    conn: &mut Conn,
-    changes: &ChangeSet,
-    ids: &pbps_model::IdsFile,
-    stored: &pbps_model::Schema,
-    stored_ids: &pbps_model::IdsFile,
-) -> anyhow::Result<ConnectedCheck> {
-    match conn.driver() {
-        Driver::Mssql => {
-            plan_session::mssql::check_drop_blockers(conn, changes, ids, stored, stored_ids).await
-        }
-        Driver::Postgres => {
-            plan_session::postgres::check_drop_blockers(conn, changes, ids, stored, stored_ids)
-                .await
-        }
-    }
 }
 
 fn refuse_drop_reports(
@@ -1861,29 +1720,6 @@ fn fills_listed(
     }
 }
 
-/// What a plan over generated columns needs of this server and of the columns
-/// already there, asked before anything is written (DEC-1168.1).
-///
-/// `SET EXPRESSION` is PostgreSQL 17's; on 16 a plan that changes an
-/// expression is refused by name, never turned into a drop and re-add that
-/// would take the column's dependents and its place with it. And a column a
-/// live generated column is computed from cannot be retyped, nor dropped
-/// without `CASCADE` — measured on 16, 17 and 18 — so a plan that retypes or
-/// drops one is refused here rather than by the engine halfway through. Two
-/// things release it: the same plan dropping the generated column, or an
-/// earlier change in the plan to the generated column's expression whose text
-/// does not name the input (DEC-1316.1).
-pub async fn generation_support(
-    conn: &mut Conn,
-    changes: &ChangeSet,
-    ids: &pbps_model::IdsFile,
-) -> anyhow::Result<ConnectedCheck> {
-    match conn.driver() {
-        Driver::Mssql => Ok(plan_session::mssql::generation_support()),
-        Driver::Postgres => plan_session::postgres::generation_support(conn, changes, ids).await,
-    }
-}
-
 /// Policy recipients need not be declared roles: an existing cluster role may
 /// receive a policy without any managed grants. Ask the connected role reader,
 /// shared by plan, bootstrap and saved-plan apply, rather than the managed scope.
@@ -2099,30 +1935,6 @@ pub fn impact_notes(driver: Driver, report: &ImpactReport) -> Vec<String> {
     (profile::profile(driver).impact_notes)(report)
 }
 
-/// Every rename in a plan, as the objects they are renamed *from* — the name
-/// the catalog still knows them by. Which changes count is each engine's
-/// question: a module rename is a drop plus a create, and only SQL Server asks
-/// the drop side through the rename-impact query.
-pub fn rename_targets(
-    driver: Driver,
-    names: &pbps_model::plan_names::PlanNames<'_>,
-) -> Vec<RenameTarget> {
-    match driver {
-        Driver::Mssql => pbps_mssql::impact::rename_targets(names),
-        Driver::Postgres => pbps_pg::impact::rename_targets(names),
-    }
-}
-
-pub async fn rename_impact(
-    conn: &mut Conn,
-    target: &RenameTarget,
-) -> Result<ImpactReport, ImpactError> {
-    match conn.driver() {
-        Driver::Mssql => pbps_mssql::impact::rename_impact(conn, target).await,
-        Driver::Postgres => pbps_pg::impact::rename_impact(conn, target).await,
-    }
-}
-
 /// Bootstrap can build database roles, but cluster roles must already exist
 /// and still exist when its successful snapshot is recorded.
 pub fn refuse_missing_cluster_roles(
@@ -2153,19 +1965,6 @@ pub fn refuse_missing_cluster_roles(
 pub struct ExternalRoleRenames {
     pub renames: BTreeMap<pbps_model::RoleName, pbps_model::RoleName>,
     pub check: ConnectedCheck,
-}
-
-pub async fn external_role_renames(
-    conn: &mut Conn,
-    recorded: &pbps_model::IdsFile,
-    declared: &pbps_model::IdsFile,
-) -> anyhow::Result<ExternalRoleRenames> {
-    match conn.driver() {
-        Driver::Mssql => Ok(plan_session::mssql::external_role_renames()),
-        Driver::Postgres => {
-            plan_session::postgres::external_role_renames(conn, recorded, declared).await
-        }
-    }
 }
 
 /// A replacement may be explicit or synthesized as a drop and create.
@@ -2229,20 +2028,6 @@ pub enum Absent {
     Refused,
     /// A staged step before the one that creates it.
     NotYetCreated,
-}
-
-/// PostgreSQL rebuilds must keep their locks, checks and DDL in one
-/// transaction — and so must the revoke that closes a routine this plan
-/// creates.
-pub fn require_transactional_rebuilds(
-    driver: Driver,
-    changes: &ChangeSet,
-    staged: bool,
-) -> anyhow::Result<()> {
-    match driver {
-        Driver::Postgres => plan_session::postgres::require_transactional_rebuilds(changes, staged),
-        Driver::Mssql => plan_session::mssql::require_transactional_rebuilds(changes, staged),
-    }
 }
 
 /// Called inside the transaction before the DROP and after the CREATE.
@@ -3973,9 +3758,9 @@ mod tests {
             rebuilt_modules(&cs)[&id],
             (ModuleKind::View, ModuleKind::Function)
         );
-        assert!(require_transactional_rebuilds(Driver::Mssql, &cs, true).is_ok());
-        assert!(require_transactional_rebuilds(Driver::Postgres, &cs, true).is_err());
-        assert!(require_transactional_rebuilds(Driver::Postgres, &cs, false).is_ok());
+        assert!(plan_session::mssql::require_transactional_rebuilds(&cs, true).is_ok());
+        assert!(plan_session::postgres::require_transactional_rebuilds(&cs, true).is_err());
+        assert!(plan_session::postgres::require_transactional_rebuilds(&cs, false).is_ok());
     }
 
     /// The `CREATE` and the revoke that closes the routine are two statements,
@@ -3996,13 +3781,16 @@ mod tests {
                 origin: pbps_model::RoutineOrigin::Created,
             },
         )));
-        for driver in [Driver::Postgres, Driver::Mssql] {
-            let e = require_transactional_rebuilds(driver, &cs, true)
+        for require_transactional_rebuilds in [
+            plan_session::postgres::require_transactional_rebuilds,
+            plan_session::mssql::require_transactional_rebuilds,
+        ] {
+            let e = require_transactional_rebuilds(&cs, true)
                 .expect_err("a staged run leaves the routine open")
                 .to_string();
             assert!(e.contains("app.f(integer)"), "{e}");
             assert!(e.contains("public_execute: true"), "{e}");
-            assert!(require_transactional_rebuilds(driver, &cs, false).is_ok());
+            assert!(require_transactional_rebuilds(&cs, false).is_ok());
         }
 
         // The other decision's window leaves the routine closed rather than
@@ -4015,7 +3803,7 @@ mod tests {
                 origin: pbps_model::RoutineOrigin::Created,
             },
         )));
-        assert!(require_transactional_rebuilds(Driver::Postgres, &kept, true).is_ok());
+        assert!(plan_session::postgres::require_transactional_rebuilds(&kept, true).is_ok());
     }
 
     /// The routine the refusal names is the plan's, and its name may hold a
@@ -4034,7 +3822,7 @@ mod tests {
                     origin: pbps_model::RoutineOrigin::Created,
                 },
             )));
-            require_transactional_rebuilds(Driver::Postgres, &cs, true)
+            plan_session::postgres::require_transactional_rebuilds(&cs, true)
                 .expect_err("a staged run leaves the routine open")
                 .to_string()
         };
@@ -4090,9 +3878,7 @@ mod tests {
                 }
             );
 
-            let verdict = edition_verdict(&mut conn, &ChangeSet::default())
-                .await
-                .expect("verdict");
+            let verdict = plan_session::postgres::edition_verdict();
             assert!(verdict.refused_online.is_empty() && verdict.warnings.is_empty());
 
             let pulled = introspect(&mut conn, Read::Snapshot).await.expect("pull");
@@ -4121,14 +3907,15 @@ mod tests {
     fn the_role_questions_refuse_on_postgres_rather_than_answer_none() {
         block_on(async {
             let mut conn = pg().await;
-            let alike = names_alike(&mut conn, &["a", "A"]).await;
-            let holding = principals_holding(&mut conn, &["a"], &[]).await;
-            let members = role_members(&mut conn).await;
+            let session = pbps_pg::Postgres::new();
+            let alike = session.alike_role_names(&mut conn, &["a", "A"]).await;
+            let holding = session.principal_name_holders(&mut conn, &["a"], &[]).await;
+            let members = session.role_drop_facts(&mut conn).await;
             let owned = role_owned_securables(&mut conn).await;
             for (what, message) in [
                 ("names_alike", alike.err().map(|e| e.to_string())),
                 ("principals_holding", holding.err().map(|e| e.to_string())),
-                ("role_members", members.err().map(|e| e.to_string())),
+                ("role_members", members.err().map(|e| format!("{e:#}"))),
                 ("role_owned_securables", owned.err().map(|e| e.to_string())),
             ] {
                 let message = message.unwrap_or_else(|| panic!("{what} answered on PostgreSQL"));
@@ -4145,7 +3932,7 @@ mod tests {
         block_on(async {
             let mut conn = pg().await;
             let target = RenameTarget::Module("public.v".parse().unwrap());
-            match rename_impact(&mut conn, &target).await {
+            match pbps_pg::impact::rename_impact(&mut conn, &target).await {
                 Err(ImpactError::Name(e)) => assert!(e.to_string().contains("module"), "{e}"),
                 Err(other) => panic!("refused for the wrong reason: {other}"),
                 Ok(report) => panic!("answered: {report:?}"),

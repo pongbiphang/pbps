@@ -210,9 +210,112 @@ impl ApplySession for pbps_pg::Postgres {
         Ok(None)
     }
     fn rebuild_mode(&self, changes: &ChangeSet, staged: bool) -> anyhow::Result<()> {
-        require_transactional_rebuilds(Driver::Postgres, changes, staged)
+        plan_session::postgres::require_transactional_rebuilds(changes, staged)
     }
+    /// Every rename in a plan, as the objects they are renamed *from* — the name
+    /// the catalog still knows them by. A module rename is a drop plus a create,
+    /// and only SQL Server asks the drop side through the rename-impact query.
     fn rename_targets(&self, names: &pbps_model::plan_names::PlanNames<'_>) -> Vec<RenameTarget> {
-        super::super::rename_targets(Driver::Postgres, names)
+        pbps_pg::impact::rename_targets(names)
+    }
+    async fn generation_support(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+    ) -> anyhow::Result<ConnectedCheck> {
+        plan_session::postgres::generation_support(conn, changes, ids).await
+    }
+    async fn external_roles(
+        &self,
+        conn: &mut Conn,
+        recorded: &IdsFile,
+        declared: &IdsFile,
+    ) -> anyhow::Result<ExternalRoleRenames> {
+        plan_session::postgres::external_role_renames(conn, recorded, declared).await
+    }
+    async fn drop_blockers(
+        &self,
+        conn: &mut Conn,
+        plan: &pbps_model::SavedPlan,
+        stored: &Schema,
+        stored_ids: &IdsFile,
+    ) -> anyhow::Result<()> {
+        plan_session::postgres::check_drop_blockers(
+            conn,
+            &plan.changes,
+            &plan.ids,
+            stored,
+            stored_ids,
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn preflight_limits(
+        &self,
+        conn: &mut Conn,
+        plan: &pbps_model::SavedPlan,
+    ) -> Result<EditionVerdict, anyhow::Error> {
+        plan_session::postgres::refuse_unlogged_partition_referencers(
+            conn,
+            &plan.changes,
+            &plan.ids,
+            plan.mode.is_staged(),
+        )
+        .await?;
+        // A publication can list the table between the plan and this apply (#1489).
+        plan_session::postgres::refuse_published_unlogged(conn, &plan.changes, &plan.ids).await?;
+        Ok(plan_session::postgres::edition_verdict())
+    }
+    async fn role_drop_facts(
+        &self,
+        _conn: &mut Conn,
+    ) -> anyhow::Result<(
+        BTreeMap<pbps_model::RoleName, Vec<pbps_model::RoleName>>,
+        BTreeMap<pbps_model::RoleName, Vec<String>>,
+    )> {
+        // A PostgreSQL role is the cluster's, so a plan for it drops none.
+        Err(roles_are_the_clusters("reading the role memberships"))
+            .context("cannot read the role memberships")
+    }
+    async fn alike_role_names(
+        &self,
+        _conn: &mut Conn,
+        _names: &[&str],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        Err(roles_are_the_clusters("comparing the declared role names"))
+    }
+    async fn principal_name_holders(
+        &self,
+        _conn: &mut Conn,
+        _names: &[&str],
+        _vacated: &[&str],
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        Err(roles_are_the_clusters(
+            "reading which principals hold a name",
+        ))
+    }
+    async fn rename_report(
+        &self,
+        conn: &mut Conn,
+        target: &RenameTarget,
+    ) -> Result<ImpactReport, ImpactError> {
+        pbps_pg::impact::rename_impact(conn, target).await
+    }
+    async fn conversions(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        changes: &[pbps_model::PlannedChange],
+    ) -> anyhow::Result<BTreeSet<pbps_model::ColumnRef>> {
+        plan_session::postgres::vet_conversions(conn, admission, changes).await
+    }
+    async fn removed_name_matches(
+        &self,
+        _conn: &mut Conn,
+        wanted: &[TableName],
+        observed: &[TableName],
+    ) -> anyhow::Result<Vec<TableName>> {
+        Ok(pbps_pg::catalog::matching_table_names(wanted, observed))
     }
 }

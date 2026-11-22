@@ -307,7 +307,8 @@ pub(in crate::engine) async fn account_for_module_dependents<
     ))
 }
 
-/// The SQL Server body of `engine::check_drop_blockers`, which apply also calls.
+/// Predicts existing table, column and key `DROP` dependencies in the caller's
+/// transaction (issue 254); apply asks it again (`ApplySession::drop_blockers`).
 pub(in crate::engine) async fn check_drop_blockers(
     conn: &mut Conn,
     changes: &ChangeSet,
@@ -775,7 +776,10 @@ pub(in crate::engine) fn unrevocable_grants() -> ConnectedCheck {
     }
 }
 
-/// The SQL Server body of `edition_verdict`, which apply also calls.
+/// Asks the server about a plan's edition-dependent questions, the only place
+/// they can be answered honestly: the edition is a connection-time fact, and
+/// nothing binds a saved plan to an environment. Apply asks it again
+/// (`ApplySession::preflight_limits`).
 pub(in crate::engine) async fn edition_verdict(
     conn: &mut Conn,
     changes: &ChangeSet,

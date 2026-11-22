@@ -156,10 +156,106 @@ impl ApplySession for pbps_mssql::Mssql {
         ))
     }
     fn rebuild_mode(&self, changes: &ChangeSet, staged: bool) -> anyhow::Result<()> {
-        require_transactional_rebuilds(Driver::Mssql, changes, staged)
+        plan_session::mssql::require_transactional_rebuilds(changes, staged)
     }
+    /// Every rename in a plan, as the objects they are renamed *from* — the name
+    /// the catalog still knows them by. A module rename is a drop plus a create,
+    /// and SQL Server asks the drop side through the rename-impact query.
     fn rename_targets(&self, names: &pbps_model::plan_names::PlanNames<'_>) -> Vec<RenameTarget> {
-        super::super::rename_targets(Driver::Mssql, names)
+        pbps_mssql::impact::rename_targets(names)
+    }
+    async fn generation_support(
+        &self,
+        _conn: &mut Conn,
+        _changes: &ChangeSet,
+        _ids: &IdsFile,
+    ) -> anyhow::Result<ConnectedCheck> {
+        Ok(plan_session::mssql::generation_support())
+    }
+    async fn external_roles(
+        &self,
+        _conn: &mut Conn,
+        _recorded: &IdsFile,
+        _declared: &IdsFile,
+    ) -> anyhow::Result<ExternalRoleRenames> {
+        Ok(plan_session::mssql::external_role_renames())
+    }
+    async fn drop_blockers(
+        &self,
+        conn: &mut Conn,
+        plan: &pbps_model::SavedPlan,
+        stored: &Schema,
+        stored_ids: &IdsFile,
+    ) -> anyhow::Result<()> {
+        plan_session::mssql::check_drop_blockers(conn, &plan.changes, &plan.ids, stored, stored_ids)
+            .await
+            .map(|_| ())
+    }
+    async fn preflight_limits(
+        &self,
+        conn: &mut Conn,
+        plan: &pbps_model::SavedPlan,
+    ) -> Result<EditionVerdict, anyhow::Error> {
+        // The edition, asked again. `plan --db` checked it, but nothing binds a
+        // saved plan to an environment: the same file can be applied to a different
+        // server, or to the same one after an edition change, and an `ONLINE = ON`
+        // statement rejected halfway through an apply is precisely what the check
+        // at plan time exists to prevent (ADR-0003).
+        Ok(plan_session::mssql::edition_verdict(conn, &plan.changes).await?)
+    }
+    async fn role_drop_facts(
+        &self,
+        conn: &mut Conn,
+    ) -> anyhow::Result<(
+        BTreeMap<pbps_model::RoleName, Vec<pbps_model::RoleName>>,
+        BTreeMap<pbps_model::RoleName, Vec<String>>,
+    )> {
+        let members = plan_session::mssql::role_members(conn)
+            .await
+            .context("cannot read the role memberships")?;
+        let owned = pbps_mssql::catalog::role_owned_securables(conn)
+            .await
+            .context("cannot read what the roles own")?;
+        Ok((members, owned))
+    }
+    async fn alike_role_names(
+        &self,
+        conn: &mut Conn,
+        names: &[&str],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(pbps_mssql::catalog::names_alike(conn, names).await?)
+    }
+    async fn principal_name_holders(
+        &self,
+        conn: &mut Conn,
+        names: &[&str],
+        vacated: &[&str],
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        Ok(pbps_mssql::catalog::principals_holding(conn, names, vacated).await?)
+    }
+    async fn rename_report(
+        &self,
+        conn: &mut Conn,
+        target: &RenameTarget,
+    ) -> Result<ImpactReport, ImpactError> {
+        pbps_mssql::impact::rename_impact(conn, target).await
+    }
+    /// SQL Server records no conversion expression to vet.
+    async fn conversions(
+        &self,
+        _conn: &mut Conn,
+        _admission: &RoutineAdmission,
+        _changes: &[pbps_model::PlannedChange],
+    ) -> anyhow::Result<BTreeSet<pbps_model::ColumnRef>> {
+        Ok(BTreeSet::new())
+    }
+    async fn removed_name_matches(
+        &self,
+        conn: &mut Conn,
+        wanted: &[TableName],
+        observed: &[TableName],
+    ) -> anyhow::Result<Vec<TableName>> {
+        Ok(pbps_mssql::catalog::matching_table_names(conn, wanted, observed).await?)
     }
 }
 

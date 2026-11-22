@@ -68,7 +68,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
     ) -> anyhow::Result<()> {
         self.permission_support(conn, &plan.changes, &plan.ids)
             .await?;
-        generation_support(conn, &plan.changes, &plan.ids).await?;
+        self.generation_support(conn, &plan.changes, &plan.ids)
+            .await?;
         Ok(())
     }
     async fn history_before_intent(
@@ -80,14 +81,6 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         crate::deploy::refuse_taken_history_names(self, conn, changes, label).await?;
         // Nothing binds a saved plan to a server: asked again here (#1502).
         self.refuse_unsupported_temporal(conn, changes).await
-    }
-    async fn external_roles(
-        &self,
-        conn: &mut Conn,
-        recorded: &IdsFile,
-        declared: &IdsFile,
-    ) -> anyhow::Result<ExternalRoleRenames> {
-        external_role_renames(conn, recorded, declared).await
     }
     async fn baseline_collation(&self, conn: &mut Conn) -> Result<Option<String>, DbError> {
         database_collation(conn).await
@@ -112,85 +105,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         self.unrevocable_grants(&plan.changes, &plan.ids, unrevocable)?;
         Ok(())
     }
-    async fn drop_blockers(
-        &self,
-        conn: &mut Conn,
-        plan: &pbps_model::SavedPlan,
-        stored: &Schema,
-        stored_ids: &IdsFile,
-    ) -> anyhow::Result<()> {
-        check_drop_blockers(conn, &plan.changes, &plan.ids, stored, stored_ids)
-            .await
-            .map(|_| ())
-    }
-    async fn preflight_limits(
-        &self,
-        conn: &mut Conn,
-        plan: &pbps_model::SavedPlan,
-    ) -> Result<EditionVerdict, anyhow::Error> {
-        refuse_unlogged_partition_referencers(
-            conn,
-            &plan.changes,
-            &plan.ids,
-            plan.mode.is_staged(),
-        )
-        .await?;
-        // A publication can list the table between the plan and this apply (#1489).
-        refuse_published_unlogged(conn, &plan.changes, &plan.ids).await?;
-        // The edition, asked again. `plan --db` checked it, but nothing binds a
-        // saved plan to an environment: the same file can be applied to a different
-        // server, or to the same one after an edition change, and an `ONLINE = ON`
-        // statement rejected halfway through an apply is precisely what the check
-        // at plan time exists to prevent (ADR-0003).
-        Ok(edition_verdict(conn, &plan.changes).await?)
-    }
-    async fn role_drop_facts(
-        &self,
-        conn: &mut Conn,
-    ) -> anyhow::Result<(
-        BTreeMap<pbps_model::RoleName, Vec<pbps_model::RoleName>>,
-        BTreeMap<pbps_model::RoleName, Vec<String>>,
-    )> {
-        let members = role_members(conn)
-            .await
-            .context("cannot read the role memberships")?;
-        let owned = role_owned_securables(conn)
-            .await
-            .context("cannot read what the roles own")?;
-        Ok((members, owned))
-    }
-    async fn alike_role_names(
-        &self,
-        conn: &mut Conn,
-        names: &[&str],
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        names_alike(conn, names).await
-    }
-    async fn principal_name_holders(
-        &self,
-        conn: &mut Conn,
-        names: &[&str],
-        vacated: &[&str],
-    ) -> anyhow::Result<Vec<(String, String, String)>> {
-        principals_holding(conn, names, vacated).await
-    }
-    async fn rename_report(
-        &self,
-        conn: &mut Conn,
-        target: &RenameTarget,
-    ) -> Result<ImpactReport, ImpactError> {
-        rename_impact(conn, target).await
-    }
     fn rename_notes(&self, driver: Driver, report: &ImpactReport) -> Vec<String> {
         impact_notes(driver, report)
-    }
-    async fn conversions(
-        &self,
-        conn: &mut Conn,
-        admission: &RoutineAdmission,
-        changes: &[pbps_model::PlannedChange],
-    ) -> anyhow::Result<BTreeSet<pbps_model::ColumnRef>> {
-        vet_conversions(conn, admission, changes).await
     }
     async fn requirement(
         &self,
@@ -650,14 +566,106 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         conn: &mut Conn,
         names: &[TableName],
     ) -> anyhow::Result<Option<Vec<pbps_mssql::catalog::NameOccupant>>>;
+    /// What a plan over generated columns needs of this server and of the
+    /// columns already there, asked before anything is written (DEC-1168.1).
+    ///
+    /// `SET EXPRESSION` is PostgreSQL 17's; on 16 a plan that changes an
+    /// expression is refused by name, never turned into a drop and re-add that
+    /// would take the column's dependents and its place with it. And a column a
+    /// live generated column is computed from cannot be retyped, nor dropped
+    /// without `CASCADE` — measured on 16, 17 and 18 — so a plan that retypes or
+    /// drops one is refused here rather than by the engine halfway through. Two
+    /// things release it: the same plan dropping the generated column, or an
+    /// earlier change in the plan to the generated column's expression whose text
+    /// does not name the input (DEC-1316.1).
+    ///
+    /// Required, for the reason of [`Self::permission_support`].
+    async fn generation_support(
+        &self,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        ids: &IdsFile,
+    ) -> anyhow::Result<ConnectedCheck>;
+    /// Cluster-owned identities move before pbps plans their database grants;
+    /// the rename evidence this reads is the engine's. Required: an engine that
+    /// was never asked must not read as one with no role to move.
+    async fn external_roles(
+        &self,
+        conn: &mut Conn,
+        recorded: &IdsFile,
+        declared: &IdsFile,
+    ) -> anyhow::Result<ExternalRoleRenames>;
+    /// Predicts existing table, column and key `DROP` dependencies in the
+    /// caller's transaction. The other engine's rename reader does not answer
+    /// this question (issue 254). Required, for the reason of
+    /// [`Self::permission_support`].
+    async fn drop_blockers(
+        &self,
+        conn: &mut Conn,
+        plan: &pbps_model::SavedPlan,
+        stored: &Schema,
+        stored_ids: &IdsFile,
+    ) -> anyhow::Result<()>;
+    /// What the connected server can take of a saved plan, asked again where the
+    /// plan runs: a catalog read refused in the caller's transaction (a failed
+    /// read is an error, never "no referencers" or "unpublished"), then the
+    /// edition verdict (ADR-0003). Required, for the reason of
+    /// [`Self::permission_support`].
+    async fn preflight_limits(
+        &self,
+        conn: &mut Conn,
+        plan: &pbps_model::SavedPlan,
+    ) -> Result<EditionVerdict, anyhow::Error>;
+    /// The members and the owned securables of every user-defined role, for the
+    /// `DROP ROLE` that has to remove them first and that the engine will not
+    /// run over an owner (ADR-0005). Required: an engine whose roles are not
+    /// this tool's to drop refuses by name, and an empty answer from one never
+    /// asked would read as "no member, owns nothing".
+    async fn role_drop_facts(
+        &self,
+        conn: &mut Conn,
+    ) -> anyhow::Result<(
+        BTreeMap<pbps_model::RoleName, Vec<pbps_model::RoleName>>,
+        BTreeMap<pbps_model::RoleName, Vec<String>>,
+    )>;
+    /// Among `names`, the pairs the database reads as one name (DECISIONS 123).
+    /// Required, for the reason of [`Self::role_drop_facts`].
+    async fn alike_role_names(
+        &self,
+        conn: &mut Conn,
+        names: &[&str],
+    ) -> anyhow::Result<Vec<(String, String)>>;
+    /// The database principals holding any of `names`, except the ones this plan
+    /// vacates (DECISIONS 118, 119). Required, for the reason of
+    /// [`Self::role_drop_facts`].
+    async fn principal_name_holders(
+        &self,
+        conn: &mut Conn,
+        names: &[&str],
+        vacated: &[&str],
+    ) -> anyhow::Result<Vec<(String, String, String)>>;
+    /// What a rename touches, read from the engine's own catalog.
+    async fn rename_report(
+        &self,
+        conn: &mut Conn,
+        target: &RenameTarget,
+    ) -> Result<ImpactReport, ImpactError>;
+    /// Binds and vets every recorded conversion's expression, before the
+    /// pre-flight evaluates it over the rows or the `ALTER` runs it (#2331,
+    /// DEC-2331.1). Nothing to vet on an engine that records none.
+    async fn conversions(
+        &self,
+        conn: &mut Conn,
+        admission: &RoutineAdmission,
+        changes: &[pbps_model::PlannedChange],
+    ) -> anyhow::Result<BTreeSet<pbps_model::ColumnRef>>;
+    /// Which requested names occur in an already captured table inventory.
     async fn removed_name_matches(
         &self,
         conn: &mut Conn,
         wanted: &[TableName],
         observed: &[TableName],
-    ) -> anyhow::Result<Vec<TableName>> {
-        matching_table_names(conn, wanted, observed).await
-    }
+    ) -> anyhow::Result<Vec<TableName>>;
 }
 
 /// Preserved adapters have only a connection; the apply service already has
