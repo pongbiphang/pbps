@@ -275,6 +275,13 @@ impl Dialect for Mssql {
         true
     }
 
+    /// **Yes.** A three-part name reaches a table, view or routine in another
+    /// database on the same server, and the declared columns are checked
+    /// against this engine's types.
+    fn has_cross_database_dependencies(&self) -> bool {
+        true
+    }
+
     fn creation_inline(&self, name: &TableName, table: &Table) -> pbps_dialect::creation::Inline {
         generated::inline(name, table)
     }

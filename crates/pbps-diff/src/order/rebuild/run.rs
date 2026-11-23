@@ -415,7 +415,7 @@ pub fn expand(
     dialect: &dyn Dialect,
 ) -> Result<Expanded, String> {
     let run = || {
-        if dialect.name() != "postgres" || input.mode != PlanMode::Transactional {
+        if !dialect.rebuilds_tables() || input.mode != PlanMode::Transactional {
             return Err("rebuild requires PostgreSQL transactional mode".into());
         }
         let target =

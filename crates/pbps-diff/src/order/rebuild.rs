@@ -182,7 +182,7 @@ pub fn prepare(
     dialect: &dyn Dialect,
     recipes: &mut Recipes<'_>,
 ) -> Result<Prepared, String> {
-    if dialect.name() != "postgres" || input.mode != PlanMode::Transactional {
+    if !dialect.rebuilds_tables() || input.mode != PlanMode::Transactional {
         return Err(format!(
             "{}: rebuild requires PostgreSQL transactional mode",
             input.root.table.shown()
@@ -796,7 +796,7 @@ pub(super) fn validate_saved(
         }
     }
     for copy in copies {
-        if dialect.name() != "postgres" || plan.mode != PlanMode::Transactional {
+        if !dialect.rebuilds_tables() || plan.mode != PlanMode::Transactional {
             return Err("rebuild requires PostgreSQL transactional mode".into());
         }
         let (mut key, intent) = plan

@@ -289,7 +289,7 @@ pub(super) async fn plan_db_selected(
                     schema: &loaded.schema,
                     ids: &resolved.ids,
                 },
-                dialect.name(),
+                pbps_diff::Packages::of(dialect.as_ref()),
             );
             if !errors.is_empty() {
                 bail!(

@@ -30,13 +30,23 @@ fn qualify(
     super::qualify(base, desired, table, &pbps_dialect::MinimalDialect)
 }
 
-/// `MinimalDialect` under PostgreSQL's name: the lineage rules that need an
-/// engine able to rebuild read the name, nothing else.
+/// `MinimalDialect` under PostgreSQL's name and with what neutral code asks
+/// of that engine: the lineage rules need an engine able to rebuild, and read
+/// that capability, nothing else.
 struct Postgres;
 
 impl pbps_dialect::Dialect for Postgres {
     fn name(&self) -> &'static str {
         "postgres"
+    }
+    fn rebuilds_tables(&self) -> bool {
+        true
+    }
+    fn has_extensions(&self) -> bool {
+        true
+    }
+    fn manages_row_security(&self) -> bool {
+        true
     }
     fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
         pbps_dialect::MinimalDialect.quote_ident(ident)

@@ -483,7 +483,11 @@ pub(crate) fn diff_partial_rebuilding(
     if !rebuilds.is_empty() {
         return Diffed {
             changes: ChangeSet { changes: rebuilds },
-            errors: crate::extensions::differences(base, declared, dialect.name()),
+            errors: crate::extensions::differences(
+                base,
+                declared,
+                crate::extensions::Packages::of(dialect),
+            ),
         };
     }
     // The passes below read module-to-module edges; the other references are
@@ -497,7 +501,7 @@ pub(crate) fn diff_partial_rebuilding(
     errs.extend(crate::extensions::differences(
         base,
         declared,
-        dialect.name(),
+        crate::extensions::Packages::of(dialect),
     ));
     diff_sequences(base.schema, declared.schema, dialect, &mut errs);
     if !dialect.records_conversions() && !declared.ids.conversions.is_empty() {
@@ -538,22 +542,34 @@ pub(crate) fn diff_partial_rebuilding(
     changes.extend(crate::extensions::creates(
         base,
         declared,
-        dialect.name(),
+        crate::extensions::Packages::of(dialect),
         &hints.extension_requires,
     ));
-    let (extension_drops, extension_drop_errors) =
-        crate::extensions::drops(base, declared, dialect.name(), &hints.extension_drops);
+    let (extension_drops, extension_drop_errors) = crate::extensions::drops(
+        base,
+        declared,
+        crate::extensions::Packages::of(dialect),
+        &hints.extension_drops,
+    );
     changes.extend(extension_drops);
     errs.extend(extension_drop_errors);
-    let (extension_updates, extension_update_errors) =
-        crate::extensions::updates(base, declared, dialect.name(), &hints.extension_updates);
+    let (extension_updates, extension_update_errors) = crate::extensions::updates(
+        base,
+        declared,
+        crate::extensions::Packages::of(dialect),
+        &hints.extension_updates,
+    );
     changes.extend(extension_updates);
     errs.extend(extension_update_errors);
     // After the updates: a move of a package that is also updated starts from
     // the version the update leaves, and the plan's own order keeps them so
     // (DEC-2447.11).
-    let (extension_moves, extension_move_errors) =
-        crate::extensions::moves(base, declared, dialect.name(), &hints.extension_moves);
+    let (extension_moves, extension_move_errors) = crate::extensions::moves(
+        base,
+        declared,
+        crate::extensions::Packages::of(dialect),
+        &hints.extension_moves,
+    );
     changes.extend(extension_moves);
     errs.extend(extension_move_errors);
     changes.extend(diff_search(base, declared, hints, &mut errs));

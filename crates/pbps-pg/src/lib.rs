@@ -2791,6 +2791,32 @@ impl Dialect for Postgres {
         true
     }
 
+    /// **Yes.** `pbps rebuild-table` builds the replacement in the one
+    /// transaction PostgreSQL's transactional DDL allows, and the catalog
+    /// reader and the recipes in this crate cover the rewrite end to end.
+    fn rebuilds_tables(&self) -> bool {
+        true
+    }
+
+    /// **Yes.** Packages are `CREATE EXTENSION` objects in a schema, pinned by
+    /// version and read back from `pg_extension`.
+    fn has_extensions(&self) -> bool {
+        true
+    }
+
+    /// **Yes.** `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` and `CREATE
+    /// POLICY`; a policy depends on the columns it names, which the catalog's
+    /// `pg_depend` reports.
+    fn manages_row_security(&self) -> bool {
+        true
+    }
+
+    /// **Yes.** An OID-alias input (`'s.t'::regclass`) resolves a literal to a
+    /// relation when the statement runs, so it must already exist then.
+    fn names_relations_in_literals(&self) -> bool {
+        true
+    }
+
     fn symbolic_effects(
         &self,
         op: &pbps_model::operation::Operation,

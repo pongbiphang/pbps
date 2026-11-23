@@ -3628,6 +3628,10 @@ fn annotation_findings(
     // A reference to something this engine does not have is named for that,
     // and the edge is then not judged again as an unknown target.
     let mut annotations = annotations.clone();
+    // By name, and deliberately: the list and the sentence below are about
+    // PostgreSQL's own objects (DEC-2469.8), not about a capability another
+    // engine could answer for. An engine that gains one of these objects
+    // needs its own list here, which no flag on the dialect would give it.
     if dialect.name() != "postgres" {
         let foreign = |reference: &pbps_model::object_ref::ObjectRef| {
             reference
@@ -3710,7 +3714,7 @@ fn declaration_problems_with_sources(
         extensions,
     } = schema;
     let mut out = dependencies::problems(&loaded.dependencies, dialect);
-    if dialect.name() != "postgres" {
+    if !dialect.has_extensions() {
         for name in extensions.keys() {
             out.push((
                 "dialect.rejected",
@@ -4723,7 +4727,7 @@ fn cmd_rebuild_table(
     reason: &pbps_model::Reason,
 ) -> anyhow::Result<()> {
     let dialect = dialect(project)?;
-    if dialect.name() != "postgres" {
+    if !dialect.rebuilds_tables() {
         bail!("rebuild-table is only supported for PostgreSQL");
     }
     let loaded = load(project, dialect.as_ref())?;

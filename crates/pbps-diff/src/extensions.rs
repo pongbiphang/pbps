@@ -1,6 +1,33 @@
 use crate::{Side, schema_diff::DiffError};
 use std::collections::BTreeSet;
 
+/// Whether the engine has extension packages, asked of the dialect once
+/// ([`pbps_dialect::Dialect::has_extensions`]) and passed to every pass here.
+///
+/// It is not a `bool` because the one refusal for a declared extension on an
+/// engine without them names that engine, and a pass that held only "no"
+/// would have to be handed the name beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Packages<'a> {
+    /// The engine installs packages; the passes plan them.
+    Installable,
+    /// The engine has none. The passes plan nothing, and a managed extension
+    /// on either side is refused for `engine`.
+    Absent { engine: &'a str },
+}
+
+impl<'a> Packages<'a> {
+    pub fn of(dialect: &'a (impl pbps_dialect::Dialect + ?Sized)) -> Self {
+        if dialect.has_extensions() {
+            Packages::Installable
+        } else {
+            Packages::Absent {
+                engine: dialect.name(),
+            }
+        }
+    }
+}
+
 /// The adopted packages a connected or scratch bootstrap must already hold.
 ///
 /// This is not lifecycle permission: callers must verify these exact
@@ -41,13 +68,13 @@ pub fn bootstrap_base(desired: Side<'_>) -> (pbps_model::Schema, pbps_model::Ids
 pub fn creates(
     base: Side<'_>,
     desired: Side<'_>,
-    dialect: &str,
+    packages: Packages<'_>,
     requires: &std::collections::BTreeMap<
         pbps_model::ObjectLocalName,
         BTreeSet<pbps_model::ObjectLocalName>,
     >,
 ) -> Vec<pbps_model::Change> {
-    if dialect != "postgres" {
+    if packages != Packages::Installable {
         return Vec::new();
     }
     let created: std::collections::BTreeMap<_, _> = desired
@@ -108,10 +135,10 @@ fn retired<'a>(
 pub fn drops(
     base: Side<'_>,
     desired: Side<'_>,
-    dialect: &str,
+    packages: Packages<'_>,
     facts: &std::collections::BTreeMap<pbps_model::ObjectLocalName, pbps_model::ExtensionDropFacts>,
 ) -> (Vec<pbps_model::Change>, Vec<DiffError>) {
-    if dialect != "postgres" {
+    if packages != Packages::Installable {
         return (Vec::new(), Vec::new());
     }
     let dropped: std::collections::BTreeMap<_, _> = retired(base, desired)
@@ -238,13 +265,13 @@ pub fn drops(
 pub fn updates(
     base: Side<'_>,
     desired: Side<'_>,
-    dialect: &str,
+    packages: Packages<'_>,
     facts: &std::collections::BTreeMap<
         pbps_model::ObjectLocalName,
         pbps_model::ExtensionUpdateFacts,
     >,
 ) -> (Vec<pbps_model::Change>, Vec<DiffError>) {
-    if dialect != "postgres" {
+    if packages != Packages::Installable {
         return (Vec::new(), Vec::new());
     }
     let removed: Vec<&pbps_model::ModuleId> = base
@@ -324,13 +351,13 @@ pub fn updates(
 pub fn moves(
     base: Side<'_>,
     desired: Side<'_>,
-    dialect: &str,
+    packages: Packages<'_>,
     facts: &std::collections::BTreeMap<
         pbps_model::ObjectLocalName,
         std::collections::BTreeSet<pbps_model::ProviderMember>,
     >,
 ) -> (Vec<pbps_model::Change>, Vec<DiffError>) {
-    if dialect != "postgres" {
+    if packages != Packages::Installable {
         return (Vec::new(), Vec::new());
     }
     let removed: Vec<&pbps_model::ModuleId> = base
@@ -815,7 +842,7 @@ pub(crate) fn depths<'a>(
 /// Refusals share the drift channel, so no executable plan can lose an
 /// extension difference merely because no Change can yet express it. A create
 /// is not one: [`creates`] expresses it.
-pub fn differences(base: Side<'_>, desired: Side<'_>, dialect: &str) -> Vec<DiffError> {
+pub fn differences(base: Side<'_>, desired: Side<'_>, packages: Packages<'_>) -> Vec<DiffError> {
     let mut errors = Vec::new();
     let mut refuse = |name: &pbps_model::ObjectLocalName, action: String| {
         errors.push(DiffError::ExtensionLifecycleUnsupported {
@@ -835,8 +862,8 @@ pub fn differences(base: Side<'_>, desired: Side<'_>, dialect: &str) -> Vec<Diff
         })
         .collect::<BTreeSet<_>>()
     {
-        if dialect != "postgres" {
-            refuse(name, format!("PostgreSQL extensions on {}", dialect));
+        if let Packages::Absent { engine } = packages {
+            refuse(name, format!("PostgreSQL extensions on {}", engine));
             continue;
         }
         match (
@@ -896,9 +923,9 @@ pub fn differences(base: Side<'_>, desired: Side<'_>, dialect: &str) -> Vec<Diff
 pub fn prerequisite_differences(
     base: Side<'_>,
     desired: Side<'_>,
-    dialect: &str,
+    packages: Packages<'_>,
 ) -> Vec<DiffError> {
-    let mut errors = differences(base, desired, dialect);
+    let mut errors = differences(base, desired, packages);
     for name in retired(base, desired) {
         errors.push(DiffError::ExtensionLifecycleUnsupported {
             name: name.clone(),
@@ -924,7 +951,7 @@ pub fn prerequisite_differences(
             }
         }
     }
-    for change in creates(base, desired, dialect, &Default::default()) {
+    for change in creates(base, desired, packages, &Default::default()) {
         if let pbps_model::Change::Extension(pbps_model::ExtensionChange::CreateExtension {
             name,
             ..
@@ -969,8 +996,8 @@ mod tests {
                     schema: &empty,
                     ids: &no_ids,
                 };
-                assert!(differences(unowned, absent, "postgres").is_empty());
-                assert!(differences(absent, unowned, "postgres").is_empty());
+                assert!(differences(unowned, absent, Packages::Installable).is_empty());
+                assert!(differences(absent, unowned, Packages::Installable).is_empty());
                 assert!(bootstrap_base(unowned).0.extensions.is_empty());
                 let ids = IdsFile {
                     extensions: [("e_000001".parse().unwrap(), name.into())].into(),
@@ -982,8 +1009,8 @@ mod tests {
                 };
                 // A recorded identity for an absent package is a create, which
                 // `differences` leaves to `creates`; it is not a refusal.
-                assert!(differences(absent, owned, "postgres").is_empty());
-                let planned = creates(absent, owned, "postgres", &Default::default());
+                assert!(differences(absent, owned, Packages::Installable).is_empty());
+                let planned = creates(absent, owned, Packages::Installable, &Default::default());
                 assert!(
                     matches!(
                         planned.as_slice(),
@@ -991,13 +1018,17 @@ mod tests {
                     ),
                     "{planned:?}"
                 );
-                assert!(creates(owned, absent, "postgres", &Default::default()).is_empty());
-                assert!(creates(unowned, absent, "postgres", &Default::default()).is_empty());
+                assert!(
+                    creates(owned, absent, Packages::Installable, &Default::default()).is_empty()
+                );
+                assert!(
+                    creates(unowned, absent, Packages::Installable, &Default::default()).is_empty()
+                );
                 for (before, after, action) in [
                     (owned, absent, "DROP EXTENSION"),
                     (unowned, owned, "identity"),
                 ] {
-                    let errors = differences(before, after, "postgres");
+                    let errors = differences(before, after, Packages::Installable);
                     assert_eq!(errors.len(), 1);
                     assert!(errors[0].to_string().contains(action));
                 }
@@ -1042,7 +1073,7 @@ mod tests {
                     ids: &scratch_ids
                 },
                 desired,
-                "postgres"
+                Packages::Installable
             )
             .is_empty()
         );
@@ -1051,13 +1082,21 @@ mod tests {
             schema: &empty,
             ids: &IdsFile::default(),
         };
-        assert!(differences(nothing, desired, "postgres").is_empty());
+        assert!(differences(nothing, desired, Packages::Installable).is_empty());
         assert_eq!(
-            creates(nothing, desired, "postgres", &Default::default()).len(),
+            creates(nothing, desired, Packages::Installable, &Default::default()).len(),
             1
         );
         // The same declarations plan nothing on another engine, which refuses.
-        assert!(creates(nothing, desired, "mssql", &Default::default()).is_empty());
+        assert!(
+            creates(
+                nothing,
+                desired,
+                Packages::Absent { engine: "mssql" },
+                &Default::default()
+            )
+            .is_empty()
+        );
         assert!(
             differences(
                 Side {
@@ -1065,7 +1104,7 @@ mod tests {
                     ids: &scratch_ids
                 },
                 desired,
-                "mssql"
+                Packages::Absent { engine: "mssql" }
             )[0]
             .to_string()
             .contains("PostgreSQL extensions")
@@ -1093,15 +1132,15 @@ mod tests {
             schema: &schema,
             ids: &ids,
         };
-        assert!(differences(side, side, "postgres").is_empty());
-        assert!(!differences(side, side, "mssql").is_empty());
+        assert!(differences(side, side, Packages::Installable).is_empty());
+        assert!(!differences(side, side, Packages::Absent { engine: "mssql" }).is_empty());
         let found = differences(
             side,
             Side {
                 schema: &Schema::default(),
                 ids: &ids,
             },
-            "postgres",
+            Packages::Installable,
         );
         assert!(
             found
@@ -1134,8 +1173,8 @@ mod tests {
                 schema: &changed,
                 ids: &ids,
             };
-            assert!(differences(side, desired, "postgres").is_empty());
-            let strict = prerequisite_differences(side, desired, "postgres");
+            assert!(differences(side, desired, Packages::Installable).is_empty());
+            let strict = prerequisite_differences(side, desired, Packages::Installable);
             assert_eq!(strict.len(), actions.len(), "{strict:?}");
             for action in actions {
                 assert!(
@@ -1149,7 +1188,7 @@ mod tests {
             schema: &empty,
             ids: &IdsFile::default(),
         };
-        assert!(differences(nothing, side, "postgres").is_empty());
+        assert!(differences(nothing, side, Packages::Installable).is_empty());
         let new_ids = IdsFile {
             extensions: [("e_000001".parse().unwrap(), "other".into())].into(),
             ..Default::default()
@@ -1161,7 +1200,7 @@ mod tests {
                     schema: &schema,
                     ids: &new_ids
                 },
-                "postgres"
+                Packages::Installable
             )
             .iter()
             .any(|e| e.to_string().contains("immutable"))
@@ -1303,7 +1342,7 @@ mod tests {
                     schema: &self.desired,
                     ids: &self.desired_ids,
                 },
-                "postgres",
+                Packages::Installable,
                 facts,
             )
         }
@@ -1374,7 +1413,7 @@ mod tests {
                 schema: &untombstoned.desired,
                 ids: &untombstoned.desired_ids,
             },
-            "postgres",
+            Packages::Installable,
         );
         assert!(
             refused[0].to_string().contains("without a recorded intent"),
@@ -1389,7 +1428,7 @@ mod tests {
                 schema: &w.desired,
                 ids: &w.desired_ids,
             },
-            "postgres",
+            Packages::Installable,
         );
         assert!(tombstoned.is_empty(), "{tombstoned:?}");
         // The strict variant for bootstrap callers refuses a drop whatever.
@@ -1402,7 +1441,7 @@ mod tests {
                 schema: &w.desired,
                 ids: &w.desired_ids,
             },
-            "postgres",
+            Packages::Installable,
         );
         assert!(
             strict[0].to_string().contains("DROP EXTENSION"),
@@ -1427,7 +1466,7 @@ mod tests {
                 schema: &w.desired,
                 ids: &w.desired_ids,
             },
-            "mssql",
+            Packages::Absent { engine: "mssql" },
             &facts("citext", &[], &[]),
         );
         assert!(changes.is_empty() && errors.is_empty());
@@ -1930,7 +1969,7 @@ mod tests {
                     schema: desired,
                     ids: desired_ids,
                 },
-                "postgres",
+                Packages::Installable,
                 facts,
             )
         }
@@ -2033,7 +2072,7 @@ mod tests {
                 schema: &desired,
                 ids: &desired_ids,
             },
-            "mssql",
+            Packages::Absent { engine: "mssql" },
             &facts,
         );
         assert!(none.is_empty() && errors.is_empty());
@@ -2049,7 +2088,7 @@ mod tests {
                         schema: &desired,
                         ids: &desired_ids,
                     },
-                    "postgres",
+                    Packages::Installable,
                     &[("cube".into(), Default::default())].into(),
                 )
                 .iter(),
@@ -2604,7 +2643,7 @@ mod tests {
             .into(),
         )]
         .into();
-        let run = |base: &Schema, desired: &Schema, facts: &_, dialect: &str| {
+        let run = |base: &Schema, desired: &Schema, facts: &_, packages: Packages<'_>| {
             moves(
                 Side {
                     schema: base,
@@ -2614,11 +2653,11 @@ mod tests {
                     schema: desired,
                     ids: &ids,
                 },
-                dialect,
+                packages,
                 facts,
             )
         };
-        let (changes, errors) = run(&base, &desired, &facts, "postgres");
+        let (changes, errors) = run(&base, &desired, &facts, Packages::Installable);
         assert!(errors.is_empty(), "{errors:?}");
         let [
             pbps_model::Change::Extension(pbps_model::ExtensionChange::SetExtensionSchema {
@@ -2641,7 +2680,7 @@ mod tests {
             extensions: [("citext".into(), at("app", "1.6"))].into(),
             ..desired.clone()
         };
-        let (beside, _) = run(&base, &newer, &facts, "postgres");
+        let (beside, _) = run(&base, &newer, &facts, Packages::Installable);
         let [
             pbps_model::Change::Extension(pbps_model::ExtensionChange::SetExtensionSchema {
                 from,
@@ -2657,7 +2696,7 @@ mod tests {
 
         // Negatives: offline is named, the same schema, another identity and
         // another dialect plan nothing.
-        let (none, errors) = run(&base, &desired, &Default::default(), "postgres");
+        let (none, errors) = run(&base, &desired, &Default::default(), Packages::Installable);
         assert!(none.is_empty());
         let text = errors[0].to_string();
         assert!(
@@ -2668,7 +2707,11 @@ mod tests {
             extensions: [("citext".into(), at("ext", "1.4"))].into(),
             ..desired.clone()
         };
-        assert!(run(&base, &same, &facts, "postgres").0.is_empty());
+        assert!(
+            run(&base, &same, &facts, Packages::Installable)
+                .0
+                .is_empty()
+        );
         let other = IdsFile {
             extensions: [(uid("elsewhere"), "citext".into())].into(),
             ..Default::default()
@@ -2682,11 +2725,16 @@ mod tests {
                 schema: &desired,
                 ids: &other,
             },
-            "postgres",
+            Packages::Installable,
             &facts,
         );
         assert!(none.is_empty() && errors.is_empty());
-        let (none, errors) = run(&base, &desired, &facts, "mssql");
+        let (none, errors) = run(
+            &base,
+            &desired,
+            &facts,
+            Packages::Absent { engine: "mssql" },
+        );
         assert!(none.is_empty() && errors.is_empty());
     }
 }

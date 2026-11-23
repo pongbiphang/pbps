@@ -1344,13 +1344,23 @@ impl Dialect for Aliases {
     }
 }
 
-/// `MinimalDialect` under PostgreSQL's name, for the shapes only that
-/// dialect plans: a package's lifecycle (DEC-2447.12).
+/// `MinimalDialect` under PostgreSQL's name and with what neutral code asks
+/// of that engine, for the shapes only it plans: a package's lifecycle
+/// (DEC-2447.12).
 struct Postgres;
 
 impl Dialect for Postgres {
     fn name(&self) -> &'static str {
         "postgres"
+    }
+    fn rebuilds_tables(&self) -> bool {
+        true
+    }
+    fn has_extensions(&self) -> bool {
+        true
+    }
+    fn manages_row_security(&self) -> bool {
+        true
     }
     /// PostgreSQL reads a name inside a string literal too (`'app.docs'::regconfig`).
     fn generation_may_call(&self, text: &str, name: &str) -> bool {
@@ -21686,4 +21696,19 @@ fn an_unchanged_partition_default_follows_the_surviving_uid_into_a_dropped_name(
 #[test]
 fn a_changed_partition_default_cannot_hide_behind_the_dropped_columns_value() {
     partition_default_after_name_reuse("8", false);
+}
+
+/// The extension passes are told once whether the engine has packages, and
+/// an engine without them is carried by name for the one refusal (#2950).
+#[test]
+fn the_extension_passes_take_the_engines_answer_and_name_an_engine_without_packages() {
+    use crate::extensions::Packages;
+    assert_eq!(Packages::of(&Postgres), Packages::Installable);
+    // Negative: an engine that says nothing has none, whatever it is called.
+    assert_eq!(
+        Packages::of(&MinimalDialect),
+        Packages::Absent {
+            engine: MinimalDialect.name()
+        }
+    );
 }

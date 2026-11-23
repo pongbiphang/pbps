@@ -10,7 +10,7 @@ pub(super) fn settle(
 ) -> Result<ChangeSet, Refusal> {
     let mut skipped = Vec::new();
     let edges = pbps_diff::order::row_security::edges(cs.changes.iter().map(|p| &p.change));
-    let releases = if dialect.name() == "postgres" {
+    let releases = if dialect.manages_row_security() {
         match facts.policy_dependents {
             Some(found) => crate::row_security::policy_releases(&cs, declared.sources.after, found)
                 .map_err(Refusal::module_passes)?,

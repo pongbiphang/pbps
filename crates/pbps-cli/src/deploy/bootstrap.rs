@@ -208,7 +208,7 @@ pub(super) fn refuse_nonempty_bootstrap(
                 .keys()
                 // Exact PostgreSQL packages are separately checked prerequisites,
                 // like standing cluster roles, not objects we create (DEC-2447.2).
-                .filter(|_| dialect.name() != "postgres")
+                .filter(|_| !dialect.has_extensions())
                 .map(|name| format!("extension {}", name.shown())),
         )
         // Omitted definitions still occupy names in the managed set.
@@ -251,7 +251,7 @@ pub(super) fn refuse_extension_prerequisite_drift(
             schema: desired,
             ids,
         },
-        dialect.name(),
+        pbps_diff::Packages::of(dialect),
     );
     if !errors.is_empty() {
         bail!(
@@ -471,7 +471,7 @@ pub(super) async fn bootstrap_async(
         // `--db`, before any script is written, and refused without one. One
         // refusal names them all.
         let mut refused = Vec::new();
-        if dialect.name() == "postgres" {
+        if dialect.names_relations_in_literals() {
             let offline = crate::dependents::names_a_later_relation(
                 &cs,
                 dialect.as_ref(),

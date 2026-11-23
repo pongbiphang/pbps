@@ -8,7 +8,7 @@ pub fn problems(
 ) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     for (name, declaration) in declarations {
-        if dialect.name() != "mssql" {
+        if !dialect.has_cross_database_dependencies() {
             out.push((
                 "dialect.rejected",
                 format!(

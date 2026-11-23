@@ -42,7 +42,7 @@ pub fn validate(
         }) = &step.change
         {
             if table.has_row_security() {
-                if dialect.name() != "postgres"
+                if !dialect.manages_row_security()
                     || table.partition_by.is_some()
                     || table.partition_of.is_some()
                 {
@@ -91,7 +91,7 @@ pub fn validate(
                 table.shown()
             );
         };
-        if dialect.name() != "postgres" {
+        if !dialect.manages_row_security() {
             bail!(
                 "{}: row-security policies and flags require PostgreSQL",
                 table.shown()
