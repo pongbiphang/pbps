@@ -960,7 +960,7 @@ pub(crate) fn lineage_errors(
         };
         // Only PostgreSQL can hold a record the CLI wrote; one in another
         // engine's files was edited in by hand and is not read as history.
-        if dialect.name() != "postgres" {
+        if !dialect.rebuilds_tables() {
             errors.push(error(
                 table,
                 "this engine does not support table rebuilds".to_owned(),

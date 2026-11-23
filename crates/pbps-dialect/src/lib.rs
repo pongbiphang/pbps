@@ -3544,6 +3544,70 @@ pub trait Dialect {
         false
     }
 
+    /// Whether pbps rebuilds a table on this engine: builds its replacement
+    /// beside it, copies the rows across and retires the source (the approved
+    /// rewrite `pbps rebuild-table` records).
+    ///
+    /// The question is what this crate's recipes cover, not what the engine
+    /// could be made to do. The default answers `false`. Neutral code then
+    /// refuses `rebuild-table`, refuses to plan or replay a rebuild, and
+    /// refuses a rebuild record found in the files, which on such an engine
+    /// was edited in by hand and is not read as history. Answering `true` is
+    /// the engine's promise that every one of those paths has a recipe for it.
+    fn rebuilds_tables(&self) -> bool {
+        false
+    }
+
+    /// Whether this engine has installable extension packages that a
+    /// declaration can name (`extensions:` in the files).
+    ///
+    /// The default answers `false`, and a declared extension is then refused
+    /// as unsupported on the engine. Where it answers `true`, a package is a
+    /// prerequisite that `plan` and `apply` check (and, behind an approval,
+    /// install), never an object bootstrap builds: bootstrap's check that the
+    /// database is empty does not count one.
+    fn has_extensions(&self) -> bool {
+        false
+    }
+
+    /// Whether pbps manages row-level security on this engine: per-row
+    /// policies on a table, and the flags that turn them on.
+    ///
+    /// The question is what pbps declares and plans, not whether the engine
+    /// has the feature: SQL Server has security policies and answers `false`,
+    /// the default, because nothing here reads or writes them. Neutral code
+    /// then refuses a policy or a flag on any table and plans no policy
+    /// release. Where it answers `true`, a policy depends on the columns its
+    /// expressions name, so a change to one of those columns releases the
+    /// policy first and restores it after, from the catalog's dependents.
+    fn manages_row_security(&self) -> bool {
+        false
+    }
+
+    /// Whether this engine can hold a dependency on an object in another
+    /// database, which the files declare under `dependencies:`.
+    ///
+    /// The default answers `false`, and neutral code refuses a declared
+    /// dependency as supported only where the engine has them. Where it
+    /// answers `true`, each column of a declared dependency is checked
+    /// against the engine's types.
+    fn has_cross_database_dependencies(&self) -> bool {
+        false
+    }
+
+    /// Whether this engine reads a string literal in an expression as the
+    /// name of a relation (PostgreSQL's `'s.t'::regclass`), so that an
+    /// expression can name a relation that the plan creates only after it.
+    ///
+    /// The default answers `false`: a literal is data, and the ordering
+    /// check for a relation named too early has nothing to look for. Where
+    /// it answers `true`, `bootstrap` and a connected plan refuse such an
+    /// expression with the two-plan remedy before any script is written,
+    /// rather than leaving the engine to roll the statement back.
+    fn names_relations_in_literals(&self) -> bool {
+        false
+    }
+
     /// Whether a filter on an index can bind something when the index is
     /// created (a PostgreSQL partial-index predicate may call a function). A
     /// SQL Server filtered index predicate binds only its own table's
@@ -6216,6 +6280,19 @@ mod tests {
             T_SQL.normalize_definition("SELECT $tag$a  b$tag$"),
             "SELECT $tag$a b$tag$"
         );
+    }
+
+    /// An engine that says nothing about what it can do lacks each of these
+    /// things, so neutral code refuses them for it instead of giving it the
+    /// answer of whichever engine it was written against (#2950).
+    #[test]
+    fn an_engine_that_overrides_no_capability_lacks_each_of_them() {
+        let d = MinimalDialect;
+        assert!(!d.rebuilds_tables());
+        assert!(!d.has_extensions());
+        assert!(!d.manages_row_security());
+        assert!(!d.has_cross_database_dependencies());
+        assert!(!d.names_relations_in_literals());
     }
 
     /// A `--` comment runs to the end of its line, so that line ending is

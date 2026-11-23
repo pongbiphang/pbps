@@ -322,7 +322,10 @@ fn oracle_schedule(
 ) -> Result<OracleScheduled, Refusal> {
     let (mut added, mut split, mut moved) = (0, 0, 0);
     let mut skipped = Vec::new();
-    if dialect.name() == "postgres" {
+    // The route of an engine whose module edit is a drop and a create: the
+    // passes below place each rebuilt module among what holds it. An engine
+    // that edits a module in place takes the other branch.
+    if dialect.rebuilds_modules() {
         // Out of the way of the reordering passes, and back beside each
         // routine's final `CREATE` once they are done (#687).
         let decisions = take_public_execution(&mut cs);
@@ -456,7 +459,7 @@ fn oracle_schedule(
     )
     .map_err(Refusal)?;
     let edges = pbps_diff::order::row_security::edges(cs.changes.iter().map(|p| &p.change));
-    let releases = if dialect.name() == "postgres" {
+    let releases = if dialect.manages_row_security() {
         match facts.policy_dependents {
             Some(found) => crate::row_security::policy_releases(&cs, declared.sources.after, found)
                 .map_err(Refusal::module_passes)?,
