@@ -687,7 +687,12 @@ pub(crate) fn judge_slots(
 ) -> (Vec<String>, bool) {
     use super::slots::{SlotViolation, analyse, verify};
     let slots = analyse(ops, owners, before, dialect);
-    let (violations, skipped) = verify(ops, &slots, dialect, facts, owners, before);
+    // A name the models cannot read fails the run with its own text: the
+    // judge has lines to report and no other way to refuse.
+    let (violations, skipped) = match verify(ops, &slots, dialect, facts, owners, before) {
+        Ok(found) => found,
+        Err(why) => return (vec![format!("slot replay: {why}")], true),
+    };
     // The class order has not visited after_the_rebuilds yet. Type and
     // constraint-trigger handovers join that existing slot settlement;
     // every subsequent replay must satisfy them (DEC-1635.3, DEC-2100.1).

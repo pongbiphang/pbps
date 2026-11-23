@@ -226,7 +226,8 @@ impl Plan {
         };
         let ops = crate::order::reordered_operations(&logical, order);
         let slots = analyse(ops.as_slice(), &owners, before, dialect);
-        let (violations, skipped) = verify(ops.as_slice(), &slots, dialect, facts, &owners, before);
+        let (violations, skipped) =
+            verify(ops.as_slice(), &slots, dialect, facts, &owners, before).unwrap();
         // The effects' replay on the same order: what the slots add to it.
         let fx: Vec<_> = ops
             .iter()
@@ -256,7 +257,7 @@ impl Plan {
         };
         let ops = logical.as_slice();
         let slots = analyse(ops, &owners, before, dialect);
-        let held = carried(ops, facts, &owners, before, dialect);
+        let held = carried(ops, facts, &owners, before, dialect).unwrap();
         edges(&slots, Some(facts), &held)
     }
 }
@@ -357,7 +358,7 @@ fn a_claim_on_an_intermediate_name_held_at_that_statement_is_refused() {
     for fx in &mut slots.effects {
         fx.intermediate.clear();
     }
-    let (unguarded, _) = verify(ops.as_slice(), &slots, &exact, None, &owners, before);
+    let (unguarded, _) = verify(ops.as_slice(), &slots, &exact, None, &owners, before).unwrap();
     assert!(unguarded.is_empty(), "{unguarded:?}");
 }
 
@@ -1168,4 +1169,107 @@ fn an_exclusion_clone_hands_its_name_over_as_a_key_clone_does() {
     let mut kept = facts.clone();
     kept.detach_releases.clear();
     assert!(plan.handovers(&dialect, &kept).is_empty());
+}
+
+/// Owners that answer one table's lookups with a chosen error and everything
+/// else as the plan does.
+struct Unreadable<'a> {
+    inner: &'a dyn pbps_model::operation::Owners,
+    table: TableName,
+    error: pbps_model::operation::OwnerError,
+}
+
+impl pbps_model::operation::Owners for Unreadable<'_> {
+    fn managed_type(
+        &self,
+        name: &pbps_model::TypeRef,
+        spelling: pbps_model::operation::Spelling,
+    ) -> Result<Uid, pbps_model::operation::OwnerError> {
+        self.inner.managed_type(name, spelling)
+    }
+    fn table(
+        &self,
+        name: &TableName,
+        spelling: pbps_model::operation::Spelling,
+    ) -> Result<Uid, pbps_model::operation::OwnerError> {
+        if *name == self.table {
+            return Err(self.error.clone());
+        }
+        self.inner.table(name, spelling)
+    }
+    fn column(
+        &self,
+        column: &pbps_model::ColumnRef,
+        spelling: pbps_model::operation::Spelling,
+    ) -> Result<Uid, pbps_model::operation::OwnerError> {
+        self.inner.column(column, spelling)
+    }
+    fn role(
+        &self,
+        name: &pbps_model::RoleName,
+        spelling: pbps_model::operation::Spelling,
+    ) -> Result<Uid, pbps_model::operation::OwnerError> {
+        self.inner.role(name, spelling)
+    }
+}
+
+#[test]
+fn an_unreadable_baseline_name_reaches_the_catalog_and_replay_refusals_with_its_name() {
+    use super::shadow::{Stage, judge_slots};
+    use pbps_model::operation::{OwnerError, Spelling};
+    let plan = Plan::new(&[("t", "app.t")], &[], vec![drop_table("t", "app.t")]);
+    let names = PlanNames::of(&plan.logical, &plan.after_ids).unwrap();
+    let plan_owners = PlanOwners::new(names, &plan.before_ids, &plan.after_ids);
+    let before = Snapshot {
+        schema: &plan.before,
+        ids: &plan.before_ids,
+    };
+    let ops = Operations::of_plan(&plan.logical, ModuleEdits::InPlace);
+    let dialect = Slotted { exact: true };
+    let facts = CatalogFacts::default();
+    let slots = analyse(ops.as_slice(), &plan_owners, before, &dialect);
+    // The control: the same plan over readable names gives both answers.
+    assert!(carried(ops.as_slice(), &facts, &plan_owners, before, &dialect).is_ok());
+    assert!(verify(ops.as_slice(), &slots, &dialect, None, &plan_owners, before).is_ok());
+
+    let unreadable = |error: OwnerError| Unreadable {
+        inner: &plan_owners,
+        table: name("app.t"),
+        error,
+    };
+    let broken = OwnerError::Names {
+        name: "app.t".into(),
+        spelling: Spelling::Base,
+        why: "two holders".into(),
+    };
+    let owners = unreadable(broken.clone());
+    assert_eq!(
+        carried(ops.as_slice(), &facts, &owners, before, &dialect).err(),
+        Some(broken.clone())
+    );
+    assert_eq!(
+        verify(ops.as_slice(), &slots, &dialect, None, &owners, before).err(),
+        Some(broken.clone())
+    );
+    let (lines, failed) = judge_slots(
+        ops.as_slice(),
+        &owners,
+        before,
+        &dialect,
+        None,
+        Stage::Final,
+    );
+    assert!(failed, "{lines:?}");
+    assert!(
+        lines.iter().any(|line| line.contains("app.t")),
+        "the failing line names the table: {lines:?}"
+    );
+
+    // A table the project does not declare is no refusal: it holds no name.
+    let undeclared = unreadable(OwnerError::Unmanaged {
+        name: "app.t".into(),
+        spelling: Spelling::Base,
+    });
+    assert!(carried(ops.as_slice(), &facts, &undeclared, before, &dialect).is_ok());
+    assert!(verify(ops.as_slice(), &slots, &dialect, None, &undeclared, before).is_ok());
 }

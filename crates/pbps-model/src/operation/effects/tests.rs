@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::change::DeleteCause;
-use crate::operation::{ModuleEdits, Operations};
+use crate::operation::{ModuleEdits, Named, Operations, baseline_names};
 use crate::{ComputedColumn, Index};
 use crate::{
     ConstraintChange, ForeignKey, GrantChange, IndexColumn, PartitionBound, PartitionOf,
@@ -81,10 +81,12 @@ struct Script {
     tables: Vec<(TableName, Reply)>,
     columns: Vec<(ColumnRef, Reply)>,
     roles: Vec<(RoleName, Reply)>,
+    types: Vec<(crate::TypeRef, Reply)>,
 }
 
 impl Script {
     fn table(mut self, name: &str, reply: Reply) -> Self {
+        self.tables.retain(|(n, _)| *n != t(name));
         self.tables.push((t(name), reply));
         self
     }
@@ -92,7 +94,18 @@ impl Script {
         self.table(name, Reply::Held(uid(UidKind::Table, name)))
     }
     fn column(mut self, table: &str, name: &str, reply: Reply) -> Self {
-        self.columns.push((t(table).column(name), reply));
+        let column = t(table).column(name);
+        // A later answer replaces an earlier one for the same name.
+        self.columns.retain(|(c, _)| *c != column);
+        self.columns.push((column, reply));
+        self
+    }
+    fn role(mut self, name: &str, reply: Reply) -> Self {
+        self.roles.push((RoleName::new(name), reply));
+        self
+    }
+    fn ty(mut self, name: &str, reply: Reply) -> Self {
+        self.types.push((mood(name), reply));
         self
     }
     fn held_column(self, table: &str, name: &str) -> Self {
@@ -102,6 +115,21 @@ impl Script {
 }
 
 impl Owners for Script {
+    fn managed_type(
+        &self,
+        name: &crate::TypeRef,
+        spelling: Spelling,
+    ) -> Result<crate::Uid, OwnerError> {
+        let shown = name.shown().to_string();
+        match self.types.iter().find(|(n, _)| n == name) {
+            Some((_, reply)) => reply.answer(&shown, spelling),
+            None => Err(OwnerError::Unmanaged {
+                name: shown,
+                spelling,
+            }),
+        }
+    }
+
     fn table(&self, name: &TableName, spelling: Spelling) -> Result<crate::Uid, OwnerError> {
         let shown = format!("{}.{}", name.schema, name.name);
         match self.tables.iter().find(|(n, _)| n == name) {
@@ -140,23 +168,42 @@ impl Owners for Script {
     }
 }
 
+fn mood(name: &str) -> crate::TypeRef {
+    crate::TypeRef::new("app", name).unwrap()
+}
+
 /// The effects of one step over the scripted names and the desired state.
 fn run(change: Change, owners: &Script, after: &Schema) -> Result<Effects, OwnerError> {
+    run_over(
+        change,
+        owners,
+        &Schema::default(),
+        &IdsFile::default(),
+        after,
+    )
+}
+
+/// The same, over a baseline that holds tables.
+fn run_over(
+    change: Change,
+    owners: &Script,
+    before_schema: &Schema,
+    no_ids: &IdsFile,
+    after: &Schema,
+) -> Result<Effects, OwnerError> {
     let ops = Operations::of_plan(&[PlannedChange::new(change)], ModuleEdits::InPlace);
-    let no_ids = IdsFile::default();
     let mut after_ids = IdsFile::default();
     for (name, reply) in &owners.tables {
         if let Reply::Held(uid) | Reply::HeldAtFinalOnly(uid) = reply {
             after_ids.tables.insert(uid.clone(), name.clone());
         }
     }
-    let before_schema = Schema::default();
     effects(
         &ops.as_slice()[0],
         owners,
         Snapshot {
-            schema: &before_schema,
-            ids: &no_ids,
+            schema: before_schema,
+            ids: no_ids,
         },
         Snapshot {
             schema: after,
@@ -622,4 +669,591 @@ fn an_unreadable_column_refuses_even_where_a_computed_column_has_its_name() {
         let owners = Script::default().held_table("t").column("t", "c", reply);
         run(unique_on("t", "c"), &owners, &after)
     });
+}
+
+// The lookups that only point at a name (DEC-2993.2).
+
+/// A step's context over scripted owners, to ask the lookups themselves.
+fn with_cx<R>(
+    owners: &Script,
+    before: (&Schema, &IdsFile),
+    after: (&Schema, &IdsFile),
+    ask: impl FnOnce(&mut Cx<'_>) -> R,
+) -> R {
+    with_cx_for(delete_row("t"), owners, before, after, ask)
+}
+
+fn with_cx_for<R>(
+    change: Change,
+    owners: &Script,
+    before: (&Schema, &IdsFile),
+    after: (&Schema, &IdsFile),
+    ask: impl FnOnce(&mut Cx<'_>) -> R,
+) -> R {
+    let ops = Operations::of_plan(&[PlannedChange::new(change)], ModuleEdits::InPlace);
+    let op = &ops.as_slice()[0];
+    let mut cx = Cx {
+        op,
+        owners,
+        before: Snapshot {
+            schema: before.0,
+            ids: before.1,
+        },
+        after: Snapshot {
+            schema: after.0,
+            ids: after.1,
+        },
+        spelling: op.origin().spelling(),
+        fx: Effects::default(),
+    };
+    ask(&mut cx)
+}
+
+fn empty() -> (Schema, IdsFile) {
+    (Schema::default(), IdsFile::default())
+}
+
+fn column_ref(table: &str, name: &str) -> ColumnRef {
+    t(table).column(name)
+}
+
+#[test]
+fn the_pointing_lookups_give_the_key_when_held_and_nothing_when_undeclared() {
+    let (schema, ids) = empty();
+    let script = Script::default().held_table("p").held_column("p", "c");
+    with_cx(&script, (&schema, &ids), (&schema, &ids), |cx| {
+        let table = Some(recorded(UidKind::Table, "p"));
+        let column = Some(ColumnKey::Recorded(recorded(UidKind::Column, "c")));
+        assert_eq!(cx.base_table(&t("p")).unwrap(), table);
+        assert_eq!(cx.final_table(&t("p")).unwrap(), table);
+        assert_eq!(cx.base_column(&column_ref("p", "c")).unwrap(), column);
+        assert_eq!(cx.final_column(&column_ref("p", "c")).unwrap(), column);
+        assert_eq!(cx.base_table(&t("far")).unwrap(), None);
+        assert_eq!(cx.final_table(&t("far")).unwrap(), None);
+        assert_eq!(cx.base_column(&column_ref("far", "c")).unwrap(), None);
+        assert_eq!(cx.final_column(&column_ref("far", "c")).unwrap(), None);
+    });
+}
+
+#[test]
+fn the_pointing_lookups_return_the_original_refusal_for_a_vacant_or_unreadable_name() {
+    let (schema, ids) = empty();
+    for why in faults("app.p") {
+        let script = Script::default()
+            .table("p", Reply::Fail(why.clone()))
+            .column("p", "c", Reply::Fail(why.clone()));
+        with_cx(&script, (&schema, &ids), (&schema, &ids), |cx| {
+            assert_eq!(cx.base_table(&t("p")), Err(why.clone()), "base_table");
+            assert_eq!(cx.final_table(&t("p")), Err(why.clone()), "final_table");
+            let column = column_ref("p", "c");
+            assert_eq!(cx.base_column(&column), Err(why.clone()), "base_column");
+            assert_eq!(cx.final_column(&column), Err(why.clone()), "final_column");
+        });
+    }
+}
+
+#[test]
+fn a_vacant_table_a_drop_foreign_key_points_at_refuses_and_an_undeclared_one_does_not() {
+    let mut before = Schema::default();
+    let mut child = Table::default();
+    child.foreign_keys.insert(
+        "fk".into(),
+        ForeignKey {
+            columns: vec!["c".into()],
+            references_table: t("parent"),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    before.tables.insert(t("child"), child);
+    let mut ids = IdsFile::default();
+    ids.tables.insert(uid(UidKind::Table, "child"), t("child"));
+    let drop = Change::Constraint(ConstraintChange::DropForeignKey {
+        table: t("child"),
+        name: "fk".into(),
+    });
+    let script = Script::default().held_table("child");
+    let after = Schema::default();
+    // `Cx::base_table` at the step `DropForeignKey` asks for its target.
+    assert!(run_over(drop.clone(), &script, &before, &ids, &after).is_ok());
+    let vacant = OwnerError::Vacant {
+        name: "app.parent".to_string(),
+        spelling: Spelling::Base,
+    };
+    let script = script.table("parent", Reply::Fail(vacant.clone()));
+    assert_eq!(
+        run_over(drop, &script, &before, &ids, &after).unwrap_err(),
+        vacant
+    );
+}
+
+#[test]
+fn the_renames_of_a_table_keep_the_rest_when_a_key_target_is_undeclared_and_refuse_when_unreadable()
+{
+    let mut child = Table::default();
+    child.foreign_keys.insert(
+        "fk".into(),
+        ForeignKey {
+            columns: vec!["c".into()],
+            references_table: t("far"),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    let mut before = Schema::default();
+    before.tables.insert(t("child"), child.clone());
+    let mut before_ids = IdsFile::default();
+    before_ids
+        .tables
+        .insert(uid(UidKind::Table, "child"), t("child"));
+    // The plan renames `child` to `kid`.
+    let mut after_ids = IdsFile::default();
+    after_ids
+        .tables
+        .insert(uid(UidKind::Table, "child"), t("kid"));
+    let after = Schema::default();
+    let script = Script::default().held_table("child");
+    let renames = with_cx(
+        &script,
+        (&before, &before_ids),
+        (&after, &after_ids),
+        |cx| cx.renames_of(&t("child"), &child),
+    )
+    .unwrap();
+    let mut expected = crate::rename::Renames::default();
+    expected.rename_table(t("child"), t("kid"));
+    assert_eq!(renames, expected, "the undeclared target leaves the rename");
+    for why in faults("app.far") {
+        let script = script.clone().table("far", Reply::Fail(why.clone()));
+        let got = with_cx(
+            &script,
+            (&before, &before_ids),
+            (&after, &after_ids),
+            |cx| cx.renames_of(&t("child"), &child),
+        );
+        assert_eq!(got, Err(why));
+    }
+}
+
+fn type_input_of(
+    script: &Script,
+    after: (&Schema, &IdsFile),
+) -> Result<Vec<Requirement>, OwnerError> {
+    let (schema, ids) = empty();
+    with_cx(script, (&schema, &ids), after, |cx| {
+        cx.type_input(&crate::ColumnType::reference(mood("mood")))?;
+        Ok(cx.fx.requires.clone())
+    })
+}
+
+fn package_in_app() -> (Schema, IdsFile) {
+    let mut schema = Schema::default();
+    schema.extensions.insert(
+        "citext".into(),
+        crate::Extension {
+            schema: "app".to_string(),
+            version: "1".to_string(),
+        },
+    );
+    let mut ids = IdsFile::default();
+    ids.extensions
+        .insert(uid(UidKind::Extension, "citext"), "citext".into());
+    (schema, ids)
+}
+
+#[test]
+fn a_held_type_is_required_in_its_final_incarnation_and_no_package_is() {
+    let (schema, ids) = package_in_app();
+    let script = Script::default().ty("mood", Reply::Held(uid(UidKind::Type, "mood")));
+    let required = type_input_of(&script, (&schema, &ids)).unwrap();
+    let ty = ObjectKey::Type(recorded(UidKind::Type, "mood"));
+    assert!(required.contains(&Requirement::Is(ty, Incarnation::Final)));
+    assert_eq!(required.len(), 1, "{required:?}");
+}
+
+#[test]
+fn an_undeclared_type_waits_for_a_package_in_its_schema_and_for_nothing_else() {
+    let (schema, ids) = package_in_app();
+    let script = Script::default();
+    let required = type_input_of(&script, (&schema, &ids)).unwrap();
+    let package = ObjectKey::Extension(recorded(UidKind::Extension, "citext"));
+    assert_eq!(
+        required.into_iter().collect::<Vec<_>>(),
+        [Requirement::Is(package, Incarnation::Final)]
+    );
+    let (schema, ids) = empty();
+    assert!(type_input_of(&script, (&schema, &ids)).unwrap().is_empty());
+}
+
+#[test]
+fn a_vacant_or_unreadable_type_refuses_and_is_never_taken_for_a_packages() {
+    let (schema, ids) = package_in_app();
+    for why in faults("app.mood") {
+        let script = Script::default().ty("mood", Reply::Fail(why.clone()));
+        assert_eq!(type_input_of(&script, (&schema, &ids)), Err(why));
+    }
+}
+
+fn copy_rows(source: &str, target: &str) -> Change {
+    let relation = |name: &str| crate::RebuildRelation {
+        uid: uid(UidKind::Table, name),
+        name: t(name),
+    };
+    Change::Partition(crate::PartitionChange::CopyTableRows(Box::new(
+        crate::CopyTableRows {
+            source: relation("src"),
+            target: relation("dst"),
+            columns: vec![crate::CopyColumn {
+                source: Some(crate::CopySource {
+                    column: column_ref("src", source),
+                    ty: crate::ColumnType::simple("int"),
+                    collation: None,
+                }),
+                target: column_ref("dst", target),
+                cast: crate::ColumnType::simple("int"),
+                collation: None,
+                stages: Vec::new(),
+            }],
+            source_partitions: Vec::new(),
+            target_partitions: Vec::new(),
+            max_rows: 1,
+        },
+    )))
+}
+
+fn copy_script() -> Script {
+    Script::default()
+        .held_table("src")
+        .held_table("dst")
+        .held_column("src", "a")
+        .held_column("dst", "b")
+}
+
+/// What the step's own effects say, before the names it reads are listed:
+/// `read_names` refuses the same columns again, so only this one shows which
+/// lookup refused.
+fn copy_effects(change: Change, owners: &Script) -> Result<Effects, OwnerError> {
+    let (schema, ids) = empty();
+    with_cx_for(change, owners, (&schema, &ids), (&schema, &ids), |cx| {
+        cx.by_kind().map(|()| cx.fx.clone())
+    })
+}
+
+#[test]
+fn the_columns_a_copy_moves_are_read_and_written_when_held() {
+    let fx = copy_effects(copy_rows("a", "b"), &copy_script()).unwrap();
+    assert!(fx.requires.contains(&Requirement::Reads(column_key("a"))));
+    assert!(
+        fx.requires
+            .contains(&Requirement::Is(column_key("b"), Incarnation::Final))
+    );
+}
+
+#[test]
+fn a_copy_refuses_a_column_that_is_undeclared_or_vacant_and_keeps_the_original_text() {
+    // The source column nobody declares.
+    let Err(OwnerError::Unmanaged { name, .. }) =
+        copy_effects(copy_rows("gone", "b"), &copy_script())
+    else {
+        panic!("an undeclared source column must refuse");
+    };
+    assert_eq!(name, "app.src.gone");
+    // The target column nobody declares.
+    let Err(OwnerError::Unmanaged { name, .. }) =
+        copy_effects(copy_rows("a", "gone"), &copy_script())
+    else {
+        panic!("an undeclared target column must refuse");
+    };
+    assert_eq!(name, "app.dst.gone");
+    ensure_refuses("CopyTableRows source column", "app.src.a", |reply| {
+        copy_effects(
+            copy_rows("a", "b"),
+            &copy_script().column("src", "a", reply),
+        )
+    });
+    ensure_refuses("CopyTableRows target column", "app.dst.b", |reply| {
+        copy_effects(
+            copy_rows("a", "b"),
+            &copy_script().column("dst", "b", reply),
+        )
+    });
+}
+
+fn base_of_child() -> (Schema, IdsFile) {
+    let mut schema = Schema::default();
+    schema.tables.insert(t("child"), Table::default());
+    (schema, IdsFile::default())
+}
+
+#[test]
+fn a_baseline_table_and_its_columns_are_found_when_held_and_missing_when_undeclared() {
+    let (before, ids) = base_of_child();
+    let snapshot = Snapshot {
+        schema: &before,
+        ids: &ids,
+    };
+    let name = t("child");
+    let script = Script::default()
+        .held_table("child")
+        .held_column("child", "c");
+    let found = base_table_named(&script, snapshot, &name).unwrap().unwrap();
+    assert_eq!(found.table_key(), table_key("child"));
+    assert_eq!(found.column(&script, "c").unwrap(), Some(column_key("c")));
+    assert_eq!(found.column(&script, "gone").unwrap(), None);
+    // A table the baseline lacks, or the project does not declare, is none.
+    assert!(
+        base_table_named(&script, snapshot, &t("absent"))
+            .unwrap()
+            .is_none()
+    );
+    let undeclared = Script::default();
+    assert!(
+        base_table_named(&undeclared, snapshot, &name)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn an_unreadable_baseline_table_or_column_is_the_original_refusal() {
+    let (before, ids) = base_of_child();
+    let snapshot = Snapshot {
+        schema: &before,
+        ids: &ids,
+    };
+    let name = t("child");
+    for why in faults("app.child") {
+        let script = Script::default().table("child", Reply::Fail(why.clone()));
+        assert_eq!(
+            base_table_named(&script, snapshot, &name).err(),
+            Some(why.clone())
+        );
+        let script =
+            Script::default()
+                .held_table("child")
+                .column("child", "c", Reply::Fail(why.clone()));
+        let found = base_table_named(&script, snapshot, &name).unwrap().unwrap();
+        assert_eq!(found.column(&script, "c").err(), Some(why));
+    }
+}
+
+// The names beside the effects (`slots.rs`).
+
+fn baseline_with_everything() -> (Schema, IdsFile) {
+    let mut schema = Schema::default();
+    let mut table = Table::default();
+    table.columns.insert(
+        "c".into(),
+        crate::Column::new(crate::ColumnType::simple("int")),
+    );
+    schema.tables.insert(t("child"), table);
+    schema
+        .roles
+        .insert(RoleName::new("ops"), Default::default());
+    (schema, IdsFile::default())
+}
+
+fn baseline_names_of(script: &Script) -> Result<Vec<Named>, OwnerError> {
+    let (before, ids) = baseline_with_everything();
+    baseline_names(
+        script,
+        Snapshot {
+            schema: &before,
+            ids: &ids,
+        },
+    )
+}
+
+#[test]
+fn baseline_names_skip_what_the_project_does_not_declare_and_keep_the_rest() {
+    let script = Script::default()
+        .held_table("child")
+        .held_column("child", "c");
+    let held = baseline_names_of(&script).unwrap();
+    assert!(held.iter().any(|n| n.holder == column_key("c")));
+    // No role is declared: the table and its column stay.
+    let nothing = baseline_names_of(&Script::default()).unwrap();
+    assert!(nothing.is_empty(), "{nothing:?}");
+    let table_only = baseline_names_of(&Script::default().held_table("child")).unwrap();
+    assert!(table_only.iter().any(|n| n.holder == table_key("child")));
+    assert!(table_only.iter().all(|n| n.holder != column_key("c")));
+}
+
+#[test]
+fn baseline_names_refuse_an_unreadable_table_column_or_role_and_name_it() {
+    for why in faults("app.child") {
+        let table = Script::default().table("child", Reply::Fail(why.clone()));
+        assert_eq!(baseline_names_of(&table).err(), Some(why.clone()), "table");
+        let column =
+            Script::default()
+                .held_table("child")
+                .column("child", "c", Reply::Fail(why.clone()));
+        assert_eq!(
+            baseline_names_of(&column).err(),
+            Some(why.clone()),
+            "column"
+        );
+        let role = Script::default().role("ops", Reply::Fail(why.clone()));
+        assert_eq!(baseline_names_of(&role).err(), Some(why), "role");
+    }
+}
+
+fn baseline_with_type() -> (Schema, IdsFile) {
+    let mut schema = Schema::default();
+    schema.types.insert(
+        mood("mood"),
+        crate::ManagedType::Enum {
+            values: vec!["a".into()],
+        },
+    );
+    (schema, IdsFile::default())
+}
+
+#[test]
+fn baseline_names_refuse_an_unreadable_type() {
+    let (before, ids) = baseline_with_type();
+    let snapshot = Snapshot {
+        schema: &before,
+        ids: &ids,
+    };
+    assert!(
+        baseline_names(&Script::default(), snapshot)
+            .unwrap()
+            .is_empty(),
+        "an undeclared type holds no name"
+    );
+    for why in faults("app.mood") {
+        let script = Script::default().ty("mood", Reply::Fail(why.clone()));
+        assert_eq!(baseline_names(&script, snapshot).err(), Some(why));
+    }
+}
+
+fn create_with_column() -> Change {
+    let mut table = Table::default();
+    table.columns.insert(
+        "c".into(),
+        crate::Column::new(crate::ColumnType::simple("int")),
+    );
+    Change::Table(TableChange::CreateTable {
+        uid: uid(UidKind::Table, "child"),
+        name: t("child"),
+        table: Box::new(table),
+        beside_default: None,
+        moves_at_most: None,
+    })
+}
+
+fn names_of(change: Change, script: &Script) -> Result<crate::operation::Names, OwnerError> {
+    let ops = Operations::of_plan(&[PlannedChange::new(change)], ModuleEdits::InPlace);
+    let (before, ids) = (Schema::default(), IdsFile::default());
+    crate::operation::names(
+        &ops.as_slice()[0],
+        script,
+        Snapshot {
+            schema: &before,
+            ids: &ids,
+        },
+    )
+}
+
+#[test]
+fn a_created_tables_column_claims_its_name_when_held_not_when_undeclared_and_refuses_when_unreadable()
+ {
+    let held = Script::default()
+        .held_table("child")
+        .held_column("child", "c");
+    let claimed = names_of(create_with_column(), &held).unwrap();
+    assert!(claimed.claims.iter().any(|n| n.holder == column_key("c")));
+    let undeclared = Script::default().held_table("child");
+    let claimed = names_of(create_with_column(), &undeclared).unwrap();
+    assert!(claimed.claims.iter().all(|n| n.holder != column_key("c")));
+    assert!(
+        claimed
+            .claims
+            .iter()
+            .any(|n| n.holder == table_key("child"))
+    );
+    ensure_these_names_refuse("CreateTable column", "app.child.c", |reply| {
+        let script = Script::default()
+            .held_table("child")
+            .column("child", "c", reply);
+        names_of(create_with_column(), &script)
+    });
+}
+
+fn drop_trigger() -> Change {
+    Change::Module(crate::ModuleChange::DropModule {
+        id: crate::ModuleId::Trigger {
+            on: t("child"),
+            name: "trg".into(),
+        },
+        kind: crate::ModuleKind::Trigger,
+    })
+}
+
+#[test]
+fn a_trigger_on_an_undeclared_table_has_no_scope_and_one_on_an_unreadable_table_refuses() {
+    let held = Script::default().held_table("child");
+    let released = names_of(drop_trigger(), &held).unwrap();
+    assert_eq!(released.releases.len(), 1);
+    assert_eq!(
+        released.releases[0].address.table,
+        Some(table_key("child")),
+        "a held table is the trigger's scope"
+    );
+    let released = names_of(drop_trigger(), &Script::default()).unwrap();
+    assert!(
+        released.releases.is_empty(),
+        "an undeclared table is nobody's scope: {released:?}"
+    );
+    ensure_these_names_refuse("DropModule trigger scope", "app.child", |reply| {
+        names_of(drop_trigger(), &Script::default().table("child", reply))
+    });
+}
+
+fn ensure_these_names_refuse<T>(
+    site: &str,
+    name: &str,
+    run_with: impl Fn(Reply) -> Result<T, OwnerError>,
+) {
+    for why in faults(name) {
+        let Err(got) = run_with(Reply::Fail(why.clone())) else {
+            panic!("{site}: `{why}` was read as an answer");
+        };
+        assert_eq!(got, why, "{site} must return the original refusal");
+    }
+}
+
+#[test]
+fn the_public_base_table_needs_a_held_name_and_returns_every_other_answer_as_the_refusal() {
+    let mut before = Schema::default();
+    before.tables.insert(t("child"), Table::default());
+    let mut ids = IdsFile::default();
+    ids.tables.insert(uid(UidKind::Table, "child"), t("child"));
+    let snapshot = Snapshot {
+        schema: &before,
+        ids: &ids,
+    };
+    let ops = Operations::of_plan(&[PlannedChange::new(delete_row("t"))], ModuleEdits::InPlace);
+    let op = &ops.as_slice()[0];
+    let held = Script::default().held_table("child");
+    let found = base_table(op, &held, snapshot, &t("child"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.table_key(), table_key("child"));
+    // Unlike the scans, a step that names an undeclared table has nothing to
+    // order: the answer is the refusal, as it was before the door.
+    assert!(matches!(
+        base_table(op, &Script::default(), snapshot, &t("child")),
+        Err(OwnerError::Unmanaged { .. })
+    ));
+    for why in faults("app.child") {
+        let script = Script::default().table("child", Reply::Fail(why.clone()));
+        assert_eq!(
+            base_table(op, &script, snapshot, &t("child")).err(),
+            Some(why)
+        );
+    }
 }

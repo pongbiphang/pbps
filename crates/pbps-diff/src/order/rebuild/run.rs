@@ -169,7 +169,8 @@ impl Rule<'_> {
             Some(&self.prepared.names),
             &owners,
             before,
-        );
+        )
+        .map_err(|e| e.to_string())?;
         if !violations.is_empty() || !names.is_empty() || !skipped.is_empty() {
             return Err(format!(
                 "rebuild replay refused: {violations:?} {names:?} {skipped:?}"

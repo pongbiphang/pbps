@@ -135,15 +135,15 @@ fn constraint_names(
     owners: &dyn Owners,
     scope: Option<ObjectKey>,
     introduced: &[Operation],
-) -> Vec<Named> {
+) -> Result<Vec<Named>, OwnerError> {
     let ModuleId::Trigger { on, name } = id else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if !dialect.declares_a_constraint(module) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(ObjectKey::Table(uid)) = scope else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let address = |owner, schema: String| Named {
         address: Address {
@@ -161,7 +161,7 @@ fn constraint_names(
         for (table, shape) in &before.schema.tables {
             if let Some(of) = &shape.partition_of
                 && ids.table_uid(&of.parent) == Some(uid.uid())
-                && let Some(partition) = base_table_named(owners, before, table)
+                && let Some(partition) = base_table_named(owners, before, table)?
             {
                 out.push(address(partition.table_key(), table.schema.clone()));
             }
@@ -185,7 +185,7 @@ fn constraint_names(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 // Other changes introduce no partition into a parent.
@@ -280,7 +280,7 @@ fn arriving_clones(
         // An attach keeps the table's own constraints. Restate only the
         // ones a clone would collide with, as they stand at this operation;
         // using the final shape would also claim checks installed later.
-        let mut held = pbps_model::operation::baseline_names(owners, before);
+        let mut held = pbps_model::operation::baseline_names(owners, before)?;
         for earlier in previous {
             let names = pbps_model::operation::names(earlier, owners, before)?;
             held.retain(|n| !names.releases.contains(n));
@@ -315,22 +315,29 @@ pub fn names(
     let mut out = pbps_model::operation::names(op, owners, before)?;
     out.claims
         .extend(arriving_clones(dialect, op, owners, before, operations)?);
-    let scope = out
+    let named_scope = out
         .claims
         .iter()
         .chain(&out.releases)
         .find(|n| n.address.kind == NameKind::Module(ModuleKind::Trigger))
-        .and_then(|n| n.address.table.clone())
-        .or_else(|| match op.change().module_id()? {
-            ModuleId::Trigger { on, .. } => op
-                .input_owners(owners)
-                .table(on, op.origin().spelling())
-                .ok()
-                .and_then(|uid| before.ids.tables.get(&uid))
-                .and_then(|name| base_table_named(owners, before, name))
-                .map(|table| table.table_key()),
-            ModuleId::Named(_) | ModuleId::Routine(_) => None,
-        });
+        .and_then(|n| n.address.table.clone());
+    let scope = match named_scope {
+        Some(scope) => Some(scope),
+        None => match op.change().module_id() {
+            Some(ModuleId::Trigger { on, .. }) => {
+                let base = op
+                    .input_owners(owners)
+                    .table(on, op.origin().spelling())
+                    .ok()
+                    .and_then(|uid| before.ids.tables.get(&uid));
+                match base {
+                    Some(name) => base_table_named(owners, before, name)?.map(|t| t.table_key()),
+                    None => None,
+                }
+            }
+            Some(ModuleId::Named(_) | ModuleId::Routine(_)) | None => None,
+        },
+    };
     if let Change::Module(ModuleChange::DropModule { id, .. })
     | Change::Module(ModuleChange::AlterModule { id, .. }) = op.change()
     {
@@ -355,7 +362,7 @@ pub fn names(
                 owners,
                 scope.clone(),
                 operations,
-            ));
+            )?);
         }
     }
     if let Change::Module(ModuleChange::CreateModule { id, module })
@@ -369,7 +376,7 @@ pub fn names(
             owners,
             scope,
             preceding(operations, op),
-        ));
+        )?);
     }
     Ok(out)
 }
@@ -380,12 +387,12 @@ pub fn baseline_names(
     dialect: &(impl Dialect + ?Sized),
     owners: &dyn Owners,
     before: Snapshot<'_>,
-) -> Vec<Named> {
-    let mut out = pbps_model::operation::baseline_names(owners, before);
+) -> Result<Vec<Named>, OwnerError> {
+    let mut out = pbps_model::operation::baseline_names(owners, before)?;
     for (id, module) in &before.schema.modules {
         let scope = match id {
             ModuleId::Trigger { on, .. } => {
-                base_table_named(owners, before, on).map(|t| t.table_key())
+                base_table_named(owners, before, on)?.map(|t| t.table_key())
             }
             ModuleId::Named(_) | ModuleId::Routine(_) => None,
         };
@@ -397,9 +404,9 @@ pub fn baseline_names(
             owners,
             scope,
             &[],
-        ));
+        )?);
     }
-    out
+    Ok(out)
 }
 
 /// The slots `address` takes, by the dialect's namespace answers: one, or

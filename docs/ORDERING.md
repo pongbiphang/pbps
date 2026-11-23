@@ -479,6 +479,12 @@ column, which has no column uid and is looked for among the table's computed
 parts before its ordinary-column answer is read. A name that comes from the
 desired state, such as the parent of a partition that gets an index, is asked
 at the desired state and not at the step's moment.
+The lookups that only point at a name (the baseline's and the desired
+state's tables and columns, a type, the columns a copy moves, a trigger's table)
+take the same answers (DEC-2993.2), and the functions that list the baseline's
+names return the error instead of a shorter list. Two are not through the door
+yet: `baseline_keys` and `baseline_bindings` still read an unreadable name as a
+key that is missing.
 
 Names are stated the same way, apart from the effects, because a name is an
 address and not an identity. `pbps_model::operation::names` reports, for each

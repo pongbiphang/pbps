@@ -161,7 +161,7 @@ pub fn retype_blockers(
     }
     if dependents.foreign_keys {
         for other_name in before.schema.tables.keys() {
-            let Some(other) = pbps_model::operation::base_table_named(owners, before, other_name)
+            let Some(other) = pbps_model::operation::base_table_named(owners, before, other_name)?
             else {
                 continue;
             };

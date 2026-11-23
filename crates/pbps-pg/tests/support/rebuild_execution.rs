@@ -234,7 +234,8 @@ fn independent_replay_rejects_premature_analysis_and_final_name_claims() {
         Some(prepared.names()),
         &owners,
         before,
-    );
+    )
+    .unwrap();
     assert!(skipped.is_empty());
     assert!(!violations.is_empty());
 }

@@ -211,7 +211,7 @@ fn slot_read_edges_and_holder_replay_agree_at_all_three_address_boundaries() {
                 ..Default::default()
             };
             let (violations, skipped) =
-                slots::verify(ordered.as_slice(), &slots, &dialect, None, &owners, before);
+                slots::verify(ordered.as_slice(), &slots, &dialect, None, &owners, before).unwrap();
             assert!(skipped.is_empty());
             let replay_holds = !violations
                 .iter()
@@ -226,6 +226,7 @@ fn slot_read_edges_and_holder_replay_agree_at_all_three_address_boundaries() {
         let collated = super::slot_tests::Slotted { exact: false };
         assert!(
             slots::verify(ops.as_slice(), &unknown, &collated, None, &owners, before)
+                .unwrap()
                 .0
                 .iter()
                 .any(|v| matches!(v, slots::SlotViolation::MissingInput { .. }))
@@ -235,6 +236,7 @@ fn slot_read_edges_and_holder_replay_agree_at_all_three_address_boundaries() {
         wrong.effects[2].reads[0].1 = object_key(UidKind::Table, "other");
         assert!(
             slots::verify(ops.as_slice(), &wrong, &dialect, None, &owners, before)
+                .unwrap()
                 .0
                 .iter()
                 .any(|v| matches!(v, slots::SlotViolation::MissingInput { .. }))

@@ -1521,6 +1521,7 @@ fn computed_then(second: Change, id: Option<ModuleId>) -> (Operations, Vec<Effec
     };
     let key = pbps_model::operation::base_table_named(&owners, snapshot, &t("t"))
         .unwrap()
+        .unwrap()
         .part(PartKey::Computed("c".into()));
     fx[1].requires.push(Requirement::Absent(key));
     (ops, fx, baseline)

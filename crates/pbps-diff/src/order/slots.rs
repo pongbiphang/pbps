@@ -232,10 +232,14 @@ pub fn with_catalog_parts(
             Part::Exclusion(n) => PartKey::Exclusion(n.clone()),
             Part::Default(_) | Part::Generated(_) | Part::Policy(_) => return Err(bad()),
         };
+        // An unreadable name is the models' refusal, with the name in it; a
+        // table the baseline does not hold is this function's.
         let holder = base_table_named(owners, before, table)
+            .map_err(|e| e.to_string())?
             .ok_or_else(bad)?
             .part(part);
         let scope = base_table_named(owners, before, &spelling.table)
+            .map_err(|e| e.to_string())?
             .ok_or_else(bad)?
             .table_key();
         let named = Named {
@@ -398,8 +402,8 @@ pub fn carried(
     owners: &dyn Owners,
     before: Snapshot<'_>,
     dialect: &(impl Dialect + ?Sized),
-) -> Vec<Carried> {
-    let declared: BTreeSet<SlotKey> = baseline_names(dialect, owners, before)
+) -> Result<Vec<Carried>, OwnerError> {
+    let declared: BTreeSet<SlotKey> = baseline_names(dialect, owners, before)?
         .into_iter()
         .flat_map(|named| slots_of(dialect, &named.address))
         .collect();
@@ -409,14 +413,14 @@ pub fn carried(
         if declared.contains(&o.slot) {
             continue;
         }
-        let table = o
-            .owner
-            .as_ref()
-            .and_then(|t| base_table_named(owners, before, t));
-        let column = table
-            .as_ref()
-            .zip(o.column.as_ref())
-            .and_then(|(t, c)| t.column(owners, c.raw()).map(|key| (key, c.clone())));
+        let table = match &o.owner {
+            Some(t) => base_table_named(owners, before, t)?,
+            None => None,
+        };
+        let column = match (&table, &o.column) {
+            (Some(t), Some(c)) => t.column(owners, c.raw())?.map(|key| (key, c.clone())),
+            _ => None,
+        };
         let who = Occupier::Catalog {
             kind: o.kind.clone(),
             owner: table.map(|t| t.table_key()),
@@ -489,7 +493,7 @@ pub fn carried(
             lands,
         });
     }
-    out
+    Ok(out)
 }
 
 /// The slots `a` and `b` are one name in, by the facts at hand: equal slots
@@ -751,7 +755,7 @@ pub fn handovers(
     };
     let ops = operations.as_slice();
     let slots = analyse(ops, &owners, before, dialect);
-    let held = carried(ops, facts, &owners, before, dialect);
+    let held = carried(ops, facts, &owners, before, dialect).map_err(|e| e.to_string())?;
     let mut out = super::Schedule::new(changes.len());
     schedule(&mut out, &edges(&slots, Some(facts), &held));
     Ok(out)
@@ -839,7 +843,7 @@ pub fn verify(
     facts: Option<&CatalogFacts>,
     owners: &dyn Owners,
     before: Snapshot<'_>,
-) -> (Vec<SlotViolation>, Vec<Skipped>) {
+) -> Result<(Vec<SlotViolation>, Vec<Skipped>), OwnerError> {
     let mut violations = Vec::new();
     let mut skipped = Vec::new();
     let mut held: Vec<(SlotKey, Occupier)> = Vec::new();
@@ -879,7 +883,7 @@ pub fn verify(
                 .chain(&fx.intermediate)
         })
         .collect();
-    let baseline: Vec<(SlotKey, ObjectKey)> = baseline_names(dialect, owners, before)
+    let baseline: Vec<(SlotKey, ObjectKey)> = baseline_names(dialect, owners, before)?
         .into_iter()
         .flat_map(|named| {
             slots_of(dialect, &named.address)
@@ -917,14 +921,14 @@ pub fn verify(
             .iter()
             .filter(|o| !declared.contains(&o.slot))
         {
-            let table = o
-                .owner
-                .as_ref()
-                .and_then(|t| base_table_named(owners, before, t));
-            let column = table
-                .as_ref()
-                .zip(o.column.as_ref())
-                .and_then(|(t, c)| t.column(owners, c.raw()).map(|k| (k, c.clone())));
+            let table = match &o.owner {
+                Some(t) => base_table_named(owners, before, t)?,
+                None => None,
+            };
+            let column = match (&table, &o.column) {
+                (Some(t), Some(c)) => t.column(owners, c.raw())?.map(|k| (k, c.clone())),
+                _ => None,
+            };
             held.push((
                 o.slot.clone(),
                 Occupier::Catalog {
@@ -1064,7 +1068,7 @@ pub fn verify(
             });
         }
     }
-    (violations, skipped)
+    Ok((violations, skipped))
 }
 
 /// A detach only releases the clone names the catalog proved it renames.
