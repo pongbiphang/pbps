@@ -313,6 +313,130 @@ fn a_renamed_text_search_object_stands_at_the_definition_the_plan_renames() {
     assert!(close(&was, &was).unwrap_err().contains(&shown));
 }
 
+/// A chain of renames (`a` to `b`, `b` to `c`) over objects of different definitions closes.
+/// The guard holds the baseline read as well as the close, and in the baseline the first's new
+/// name still holds the second, so each rename is found where its pinned object stands, not
+/// merely where something stands. Negatives: the first's new name holding anything else at
+/// the close refuses, and so does a baseline where neither name holds the first's definition.
+#[test]
+fn a_chain_of_renames_over_different_definitions_stands_at_each_step() {
+    let (a, b, c) = (name("app.a"), name("app.b"), name("app.c"));
+    let (first, second) = (
+        with_options(&[("stopwords", "first")]),
+        with_options(&[("stopwords", "second")]),
+    );
+    let rename = |from: &SearchRef, to: &SearchRef, definition: &SearchObject, uid: &str| {
+        pbps_model::PlannedChange::new(pbps_model::Change::Search(
+            pbps_model::SearchChange::RenameSearch {
+                uid: uid.parse().unwrap(),
+                from: from.clone(),
+                to: to.clone(),
+                definition: Box::new(definition.clone()),
+            },
+        ))
+    };
+    let changes = pbps_model::ChangeSet {
+        changes: vec![
+            rename(&b, &c, &second, "s_000002"),
+            rename(&a, &b, &first, "s_000001"),
+        ],
+    };
+    let holding = |objects: &[(&SearchRef, &SearchObject)]| {
+        let mut schema = Schema::default();
+        for (at, definition) in objects {
+            schema.search.insert((*at).clone(), (*definition).clone());
+        }
+        schema
+    };
+    let was = holding(&[(&a, &first), (&b, &second)]);
+    let result = holding(&[(&b, &first), (&c, &second)]);
+    let ids = guard::fixture_ids(&changes, &was);
+    let plan = guard::Plan {
+        changes: &changes,
+        ids: &ids,
+    };
+    let close = |before: &Schema, after: &Schema| {
+        let read = guard::Read::fixture_transactional(plan, before);
+        refuse_pinned_movement(&pbps_pg::Postgres::new(), read, before, after, "fixture")
+            .map_err(|e| e.to_string())
+    };
+    close(&was, &result).expect("the chain as planned");
+    let other = with_options(&[("stopwords", "other")]);
+    assert!(close(&was, &holding(&[(&b, &other), (&c, &second)])).is_err());
+    // The baseline read is held too: the first renamed away by another session refuses.
+    assert!(close(&holding(&[(&a, &other), (&b, &second)]), &result).is_err());
+}
+
+/// A plan that renames dictionary `app.a` to `app.c`, creates a replacement `app.a` and alters
+/// a configuration to map the replacement closes: at the close the engine's names are final,
+/// so the read is compared as it is and not respelled through the rename. Negative: a close
+/// whose configuration still maps the renamed dictionary is not the plan's result.
+#[test]
+fn a_mapping_to_a_replacement_under_a_vacated_name_closes_as_read() {
+    let config = SearchRef::new(SearchKind::Config, "app.cfg".parse().unwrap());
+    let (old, moved) = (name("app.a"), name("app.c"));
+    let approved = mapping_to("app.c");
+    let wrote = mapping_to("app.a");
+    let changes = pbps_model::ChangeSet {
+        changes: vec![
+            pbps_model::PlannedChange::new(pbps_model::Change::Search(
+                pbps_model::SearchChange::RenameSearch {
+                    uid: "s_000002".parse().unwrap(),
+                    from: old.clone(),
+                    to: moved.clone(),
+                    definition: Box::new(dictionary("pg_catalog.simple")),
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Search(
+                pbps_model::SearchChange::CreateSearch {
+                    uid: "s_000003".parse().unwrap(),
+                    name: old.clone(),
+                    definition: Box::new(dictionary("pg_catalog.simple")),
+                    unresolved: Vec::new(),
+                },
+            )),
+            pbps_model::PlannedChange::new(pbps_model::Change::Search(
+                pbps_model::SearchChange::AlterSearchMapping {
+                    uid: "s_000001".parse().unwrap(),
+                    name: config.clone(),
+                    before: Box::new(approved.clone()),
+                    after: Box::new(wrote.clone()),
+                    opaque: Vec::new(),
+                },
+            )),
+        ],
+    };
+    let holding = |mapping: &SearchObject, dictionaries: &[&SearchRef]| {
+        let mut schema = Schema::default();
+        schema.search.insert(config.clone(), mapping.clone());
+        for at in dictionaries {
+            schema
+                .search
+                .insert((*at).clone(), dictionary("pg_catalog.simple"));
+        }
+        schema
+    };
+    // Before the plan the configuration maps the dictionary under its old name.
+    let before = holding(&mapping_to("app.a"), &[&old]);
+    let after = holding(&wrote, &[&old, &moved]);
+    let ids = guard::fixture_ids(&changes, &before);
+    let plan = guard::Plan {
+        changes: &changes,
+        ids: &ids,
+    };
+    let close = |after: &Schema| {
+        let read = guard::Read::fixture_transactional(plan, &before);
+        refuse_pinned_movement(&pbps_pg::Postgres::new(), read, &before, after, "fixture")
+            .map_err(|e| e.to_string())
+    };
+    close(&after).expect("the replacement mapped under the vacated name");
+    assert!(
+        close(&holding(&approved, &[&old, &moved]))
+            .unwrap_err()
+            .contains("app.cfg")
+    );
+}
+
 /// A mapping change of several statements passes through definitions that are neither end, and a
 /// staged apply checkpoints on each: every one of them is admitted at a checkpoint, a resume from
 /// any of them closes, and only the last is the close (SPEC §7.6, DEC-2728.3). A definition on
