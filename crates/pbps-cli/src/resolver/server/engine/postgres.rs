@@ -1650,6 +1650,7 @@ pub(in crate::resolver::server) fn reconstruction(
         )
         .map_err(|error| error.to_string()),
         Driver::Mssql => Err(super::NO_BINDING_ADAPTER.into()),
+        Driver::Sqlite => Err("SQLite has no binding adapter".into()),
     }
 }
 

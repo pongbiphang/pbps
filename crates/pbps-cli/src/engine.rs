@@ -61,6 +61,7 @@ pub(crate) fn of(driver: Driver) -> &'static dyn pbps_db::engine::Engine {
     match driver {
         Driver::Mssql => &MSSQL,
         Driver::Postgres => &POSTGRES,
+        Driver::Sqlite => crate::db::sqlite_not_wired(),
     }
 }
 

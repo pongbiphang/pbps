@@ -180,6 +180,8 @@ pub const fn support(driver: Driver) -> Option<&'static ContainerSupport> {
     match driver {
         Driver::Postgres => Some(&POSTGRES),
         Driver::Mssql => Some(&MSSQL),
+        // A database file has no server to start in a container.
+        Driver::Sqlite => None,
     }
 }
 
@@ -224,6 +226,7 @@ pub(crate) fn select(driver: Driver) -> Result<&'static ContainerSupport, Unsupp
     let name = match driver {
         Driver::Postgres => POSTGRES.name,
         Driver::Mssql => MSSQL.name,
+        Driver::Sqlite => "SQLite",
     };
     require(name, support(driver))
 }

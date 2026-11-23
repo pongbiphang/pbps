@@ -1557,3 +1557,70 @@ Rejected:
 Pinned by the arrival table's test, `allows_under` under both gates, each form
 that is built under both, the boolean default below and at its release, the
 text of each form against a rebuild by hand, and the plan-order scenarios.
+
+<a id="dec-2950-17"></a>
+
+**DEC-2950.17. `Conn` reaches SQLite in the calling thread, without a row type, and only an explicit call creates the file (#2950).** `Driver` and `Conn` gain
+a `Sqlite` variant. Five points in the connection type had to be decided
+before the engine could be wired; this entry records each. Point 5 is the
+maintainer's decision of 2026-11-23 (creating the file takes an explicit
+`--create`); the other four were proposed on the issue and are recorded here as
+built.
+
+- **1. Blocking code is called in place.** `Conn`'s methods are `async` and
+  borrow the connection; the module's earlier plan, to move the connection into
+  `spawn_blocking` and back, does not compile for a borrow (`E0521`). SQLite runs
+  in the calling thread and has no server to wait for, and the workspace builds
+  tokio's current-thread runtime. So the call is made inside the `async fn`: the
+  connection stays borrowed, and a dropped future cannot leave a statement
+  running on another thread. The cost is that nothing else on the runtime runs
+  while one call waits for another process's write lock.
+- **2. The lock guard is parked on the connection.** SQLite's apply lock lasts
+  as long as a guard value (DEC-2950.13), and a command carries only the
+  connection between taking and releasing it. `sqlite::Connection` has one
+  type-erased slot (`park`, `unpark`), because this crate cannot name the
+  engine's guard. A second value is refused and handed back: replacing a guard
+  would release the lock it holds. The slot is dropped after the database is
+  closed.
+- **3. Begin, commit and rollback are three calls with the closure's checks.**
+  The apply awaits between begin and commit, so the closure form cannot hold
+  it. `begin` sets and reads back foreign-key enforcement and refuses a nested
+  transaction, as the closure did, because the pragma is ignored without an
+  error inside a transaction. The closure form is written over the three, so
+  there is one implementation. `Conn::begin`, `commit` and `rollback` call them
+  for SQLite and run the framing's text for the server engines.
+- **4. There is no `Row` for SQLite.** `Row` is read by column name and a
+  SQLite record has positions only. `Conn::query`, `query_with`,
+  `prepare_query` and `query_bounded` refuse on a SQLite connection, naming it,
+  and the engine's code reads through `Conn::sqlite` and the module's typed
+  functions. A neutral query that reaches one of them was written in another
+  engine's SQL; the refusal is how it is found.
+- **5. `connect` opens an existing file only.** The connection string is the
+  file's path. A missing file is refused and nothing is created, so a mistyped
+  path never becomes a new, empty database. `Conn::create` is the one entry
+  that may create it, and refuses for a server engine.
+
+Rejected:
+- **Holding the connection as an `Option` and moving it through
+  `spawn_blocking`.** It keeps the runtime free during a wait, and it makes a
+  call abandoned half-way leave the slot empty, which every later call would
+  have to tell apart from "no connection". It is the alternative if something
+  on the runtime must fire during a SQLite wait.
+- **A `Row::Sqlite` that looks columns up by name.** It would let another
+  engine's SQL run against a SQLite file and fail at the server, or succeed
+  with a different meaning.
+- **`connect` creating a missing file, as the library does by default.** A typo
+  in a deploy script would produce a new database with the whole schema applied
+  and report success.
+
+Not in this entry: no command can select SQLite yet (`DialectName` has no such
+value), so the selections by driver that SQLite has no answer for are one named
+unreachable arm until its engine and sessions exist. `Engine::lock`'s return
+type, which must say when a stale lock was cleared, changes with the engine's
+implementation, where it has a caller.
+
+Pinned by `sqlite_conn_tests`: a missing file is refused and not created while
+`create` makes it and server drivers refuse `create`; each row-returning call
+refuses by name while statements run and bind; the three transaction calls
+restore foreign keys, refuse to nest, roll back and commit; a parked value is
+never replaced and is dropped with the connection.

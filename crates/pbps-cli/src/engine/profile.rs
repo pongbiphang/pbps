@@ -76,6 +76,7 @@ pub(crate) const fn profile(driver: Driver) -> &'static Profile {
     match driver {
         Driver::Mssql => &MSSQL,
         Driver::Postgres => &POSTGRES,
+        Driver::Sqlite => crate::db::sqlite_not_wired(),
     }
 }
 

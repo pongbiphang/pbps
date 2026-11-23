@@ -47,8 +47,9 @@ pub mod query;
 #[doc(hidden)]
 pub mod request_count;
 pub mod resolver;
-// The third driver module (#2950). Public because `Conn` has no `Sqlite`
-// variant yet; see the module's own documentation for why.
+// The third driver module (#2950). Public because `Conn` has no row type for
+// SQLite and its engine reads through this module's typed functions; see the
+// module's own documentation.
 pub mod sqlite;
 pub mod transport;
 
@@ -649,6 +650,7 @@ impl<'a> From<Option<&'a str>> for Param<'a> {
 pub enum Driver {
     Mssql,
     Postgres,
+    Sqlite,
 }
 
 /// An open connection.
@@ -665,6 +667,33 @@ pub enum Conn {
     // whichever driver is in use.
     Mssql(Box<mssql::Conn>),
     Postgres(Box<postgres::Conn>),
+    /// A database file, opened in this process. Its "connection string" is
+    /// the file's path. Boxed like the others, though it is small, so that
+    /// every variant is one pointer.
+    Sqlite(Box<sqlite::Connection>),
+}
+
+/// The refusal of a row-returning call on a SQLite connection.
+///
+/// [`Row`] is read by column name and a SQLite record has positions only, so
+/// there is no `Row` for it. The engine's own code reads through
+/// [`Conn::sqlite`] and the typed functions of [`sqlite::Connection`]. A
+/// neutral query that arrives here was written in another engine's SQL, and
+/// refusing it by name is how that is found.
+fn no_sqlite_rows(what: &str) -> DbError {
+    DbError::Refused(format!(
+        "{what} is not available on a SQLite connection; SQLite is read through its own typed queries"
+    ))
+}
+
+fn sqlite_value(param: &Param<'_>) -> sqlite::Value {
+    match param {
+        Param::I32(n) => sqlite::Value::Integer(i64::from(*n)),
+        Param::I64(n) => sqlite::Value::Integer(*n),
+        Param::Str(text) => sqlite::Value::Text((*text).to_owned()),
+        Param::OptStr(Some(text)) => sqlite::Value::Text((*text).to_owned()),
+        Param::OptStr(None) => sqlite::Value::Null,
+    }
 }
 
 impl Conn {
@@ -682,7 +711,9 @@ impl Conn {
     #[must_use]
     pub fn session_zone(&self) -> Option<&pbps_model::SessionZone> {
         match self {
-            Conn::Mssql(_) => None,
+            // SQLite has no session zone: its date and time functions read
+            // text, and nothing offset-less is converted on the way in.
+            Conn::Mssql(_) | Conn::Sqlite(_) => None,
             Conn::Postgres(c) => Some(c.zone()),
         }
     }
@@ -692,6 +723,38 @@ impl Conn {
         match self {
             Conn::Mssql(_) => Driver::Mssql,
             Conn::Postgres(_) => Driver::Postgres,
+            Conn::Sqlite(_) => Driver::Sqlite,
+        }
+    }
+
+    /// The SQLite connection inside, for the SQLite engine's own code, or
+    /// `None` on a server engine's connection. The one accessor: everything
+    /// SQLite-specific goes through the typed functions of
+    /// [`sqlite::Connection`], never through this enum's row-returning calls.
+    pub fn sqlite(&mut self) -> Option<&mut sqlite::Connection> {
+        match self {
+            Conn::Sqlite(c) => Some(c),
+            Conn::Mssql(_) | Conn::Postgres(_) => None,
+        }
+    }
+
+    /// Creates the database a connection string names, and connects to it.
+    ///
+    /// Only SQLite has an answer: the string is a file's path, and a missing
+    /// file is created empty (its directory must exist). It is a separate
+    /// entry because [`Conn::connect`] must never create one, so that a
+    /// mistyped path is refused and does not become a new, empty database.
+    /// An existing file is opened as it is. A server engine's database is
+    /// created by its administrator, and asking here is refused.
+    pub fn create(driver: Driver, connection_string: &str) -> Result<Self, DbError> {
+        match driver {
+            Driver::Sqlite => Ok(Conn::Sqlite(Box::new(sqlite::Connection::open(
+                std::path::Path::new(connection_string),
+                sqlite::OpenMode::CreateIfMissing,
+            )?))),
+            Driver::Mssql | Driver::Postgres => Err(DbError::Refused(
+                "creating the database is implemented for SQLite only; a server's database is created by its administrator".into(),
+            )),
         }
     }
 
@@ -711,6 +774,14 @@ impl Conn {
             Driver::Postgres => Ok(Conn::Postgres(Box::new(
                 postgres::Conn::connect(connection_string).await?,
             ))),
+            // The string is the file's path, and the file must exist
+            // ([`Conn::create`] is the entry that may create it). Opening is
+            // called here directly, not on a blocking thread: the library
+            // runs in the calling thread and there is no server to wait for.
+            Driver::Sqlite => Ok(Conn::Sqlite(Box::new(sqlite::Connection::open(
+                std::path::Path::new(connection_string),
+                sqlite::OpenMode::ExistingOnly,
+            )?))),
         }
     }
 
@@ -722,7 +793,8 @@ impl Conn {
         application_name: &str,
     ) -> Result<Self, DbError> {
         match driver {
-            Driver::Mssql => Self::connect(driver, connection_string).await,
+            // Neither has a session name to set.
+            Driver::Mssql | Driver::Sqlite => Self::connect(driver, connection_string).await,
             Driver::Postgres => Ok(Conn::Postgres(Box::new(
                 postgres::Conn::connect_named(connection_string, application_name).await?,
             ))),
@@ -739,7 +811,7 @@ impl Conn {
         login: Option<(&str, &str)>,
     ) -> Result<Self, DbError> {
         match driver {
-            Driver::Mssql => Err(DbError::Refused(
+            Driver::Mssql | Driver::Sqlite => Err(DbError::Refused(
                 "a connection to another database is implemented for PostgreSQL only".into(),
             )),
             Driver::Postgres => Ok(Conn::Postgres(Box::new(
@@ -760,6 +832,7 @@ impl Conn {
         match self {
             Conn::Mssql(c) => Ok(c.query(sql).await?.into_iter().map(Row::Mssql).collect()),
             Conn::Postgres(c) => Ok(c.query(sql).await?.into_iter().map(Row::Postgres).collect()),
+            Conn::Sqlite(_) => Err(no_sqlite_rows("a query returning rows")),
         }
     }
 
@@ -774,6 +847,7 @@ impl Conn {
             Conn::Mssql(_) => Err(DbError::Refused(
                 "prepared assertion queries are implemented for PostgreSQL only".into(),
             )),
+            Conn::Sqlite(_) => Err(no_sqlite_rows("a prepared assertion query")),
         }
     }
 
@@ -791,6 +865,7 @@ impl Conn {
                 let prepared = conn.prepare_query(sql).await?;
                 conn.query_prepared_bounded(prepared, timeout).await
             }
+            Conn::Sqlite(_) => Err(no_sqlite_rows("a bounded assertion query")),
         }
     }
 
@@ -799,6 +874,11 @@ impl Conn {
         match self {
             Conn::Mssql(c) => c.execute(sql).await,
             Conn::Postgres(c) => c.execute(sql).await,
+            // Called in place: the borrow cannot move to a blocking thread,
+            // and a call abandoned half-way on another thread could leave a
+            // statement running after its caller was dropped. The price is
+            // that nothing else on the runtime runs while this waits.
+            Conn::Sqlite(c) => c.execute_batch(sql),
         }
     }
 
@@ -824,6 +904,7 @@ impl Conn {
                 .into_iter()
                 .map(Row::Postgres)
                 .collect()),
+            Conn::Sqlite(_) => Err(no_sqlite_rows("a parameterized query returning rows")),
         }
     }
 
@@ -837,6 +918,10 @@ impl Conn {
         match self {
             Conn::Mssql(c) => c.execute_with(sql, params).await,
             Conn::Postgres(c) => c.execute_with(sql, params).await,
+            Conn::Sqlite(c) => {
+                let values: Vec<_> = params.iter().map(sqlite_value).collect();
+                c.execute(sql, &values)
+            }
         }
     }
 
@@ -847,21 +932,37 @@ impl Conn {
     /// through a plan leaves the earlier ones committable — and it is asked
     /// for rather than held here, so this crate keeps to what it owns: that a
     /// transaction is opened, and closed again on every path (ADR-0014 §2).
+    ///
+    /// SQLite's goes through its own function: foreign-key enforcement has to
+    /// be set and read back before the statement, because inside a
+    /// transaction the setting is ignored without an error.
     pub async fn begin(&mut self, framing: &TransactionFraming) -> Result<(), DbError> {
-        self.execute(&framing.begin).await
+        match self {
+            Conn::Sqlite(c) => c.begin(framing),
+            Conn::Mssql(_) | Conn::Postgres(_) => self.execute(&framing.begin).await,
+        }
     }
 
     pub async fn commit(&mut self, framing: &TransactionFraming) -> Result<(), DbError> {
-        self.execute(&framing.commit).await
+        match self {
+            Conn::Sqlite(c) => c.commit(framing),
+            Conn::Mssql(_) | Conn::Postgres(_) => self.execute(&framing.commit).await,
+        }
     }
 
     /// Rolls back. The dialect's statement is expected to tolerate a
     /// transaction the server has already killed, so that its own error cannot
     /// replace the real failure — the statement that broke — with a second one.
     pub async fn rollback(&mut self, framing: &TransactionFraming) -> Result<(), DbError> {
-        self.execute(&framing.rollback).await
+        match self {
+            Conn::Sqlite(c) => c.rollback(framing),
+            Conn::Mssql(_) | Conn::Postgres(_) => self.execute(&framing.rollback).await,
+        }
     }
 }
+
+#[cfg(test)]
+mod sqlite_conn_tests;
 
 #[cfg(test)]
 mod tests {
