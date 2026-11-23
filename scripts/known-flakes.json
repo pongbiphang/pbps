@@ -79,6 +79,174 @@
       ],
       "issue": 2652,
       "expires": "2026-12-02"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_target_reaching_another_cluster_is_not_sealed",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_user_defined_type_absent_from_opening_is_not_admitted_as_a_built_in",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_shared_evidence_reads_back_through_the_sql_server_reader",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::roundtrip2143::mssql_a_computed_column_binds_as_a_surface_and_a_changed_expression_is_assessed",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::apply2144::mssql_a_name_that_arrived_after_planning_refuses_before_the_first_statement",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::apply2144::mssql_a_plan_that_creates_unnamed_keys_and_defaults_applies_and_closes",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::assessment2375::mssql_assessment_distinguishes_bindings_creation_and_unreconstructed_candidates",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::assessment2375::mssql_file_staged_unnamed_keys_match_and_different_keys_refuse",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::chained2376::mssql_dependency_placement_records_real_catalog_and_declared_rehearsals",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::chained2376::mssql_native_chain_is_compared_and_merged_for_renderer_and_deferred_file",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::chained2541::mssql_chain2541_nearer_managed_and_prefix_objects_mask_dbo",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
+    },
+    {
+      "test": "resolver::server::scratch::mssql_live_tests::chained2541::mssql_chain2541_noexec_differential_has_an_independent_negative_control",
+      "cargo": [
+        "test",
+        "--profile",
+        "live-test",
+        "-p",
+        "pbps-cli",
+        "--lib",
+        "--"
+      ],
+      "issue": 2939,
+      "expires": "2026-12-22"
     }
   ]
 }
