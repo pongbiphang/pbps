@@ -2526,7 +2526,10 @@ two halves:
    DEC-2728.4) stands at a definition its chain passes through (the one the plan was
    approved over, the one after each of its statements, the one it writes), before its
    statement and at every checkpoint, and at the close at the last (mappings per token
-   type in order, options as the plan canonicalised them); one the plan does not alter is
+   type in order, options as the plan canonicalised them). One the plan renames stands at
+   the definition its rename pins, under the old name until its statement and the new one
+   after it, and at the close under the new one; its source is bound to its recorded
+   identity before any statement (DEC-2728.5). One the plan neither alters nor renames is
    not compared (DEC-2855.1).
    A closing mismatch refuses success recording and rolls the transaction back;
    a failed-attempt entry retains the previously recorded schema and identities.

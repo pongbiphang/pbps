@@ -33,7 +33,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{
-    ColumnName, ColumnRef, IdsFile, Intent, ModuleId, Schema, TableName, Tombstone, Uid, UidKind,
+    Change, ChangeSet, ColumnName, ColumnRef, IdsFile, Intent, ModuleId, Schema, SearchChange,
+    TableName, Tombstone, Uid, UidKind,
 };
 
 pub mod removals;
@@ -920,6 +921,31 @@ struct Conflicting {
 /// Public because `pbps fmt` shares this exact judgement: an annotation whose
 /// intent is absorbed is redundant and gets stripped, while a pending one must
 /// survive the rewrite (SPEC §6.2). Two definitions of "absorbed" would drift.
+/// Each text search rename a plan carries moves the object its uid names in the recorded
+/// identities: that uid stands at the rename's old name, or at its new one where a staged apply
+/// resumes past the rename. A saved plan's admission sees only the mapping after the plan, so a
+/// hand-edited `from` naming another object would pass it, and the apply would rename that one
+/// and record the uid at the new name (DEC-2728.5). The recorded mapping is pinned by the
+/// baseline's checksum, so it is the evidence to bind the source to.
+pub fn search_renames_bound(changes: &ChangeSet, recorded: &IdsFile) -> Result<(), String> {
+    for step in &changes.changes {
+        if let Change::Search(SearchChange::RenameSearch { uid, from, to, .. }) = &step.change
+            && !recorded
+                .search
+                .get(uid)
+                .is_some_and(|held| held == from || held == to)
+        {
+            return Err(format!(
+                "the rename of text search {} to {} names an object the recorded identities do \
+                 not hold under its identity; recompute and review the plan",
+                from.shown(),
+                to.shown()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) -> bool {
     let has_column = |c: &ColumnRef| ids.column_uid(c).is_some();
     let has_table = |t: &TableName| ids.table_uid(t).is_some();
@@ -3417,6 +3443,35 @@ mod search_rename_tests {
             &context(),
         )
         .unwrap();
+    }
+
+    /// A saved plan's search rename must move the object its uid names in the recorded
+    /// identities (DEC-2728.5). Negatives: the uid at the old name binds, and so does the uid
+    /// already at the new name, as a staged apply resumed past the rename has it.
+    #[test]
+    fn a_search_rename_whose_source_is_not_its_recorded_identity_is_refused() {
+        let ids = recorded(&["dictionary app.old", "dictionary app.other"]);
+        let uid = uid_of(&ids, "dictionary app.old");
+        let plan = |from: &str| ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(Change::Search(
+                SearchChange::RenameSearch {
+                    uid: uid.clone(),
+                    from: name(from),
+                    to: name("dictionary app.new"),
+                    definition: Box::new(object(&name("dictionary app.new"))),
+                },
+            ))],
+        };
+        assert!(search_renames_bound(&plan("dictionary app.old"), &ids).is_ok());
+        let error = search_renames_bound(&plan("dictionary app.other"), &ids).unwrap_err();
+        assert!(error.contains("app.other"), "{error}");
+        assert!(search_renames_bound(&plan("dictionary app.stranger"), &ids).is_err());
+        assert!(search_renames_bound(&plan("dictionary app.old"), &IdsFile::default()).is_err());
+        let mut resumed = ids.clone();
+        resumed
+            .search
+            .insert(uid.clone(), name("dictionary app.new"));
+        assert!(search_renames_bound(&plan("dictionary app.old"), &resumed).is_ok());
     }
 
     /// A rename across schemas is no rename either: `RENAME TO` keeps the schema (DEC-2728.5),

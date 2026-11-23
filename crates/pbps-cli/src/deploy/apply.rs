@@ -254,6 +254,8 @@ pub(super) async fn apply_under_lock<D: crate::engine::ApplySession>(
     let original_ids = entry.snapshot.ids.clone();
     pbps_diff::drop_requirements::validate(&plan.changes, &original_ids, &plan.ids)
         .map_err(anyhow::Error::msg)?;
+    pbps_diff::identity::search_renames_bound(&plan.changes, &original_ids)
+        .map_err(anyhow::Error::msg)?;
     let role_renames = dialect
         .external_roles(conn, &original_ids, &plan.ids)
         .await?

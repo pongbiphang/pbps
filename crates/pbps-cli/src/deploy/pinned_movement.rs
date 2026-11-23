@@ -300,6 +300,31 @@ fn refuse_unpinned_search(
             }
         })
         .collect();
+    // A renamed object is touched too: it stands at the definition the plan renames, under
+    // the old name until its statement and under the new one after it, and at the close under
+    // the new one. Another session's change to it between the baseline read and the
+    // read-back would otherwise be recorded under the new name as the plan's result.
+    for p in &changes.changes {
+        if let pbps_model::Change::Search(pbps_model::SearchChange::RenameSearch {
+            from,
+            to,
+            definition,
+            ..
+        }) = &p.change
+        {
+            let now = held
+                .search
+                .get(to)
+                .or_else(|| held.search.get(from).filter(|_| !at_close))
+                .map(|d| d.respelled(&renames));
+            if now.as_ref() != Some(definition.as_ref()) {
+                bail!(
+                    "{} does not match what its plan promised during {label}",
+                    to.shown()
+                )
+            }
+        }
+    }
     for p in &changes.changes {
         if let pbps_model::Change::Search(
             pbps_model::SearchChange::AlterSearchMapping {
