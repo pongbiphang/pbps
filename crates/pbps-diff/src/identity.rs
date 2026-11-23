@@ -960,8 +960,13 @@ pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) 
         Intent::DropExtension { name, .. } => {
             ids.extension_uid(name).is_none() && retired(UidKind::Extension, name.raw())
         }
+        // A pair across kinds or schemas is no rename (DEC-2728.5), so it was never applied
+        // and cannot be absorbed: it stays for the unused-intent sweep.
         Intent::RenameSearch { from, to } => {
-            ids.search_uid(to).is_some() && vacated(ids.search_uid(from).is_some())
+            from.kind == to.kind
+                && from.name.schema() == to.name.schema()
+                && ids.search_uid(to).is_some()
+                && vacated(ids.search_uid(from).is_some())
         }
         Intent::DropSearch { name, .. } => {
             ids.search_uid(name).is_none() && retired(UidKind::Search, &name.raw().to_string())
@@ -3530,6 +3535,43 @@ mod search_rename_tests {
             RenameSource::of(&intent, &reused)
         ));
         assert_eq!(RenameSource::of(&intent, &redone), RenameSource::Vacated);
+    }
+
+    /// A rename annotation across schemas or kinds is never absorbed, even when its target is
+    /// already recorded: no such rename can have run (DEC-2728.5), so it reaches the
+    /// unused-intent sweep rather than being stripped by `fmt`. Negative: the same recorded
+    /// target with a source in its own schema and kind is absorbed.
+    #[test]
+    fn a_rename_across_schemas_or_kinds_is_never_absorbed() {
+        let after = recorded(&["dictionary other.new", "config app.new"]);
+        let redone = declared(&["dictionary other.new", "config app.new"]);
+        for intent in [
+            rename("dictionary app.old", "dictionary other.new"),
+            rename("dictionary app.old", "config app.new"),
+        ] {
+            assert!(
+                !intent_is_absorbed(&intent, &after, RenameSource::of(&intent, &redone)),
+                "{intent:?}"
+            );
+            let refused = resolve_with_annotations(
+                &redone,
+                &after,
+                std::slice::from_ref(&intent),
+                1,
+                &context(),
+            )
+            .unwrap_err();
+            assert!(
+                refused.contains(&Blocker::UnusedIntent { intent }),
+                "{refused:?}"
+            );
+        }
+        let within = rename("dictionary other.old", "dictionary other.new");
+        assert!(intent_is_absorbed(
+            &within,
+            &after,
+            RenameSource::of(&within, &redone)
+        ));
     }
 
     /// A pending rename is not a removal, so it raises no `DropSearchNeedsReason`; the same
