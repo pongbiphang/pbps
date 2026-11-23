@@ -207,6 +207,23 @@ pub(super) fn diff_search(
             );
             continue;
         }
+        // A rename into a name the target already holds, by an object the ids do not record
+        // under it: the engine's `RENAME TO` would fail there, and reading that object as the
+        // renamed one would skip or alter it while the identity moved onto it and the
+        // original stayed.
+        if let Some(old) = renamed_from.get(name)
+            && standing(name).is_some()
+        {
+            refuse(
+                name,
+                &format!(
+                    "is the new name of {}, but the target already holds an object of that \
+                     name; drop or rename that one first",
+                    old.shown()
+                ),
+            );
+            continue;
+        }
         match standing(name).as_ref() {
             Some(was) if was == now => {}
             Some(was) => {

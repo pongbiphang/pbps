@@ -759,11 +759,39 @@ fn a_rename_beside_a_change_a_schema_move_or_a_thesaurus_naming_it_is_refused_by
         &base,
         "also changes",
     );
-    refused(
-        &holding(&[("dictionary other.terms", words())]),
-        &[("dictionary app.words", "dictionary other.terms")],
-        &base,
-        "schema",
+    // A move across schemas never reaches the differ from a declaration: the resolver leaves
+    // the pair unclaimed (DEC-2728.5). An ids file the resolver did not write can still move
+    // the uid across, and the differ refuses that by name.
+    let moved_away = holding(&[("dictionary other.terms", words())]);
+    let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    assert!(
+        crate::resolve(
+            &moved_away,
+            &base_ids,
+            &[Intent::RenameSearch {
+                from: name("dictionary app.words"),
+                to: name("dictionary other.terms"),
+            }],
+            &ctx(),
+        )
+        .is_err()
+    );
+    let mut hand_moved = base_ids.clone();
+    let uid = base_ids
+        .search_uid(&name("dictionary app.words"))
+        .unwrap()
+        .clone();
+    hand_moved
+        .search
+        .insert(uid, name("dictionary other.terms"));
+    let errors = plan_against((&base, &base_ids), (&moved_away, &hand_moved), true).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.to_string().contains("moves from schema app to other")),
+        "{errors:?}"
     );
     let naming = holding(&[
         ("dictionary app.words", words()),
@@ -869,6 +897,40 @@ fn a_swap_in_the_recorded_identities_is_refused_and_a_chain_runs_in_order() {
 /// of the declarations leaves them before the plan runs. Negatives: the new object under
 /// another identity with no rename is still "declared again", and the same name of the
 /// other kind is unrelated and orders nothing.
+/// A rename into a name the target already holds, by an object the ids do not record, is
+/// refused by name: reading that object as the renamed one would skip the rename (equal) or
+/// alter the stranger (different) while the identity moved onto it and the original stayed.
+/// Negative: the same rename with the name free plans the rename alone.
+#[test]
+fn a_rename_into_a_name_the_target_already_holds_is_refused_by_name() {
+    let (old, new) = ("dictionary app.words", "dictionary app.terms");
+    let recorded = holding(&[(old, words())]);
+    let base_ids = crate::resolve(&recorded, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let declared = holding(&[(new, words())]);
+    let mut other = words();
+    if let SearchObject::Dictionary { options, .. } = &mut other {
+        options.insert("accept".to_owned(), "false".to_owned());
+    }
+    for stranger in [words(), other] {
+        let occupied = holding(&[(old, words()), (new, stranger)]);
+        let errors =
+            renaming_from(&occupied, &base_ids, &declared, &[(old, new)], true).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("the target already holds an object")),
+            "{errors:?}"
+        );
+    }
+    let plan = renaming_from(&recorded, &base_ids, &declared, &[(old, new)], true).unwrap();
+    assert_eq!(
+        renames(&plan),
+        [(name(old).raw().to_string(), name(new).raw().to_string())]
+    );
+}
+
 #[test]
 fn a_vacated_name_is_reused_after_the_rename_and_a_new_mapping_follows_the_new_name() {
     let base = holding(&[("dictionary app.words", words())]);
