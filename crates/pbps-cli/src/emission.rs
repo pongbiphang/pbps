@@ -37,12 +37,30 @@ mod sealed {
 /// Concrete dispatch finishes before certification. A semantic trait object
 /// cannot lower a plan or erase the actual engine's certificate brand.
 pub trait Engine:
-    sealed::Engine + pbps_dialect::PlanDialect<Plan = dyn PlanView<Self>> + Clone + Sized + 'static
+    sealed::Engine
+    + pbps_dialect::PlanDialect<Plan = dyn PlanView<Self>>
+    + Clone
+    + Send
+    + Sync
+    + Sized
+    + 'static
 {
     fn as_ref(&self) -> &Self {
         self
     }
-    fn lower(&self, plan: &Self::Plan) -> Result<LoweredPlan, pbps_dialect::DialectError>;
+    /// The one place a lowered collection is made: the engine that lowered
+    /// the plan stays with its statements, behind [`LoweredPlan`].
+    fn lower(&self, plan: &Self::Plan) -> Result<LoweredPlan, pbps_dialect::DialectError> {
+        Ok(LoweredPlan {
+            inner: std::sync::Arc::new(Branded {
+                dialect: self.clone(),
+                plan: pbps_dialect::lower::lower_all(plan, self)?,
+            }),
+        })
+    }
+    /// Whether bootstrap may be given `trusted_roles`. An engine that answers
+    /// no is refused them before its guard is prepared.
+    fn trusts_roles(&self) -> bool;
     /// The connected seam asks at the old refusal point. PostgreSQL's module
     /// expansion has always used the empty write path and observed version.
     fn with_planning_version(&self, version: i64) -> Self;
@@ -56,13 +74,8 @@ pub trait Engine:
     ) -> Self;
 }
 impl Engine for pbps_pg::Postgres {
-    fn lower(&self, plan: &Self::Plan) -> Result<LoweredPlan, pbps_dialect::DialectError> {
-        Ok(LoweredPlan {
-            inner: EnginePlan::Postgres {
-                dialect: self.clone(),
-                plan: pbps_dialect::lower::lower_all(plan, self)?,
-            },
-        })
+    fn trusts_roles(&self) -> bool {
+        true
     }
     fn with_planning_version(&self, version: i64) -> Self {
         Self::new().with_server_version(version)
@@ -78,13 +91,8 @@ impl Engine for pbps_pg::Postgres {
     }
 }
 impl Engine for pbps_mssql::Mssql {
-    fn lower(&self, plan: &Self::Plan) -> Result<LoweredPlan, pbps_dialect::DialectError> {
-        Ok(LoweredPlan {
-            inner: EnginePlan::Mssql {
-                dialect: *self,
-                plan: pbps_dialect::lower::lower_all(plan, self)?,
-            },
-        })
+    fn trusts_roles(&self) -> bool {
+        false
     }
     fn with_planning_version(&self, _version: i64) -> Self {
         *self
@@ -119,16 +127,75 @@ macro_rules! with_plan_dialect {
     };
 }
 
-#[derive(Clone)]
-enum EnginePlan {
-    Postgres {
-        dialect: pbps_pg::Postgres,
-        plan: pbps_dialect::lower::LoweredPlan<pbps_pg::Postgres>,
-    },
-    Mssql {
-        dialect: pbps_mssql::Mssql,
-        plan: pbps_dialect::lower::LoweredPlan<pbps_mssql::Mssql>,
-    },
+/// A lowered plan with the engine that lowered it. The brand `E` is what
+/// certifies the statements, so it is kept here and never erased from the
+/// value itself: only the handle the CLI passes around forgets which engine
+/// it is.
+struct Branded<E: Engine> {
+    dialect: E,
+    plan: pbps_dialect::lower::LoweredPlan<E>,
+}
+
+/// What the CLI does with a lowered plan, whichever engine lowered it. One
+/// generic implementation serves every engine, so a new one adds no arm here.
+trait Lowered: Send + Sync {
+    fn statements(&self) -> &[Statement];
+    fn groups(&self) -> &[pbps_dialect::lower::Lowered];
+    fn render(&self, zone: &SessionZone) -> Result<String, pbps_dialect::DialectError>;
+    fn bootstrap_script(
+        &self,
+        schema: &pbps_model::Schema,
+        trusted: &std::collections::BTreeSet<pbps_model::RoleName>,
+    ) -> anyhow::Result<BootstrapScript>;
+}
+
+impl<E: Engine> Lowered for Branded<E> {
+    fn statements(&self) -> &[Statement] {
+        self.plan.statements()
+    }
+    fn groups(&self) -> &[pbps_dialect::lower::Lowered] {
+        self.plan.groups()
+    }
+    fn render(&self, zone: &SessionZone) -> Result<String, pbps_dialect::DialectError> {
+        pbps_dialect::render_script(&self.plan, &self.dialect, zone)
+    }
+    fn bootstrap_script(
+        &self,
+        schema: &pbps_model::Schema,
+        trusted: &std::collections::BTreeSet<pbps_model::RoleName>,
+    ) -> anyhow::Result<BootstrapScript> {
+        if !trusted.is_empty() && !self.dialect.trusts_roles() {
+            anyhow::bail!("trusted_roles is supported only on PostgreSQL");
+        }
+        Ok(BootstrapScript {
+            inner: Box::new(Prelude {
+                dialect: self.dialect.clone(),
+                script: pbps_dialect::prepare_bootstrap_script(
+                    &self.plan,
+                    &self.dialect,
+                    schema,
+                    trusted,
+                )?,
+            }),
+        })
+    }
+}
+
+/// A bootstrap script with the engine that prepared it, as [`Branded`] is for
+/// a lowered plan.
+struct Prelude<E: Engine> {
+    dialect: E,
+    script: pbps_dialect::BootstrapScript<E>,
+}
+
+trait Prepared: Send + Sync {
+    fn render(&self, zone: &SessionZone) -> Result<String, pbps_dialect::DialectError>;
+}
+
+impl<E: Engine> Prepared for Prelude<E> {
+    fn render(&self, zone: &SessionZone) -> Result<String, pbps_dialect::DialectError> {
+        self.script.render(&self.dialect, zone)
+    }
 }
 
 /// The collection accepted by CLI transaction, staged/resume and rehearsal
@@ -157,28 +224,18 @@ enum EnginePlan {
 /// ```
 #[derive(Clone)]
 pub struct LoweredPlan {
-    inner: EnginePlan,
+    /// Shared, never mutated: a clone is the same certified collection.
+    inner: std::sync::Arc<dyn Lowered>,
 }
 impl LoweredPlan {
     pub fn statements(&self) -> &[Statement] {
-        match &self.inner {
-            EnginePlan::Postgres { plan, .. } => plan.statements(),
-            EnginePlan::Mssql { plan, .. } => plan.statements(),
-        }
+        self.inner.statements()
     }
     pub fn groups(&self) -> &[pbps_dialect::lower::Lowered] {
-        match &self.inner {
-            EnginePlan::Postgres { plan, .. } => plan.groups(),
-            EnginePlan::Mssql { plan, .. } => plan.groups(),
-        }
+        self.inner.groups()
     }
     pub fn render(&self, zone: &SessionZone) -> Result<String, pbps_dialect::DialectError> {
-        match &self.inner {
-            EnginePlan::Postgres { dialect, plan } => {
-                pbps_dialect::render_script(plan, dialect, zone)
-            }
-            EnginePlan::Mssql { dialect, plan } => pbps_dialect::render_script(plan, dialect, zone),
-        }
+        self.inner.render(zone)
     }
 }
 impl std::ops::Deref for LoweredPlan {
@@ -229,22 +286,12 @@ impl Script for LoweredPlan {
     }
 }
 
-pub enum BootstrapScript {
-    Postgres {
-        dialect: pbps_pg::Postgres,
-        script: pbps_dialect::BootstrapScript<pbps_pg::Postgres>,
-    },
-    Mssql {
-        dialect: pbps_mssql::Mssql,
-        script: pbps_dialect::BootstrapScript<pbps_mssql::Mssql>,
-    },
+pub struct BootstrapScript {
+    inner: Box<dyn Prepared>,
 }
 impl Script for BootstrapScript {
     fn render(&self, zone: &SessionZone) -> Result<String, pbps_dialect::DialectError> {
-        match self {
-            Self::Postgres { dialect, script } => script.render(dialect, zone),
-            Self::Mssql { dialect, script } => script.render(dialect, zone),
-        }
+        self.inner.render(zone)
     }
 }
 impl LoweredPlan {
@@ -253,20 +300,20 @@ impl LoweredPlan {
         schema: &pbps_model::Schema,
         trusted: &std::collections::BTreeSet<pbps_model::RoleName>,
     ) -> anyhow::Result<BootstrapScript> {
-        Ok(match &self.inner {
-            EnginePlan::Postgres { dialect, plan } => BootstrapScript::Postgres {
-                dialect: dialect.clone(),
-                script: pbps_dialect::prepare_bootstrap_script(plan, dialect, schema, trusted)?,
-            },
-            EnginePlan::Mssql { dialect, plan } => {
-                if !trusted.is_empty() {
-                    anyhow::bail!("trusted_roles is supported only on PostgreSQL");
-                }
-                BootstrapScript::Mssql {
-                    dialect: *dialect,
-                    script: pbps_dialect::prepare_bootstrap_script(plan, dialect, schema, trusted)?,
-                }
-            }
-        })
+        self.inner.bootstrap_script(schema, trusted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Engine;
+
+    /// The one thing a lowered plan still asks its engine by itself: every
+    /// other question is answered by the generic implementation (#2950).
+    #[test]
+    fn only_postgresql_may_be_given_trusted_roles_at_bootstrap() {
+        assert!(pbps_pg::Postgres::new().trusts_roles());
+        // Negative: SQL Server is refused them before its guard is prepared.
+        assert!(!pbps_mssql::Mssql.trusts_roles());
     }
 }
