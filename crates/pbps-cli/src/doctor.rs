@@ -2399,6 +2399,7 @@ mod tests {
         let findings = |d: &EnvDiagnosis, driver: pbps_db::Driver| match driver {
             pbps_db::Driver::Mssql => env_findings(d, false, &pbps_mssql::Mssql, driver),
             pbps_db::Driver::Postgres => env_findings(d, false, &pbps_pg::Postgres::new(), driver),
+            pbps_db::Driver::Sqlite => unreachable!("this test asks the two server engines"),
         };
         let only = |findings: &[output::Finding], id: &str| -> output::Finding {
             let matched: Vec<&output::Finding> = findings.iter().filter(|f| f.id == id).collect();
@@ -2464,6 +2465,7 @@ mod tests {
             let foreign: &[&str] = match driver {
                 pbps_db::Driver::Postgres => &["dbo.", "VIEW DEFINITION", "login", "OBJECT::"],
                 pbps_db::Driver::Mssql => &["public.", "USAGE", "pg_catalog"],
+                pbps_db::Driver::Sqlite => unreachable!("this test asks the two server engines"),
             };
             for word in foreign {
                 assert!(

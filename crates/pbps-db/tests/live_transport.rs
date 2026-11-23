@@ -35,6 +35,7 @@ fn address(host: &str, port: u16) -> String {
         Driver::Mssql => {
             format!("Server={host},{port};User Id=sa;Password=Pbps!Test12345;Encrypt=true")
         }
+        Driver::Sqlite => unreachable!("a database file has no transport to test"),
     }
 }
 
@@ -47,6 +48,7 @@ async fn read_value(conn: &mut Conn) {
     let sql = match driver() {
         Driver::Postgres => "SELECT CAST($1 AS INT) AS value",
         Driver::Mssql => "SELECT CAST(@P1 AS INT) AS value",
+        Driver::Sqlite => unreachable!("a database file has no transport to test"),
     };
     let rows = conn.query_with(sql, &[Param::I32(608)]).await.unwrap();
     assert_eq!(rows[0].try_get::<i32>("value").unwrap(), Some(608));

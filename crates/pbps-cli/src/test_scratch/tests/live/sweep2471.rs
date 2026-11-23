@@ -46,6 +46,7 @@ impl Made {
             match driver {
                 Driver::Postgres => "postgres",
                 Driver::Mssql => "mssql",
+                Driver::Sqlite => unreachable!("SQLite has no owned scratch container"),
             }
         );
         let mut args = vec![

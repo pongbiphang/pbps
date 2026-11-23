@@ -43,7 +43,7 @@ pbps-db        Connections plus transaction framing. Owns "there is a network";
                touches (`impact`), what `doctor` asks (`doctor`) — and no
                engine's SQL. One module per driver, and nothing outside them
                names one. Driver isolation: see constraint 9. The SQLite module
-               is public, because `Conn` has no `Sqlite` variant yet
+               is public: `Conn` has no row type for it (DEC-2950.17)
 pbps-docs      Markdown / self-contained HTML / Mermaid ERD from the model.
                Pure: no dialect, no connection, no configuration
 pbps-ui        Loopback UI over fixed CLI subprocess commands; currently read
@@ -84,11 +84,10 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 - `pbps-sqlite` depends on `pbps-db`, `pbps-dialect` and `pbps-diff` (the
   sealed plan its emitter reads, as `pbps-pg` does) and on nothing else in the
   workspace so far, and no crate depends on it until the engine is wired
-  (the last of the plan in #2950). Wiring adds a `Driver` and a `Conn` variant
-  and the arms every exhaustive `match` then needs, which is why it waits for
-  route steps 4 to 6 of #2798. The crate calls `pbps_db::sqlite::Connection`
-  directly, a synchronous type; the wiring runs those calls on a blocking
-  thread behind the async `Conn`.
+  (the last of the plan in #2950). `Driver` and `Conn` have a `Sqlite`
+  variant; no project can select it until `DialectName` has the value. The
+  crate calls `pbps_db::sqlite::Connection`, a synchronous type, and the async
+  `Conn` calls it in the calling thread (DEC-2950.17).
 - `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
 - Pure module and RLS policy dependency facts live in `pbps-diff::order::catalog`.
   PostgreSQL owns their reads and re-exports the shared value types. The
@@ -339,8 +338,8 @@ has a home, the entry links there instead of repeating its content.
    the workspace names either — `pbps-db::Conn` dispatches between them and
    holds no driver type ([decision 225](decisions/connection.md#decision-225)).
    `pbps-db::sqlite` is the third file and names `rusqlite` (DEC-2950.1); it is
-   public until `Conn` has a `Sqlite` variant, and no `rusqlite` type appears in
-   one of its signatures.
+   public because `Conn` has no row type for SQLite (DEC-2950.17), and no
+   `rusqlite` type appears in one of its signatures.
 
 Typed portable creation demands stay in planning state (DEC-2469.4).
 `pbps-dialect::creation` selects facets and refines engine-provided recipes using

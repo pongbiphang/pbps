@@ -889,6 +889,7 @@ pub(crate) fn selected(driver: Driver) -> crate::emission::SelectedDialect {
     match driver {
         Driver::Mssql => crate::emission::SelectedDialect::Mssql(pbps_mssql::Mssql),
         Driver::Postgres => crate::emission::SelectedDialect::Postgres(pbps_pg::Postgres::new()),
+        Driver::Sqlite => crate::db::sqlite_not_wired(),
     }
 }
 

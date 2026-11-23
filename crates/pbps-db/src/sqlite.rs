@@ -1,22 +1,21 @@
 //! The SQLite driver module (#2950): the one file that names `rusqlite`.
 //!
 //! ARCHITECTURE constraint 9 reads "one file per driver", and this is the third
-//! one. Unlike [`crate::mssql`] and [`crate::postgres`] it is public and not
-//! reached through [`crate::Conn`]: `Conn` has no `Sqlite` variant yet, because
-//! adding one today breaks every exhaustive `match` that route steps 4 to 6 of
-//! #2798 are rewriting. The engine crate `pbps-sqlite` uses [`Connection`]
-//! directly until the wiring lands, and no `rusqlite` type appears in any
-//! signature here, so that wiring is a change to this file and not to its
-//! callers.
+//! one. Unlike [`crate::mssql`] and [`crate::postgres`] it is public:
+//! [`crate::Conn`] has a `Sqlite` variant that runs statements and
+//! transactions, and no row type for it, so the engine crate `pbps-sqlite`
+//! reads through [`Connection`]'s typed functions, which it reaches with
+//! [`crate::Conn::sqlite`] (DEC-2950.17). No `rusqlite` type appears in any
+//! signature here.
 //!
 //! # Synchronous on purpose
 //!
 //! `rusqlite::Connection` is `Send` and not `Sync`, and SQLite runs inside the
 //! calling thread: there is no server to wait for. This module is therefore
-//! plain blocking code. The async [`crate::Conn`] methods will reach it by
-//! moving the connection into `tokio::task::spawn_blocking` and back, which
-//! needs only that [`Connection`] is `Send`; a transaction lives in the
-//! connection, so it spans those calls.
+//! plain blocking code, and the async [`crate::Conn`] methods call it in
+//! place: a borrowed connection cannot move to a blocking thread, and a call
+//! abandoned there could outlive its caller (DEC-2950.17). A transaction lives
+//! in the connection, so it spans those calls.
 //!
 //! # What the setup refuses, and why
 //!
@@ -223,9 +222,20 @@ impl Record {
 /// An open SQLite database, with foreign keys enforced.
 ///
 /// `Send` and not `Sync`, as the library's own connection is.
-#[derive(Debug)]
 pub struct Connection {
     inner: rusqlite::Connection,
+    /// Declared after `inner`, so the database is closed before what is
+    /// parked here is dropped.
+    parked: Option<Box<dyn std::any::Any + Send>>,
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("inner", &self.inner)
+            .field("parked", &self.parked.is_some())
+            .finish()
+    }
 }
 
 impl Connection {
@@ -318,7 +328,10 @@ impl Connection {
                 row.get::<_, i64>(0)
             })
             .map_err(|e| driver_error(e).context(format!("reading the schema of {shown}")))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            parked: None,
+        })
     }
 
     /// How long a statement waits for another connection's lock before it
@@ -580,8 +593,34 @@ impl Connection {
         ))
     }
 
-    /// Runs `work` in a transaction: commit if it returns `Ok`, roll back and
-    /// return its error if not.
+    /// Parks one value on this connection, to live exactly as long as it.
+    ///
+    /// For the engine's lock: SQLite's apply lock is an operating-system lock
+    /// that lasts as long as a guard value, and the command that took it holds
+    /// the connection and nothing else across its steps. This crate cannot
+    /// name the guard's type, so the slot is type-erased; whoever parks a
+    /// value is the only one who knows what to take out. One slot, not a map:
+    /// a second value while one is parked is refused and handed back, never
+    /// swapped in, because replacing a guard would release the lock it holds.
+    pub fn park(
+        &mut self,
+        value: Box<dyn std::any::Any + Send>,
+    ) -> Result<(), Box<dyn std::any::Any + Send>> {
+        if self.parked.is_some() {
+            return Err(value);
+        }
+        self.parked = Some(value);
+        Ok(())
+    }
+
+    /// Takes the parked value out, leaving the slot empty. `None` when
+    /// nothing is parked, which is a different answer from a value of an
+    /// unexpected type: the caller downcasts what it gets.
+    pub fn unpark(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
+        self.parked.take()
+    }
+
+    /// Opens a transaction.
     ///
     /// What the transaction statements say is the dialect's (ADR-0014 section
     /// 2), so they are a parameter. Before the begin, foreign keys are set and
@@ -590,14 +629,7 @@ impl Connection {
     /// switched it off through [`Connection::execute_batch`] is not carried
     /// into a transaction that silently does not enforce it. A transaction
     /// already open is refused for the same reason.
-    ///
-    /// A rollback that fails because the engine already ended the transaction
-    /// does not replace the error that caused it.
-    pub fn transaction<T>(
-        &mut self,
-        framing: &TransactionFraming,
-        work: impl FnOnce(&Connection) -> Result<T, DbError>,
-    ) -> Result<T, DbError> {
+    pub fn begin(&mut self, framing: &TransactionFraming) -> Result<(), DbError> {
         if self.in_transaction() {
             return Err(DbError::Refused(
                 "a SQLite transaction is already open on this connection; \
@@ -608,15 +640,48 @@ impl Connection {
         enable_foreign_keys(&self.inner)?;
         self.inner
             .execute_batch(&framing.begin)
-            .map_err(|e| driver_error(e).context("opening a SQLite transaction"))?;
+            .map_err(|e| driver_error(e).context("opening a SQLite transaction"))
+    }
+
+    /// Commits. A commit that fails is rolled back here, so the caller is
+    /// never left to guess whether the transaction is still open; if even the
+    /// rollback leaves the connection inside it, the error says so.
+    pub fn commit(&mut self, framing: &TransactionFraming) -> Result<(), DbError> {
+        match self.inner.execute_batch(&framing.commit) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let failure = driver_error(e).context("committing the SQLite transaction");
+                Err(self.abandon(framing, failure))
+            }
+        }
+    }
+
+    /// Rolls back. A rollback that fails because the engine already ended the
+    /// transaction is not an error: there is nothing left to undo, and its
+    /// message must not replace the failure that led here. One that leaves
+    /// the connection inside the transaction is.
+    pub fn rollback(&mut self, framing: &TransactionFraming) -> Result<(), DbError> {
+        match self.inner.execute_batch(&framing.rollback) {
+            Err(e) if self.in_transaction() => Err(driver_error(e)
+                .context("the rollback failed and the connection is still inside the transaction")),
+            Ok(()) | Err(_) => Ok(()),
+        }
+    }
+
+    /// Runs `work` in a transaction: commit if it returns `Ok`, roll back and
+    /// return its error if not. The closure form of [`Connection::begin`],
+    /// [`Connection::commit`] and [`Connection::rollback`], with their checks.
+    ///
+    /// A rollback that fails because the engine already ended the transaction
+    /// does not replace the error that caused it.
+    pub fn transaction<T>(
+        &mut self,
+        framing: &TransactionFraming,
+        work: impl FnOnce(&Connection) -> Result<T, DbError>,
+    ) -> Result<T, DbError> {
+        self.begin(framing)?;
         match work(self) {
-            Ok(value) => match self.inner.execute_batch(&framing.commit) {
-                Ok(()) => Ok(value),
-                Err(e) => {
-                    let failure = driver_error(e).context("committing the SQLite transaction");
-                    Err(self.abandon(framing, failure))
-                }
-            },
+            Ok(value) => self.commit(framing).map(|()| value),
             Err(failure) => Err(self.abandon(framing, failure)),
         }
     }
