@@ -882,6 +882,7 @@
         "extensions2447_drop::a_drop_is_rehearsed_when_the_project_rehearses_and_pins_the_targets_manifest",
         "extensions2447_drop::a_role_that_does_not_own_the_package_is_refused_before_a_plan_exists",
         "extensions2447_drop::a_package_drop_beside_a_resolver_bound_change_is_refused_by_name_and_writes_nothing",
+        "adoption_class2961::a_parent_index_over_an_expression_under_another_class_leaves_a_partitions_own",
         "comments2729::a_pulled_project_is_in_sync_and_rebuilds_the_same_comments",
         "comments2729::each_edit_is_one_statement_and_an_undeclared_comment_is_left_alone",
         "comments2729::a_comments_bytes_survive_the_pull_the_file_and_the_apply",

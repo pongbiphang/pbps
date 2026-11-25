@@ -11,6 +11,11 @@ use super::*;
 /// An expression key or a predicate is a match whatever its text, as the
 /// attach path takes it (DEC-1545.1): the engine compares what each parses
 /// and binds to, so `n+1` and `n + 1` are one index to it (#1737 review).
+/// Which expressions those are is #1671's to rehearse. An expression key's
+/// class is not text, though: absent is the default on both sides, since a
+/// declaration may not spell it and the catalog reads it back as none
+/// (DEC-2449.2), so two expression keys under different classes are told
+/// apart here, as two column keys are (DEC-2961.1).
 pub fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
     parent.method == own.method
         && parent.unique == own.unique
@@ -20,6 +25,7 @@ pub fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
         && parent.columns.iter().zip(&own.columns).all(|(p, o)| {
             match (p.key.column(), o.key.column()) {
                 (Some(p_column), Some(o_column)) => p_column == o_column && p.opclass == o.opclass,
+                (None, None) => p.opclass == o.opclass,
                 _ => true,
             }
         })
