@@ -835,6 +835,40 @@ pub(crate) fn drop(
     Ok(vec![statement])
 }
 
+/// `ALTER TEXT SEARCH ... RENAME TO`: the engine keeps the oid, so what names the object by
+/// oid follows it and nothing here rebuilds a dependent (DEC-2728.5). The rename stays inside
+/// the schema: `ALTER ... SET SCHEMA` is not planned, so a differing schema or kind is refused
+/// here as a second line of defence behind the differ. The statement carries the new name, which
+/// is the identity a staged apply records once it has committed.
+pub(crate) fn rename(
+    uid: &pbps_model::Uid,
+    from: &SearchRef,
+    to: &SearchRef,
+) -> Result<Vec<pbps_dialect::Statement>, DialectError> {
+    if from.kind != to.kind || from.name.schema() != to.name.schema() {
+        return Err(invalid(format!(
+            "{} cannot be renamed to {}: a rename keeps the kind and the schema",
+            from.shown(),
+            to.shown()
+        )));
+    }
+    let word = match from.kind {
+        SearchKind::Config => "CONFIGURATION",
+        SearchKind::Dictionary => "DICTIONARY",
+    };
+    let mut statement = pbps_dialect::Statement::new(format!(
+        "ALTER TEXT SEARCH {word} {} RENAME TO {};",
+        qualified(from.name.schema(), from.name.name())?,
+        crate::quote(to.name.name())?
+    ));
+    statement.search = Some(pbps_dialect::SearchStatement {
+        uid: uid.clone(),
+        name: to.clone(),
+        created: true,
+    });
+    Ok(vec![statement])
+}
+
 /// What the engine would refuse, or this model does not hold, before a plan is made: the
 /// parser and template, the token aliases and the dictionaries a mapping names. A
 /// dictionary the project does not declare is the target's to resolve (a system or a
@@ -1440,6 +1474,71 @@ mod tests {
             );
             assert_eq!(sql[0].sql, expected);
             assert!(!sql[0].search.as_ref().unwrap().created);
+        }
+    }
+
+    fn rename_change(from: &str, to: &str, definition: SearchObject) -> pbps_model::Change {
+        pbps_model::Change::Search(pbps_model::SearchChange::RenameSearch {
+            uid: "s_aaaaaa".parse().unwrap(),
+            from: from.parse().unwrap(),
+            to: to.parse().unwrap(),
+            definition: Box::new(definition),
+        })
+    }
+
+    /// A rename is one `ALTER ... RENAME TO` of the old qualified name to the new bare name, of
+    /// the object's own kind, and its statement carries the new name for a staged apply
+    /// (DEC-2728.5). Negatives: a rename across schemas or kinds writes nothing, and a quote in a
+    /// name is quoted.
+    #[test]
+    fn a_rename_emits_one_alter_and_refuses_a_move_across_schema_or_kind() {
+        let dictionary = SearchObject::Dictionary {
+            template: t("pg_catalog.simple"),
+            options: Default::default(),
+        };
+        let sql = emitted(&rename_change(
+            "dictionary app.words",
+            "dictionary app.\"te\"\"rms\"",
+            dictionary.clone(),
+        ));
+        assert_eq!(sql.len(), 1);
+        assert_eq!(
+            sql[0].sql,
+            "ALTER TEXT SEARCH DICTIONARY \"app\".\"words\" RENAME TO \"te\"\"rms\";"
+        );
+        let carried = sql[0].search.as_ref().unwrap();
+        assert!(
+            carried.created && carried.name.raw().to_string() == "dictionary app.\"te\"\"rms\""
+        );
+        let configuration = SearchObject::Config {
+            parser: t("pg_catalog.\"default\""),
+            mappings: Default::default(),
+        };
+        let sql = emitted(&rename_change(
+            "config app.docs",
+            "config app.articles",
+            configuration.clone(),
+        ));
+        assert_eq!(
+            sql[0].sql,
+            "ALTER TEXT SEARCH CONFIGURATION \"app\".\"docs\" RENAME TO \"articles\";"
+        );
+        for (from, to, object) in [
+            (
+                "dictionary app.words",
+                "dictionary other.words",
+                dictionary.clone(),
+            ),
+            ("config app.docs", "dictionary app.docs", configuration),
+        ] {
+            let error = crate::emit::emit(
+                &crate::Postgres::new(),
+                &rename_change(from, to, object),
+                Default::default(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("keeps the kind and the schema"), "{error}");
         }
     }
 

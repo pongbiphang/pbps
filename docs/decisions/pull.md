@@ -1790,3 +1790,70 @@ Rejected:
 - **Ordering inside the module.** Each pragma's callers order by another key (`cid`, `seqno`, `id` descending then `seq`, the name), and the rehearsal reports in the reader's order.
 
 Formats: none moves.
+
+<a id="dec-2728-5"></a>
+
+**DEC-2728.5. A text search configuration or dictionary is renamed by recorded identity, within its schema, as one `ALTER ... RENAME TO`, and text that names the old name is not followed (#2728 PR D).**
+`renamed_from:` in the file (or `pbps intent --rename-search`, never a prompt: search identity
+is never inferred, DEC-2728.2) moves the recorded identity to the new name. The change is
+`RenameSearch`, class 1 like a type's, gated as `rename`; it carries the definition that
+stands, so the plan's checksum pins what was compared.
+
+- **Engine facts** (measured on 16.15 and 18.6, identical; kept as assertions in
+  `text_search2728_rename`). The rename keeps the object's oid, needs ownership and `CREATE`
+  on the schema, and holds an `AccessExclusiveLock` on the object only (no lock on a table
+  that uses it; a concurrent `to_tsvector` and an `INSERT` are not blocked). A name is
+  occupied only by an object of the same kind in the schema (42710): the same name of the
+  other kind, or of a type, is free. A direct swap is refused and a swap through a third
+  name works; a rename into a dropped object's name works only after the drop. There is no
+  `RENAME TO other.name`: a move is `SET SCHEMA`, which is not planned.
+- **What follows by oid, and what does not.** A mapping, an expression index, a stored
+  generated column, a check, a column default, a view, a materialized view and a `BEGIN
+  ATOMIC` body keep working and are read back with the new name. A function whose body is
+  text (`to_tsvector('app.docs', $1)`) fails at its first call, a thesaurus's `dictionary`
+  option keeps the old name (no catalog edge, DEC-2728.3) and fails when used, and a
+  `default_text_search_config` set on a database or role keeps it (a session then starts with a
+  warning and the engine's default). The plan line says so: `text that names app.docs is not
+  followed: a function body, a default_text_search_config setting, an application`. No new
+  risk class and no refusal: `stale-results` means stored results may be stale (DEC-2728.4),
+  which a rename never causes, and the catalog cannot see text.
+- **A dependent's own text is the user's to update, and the plan holds the table to it.** A
+  dependent declared with the new spelling is, to the differ, a changed expression: it plans
+  the generated column's `SET EXPRESSION` (a rewrite, `narrowing`, and PostgreSQL 17 or later; 16
+  refuses it by name), a check's drop and add and an index rebuild, each under its own class.
+  This is correct and wasteful, and normalising a literal name through the plan's renames
+  is a general facility that is its own issue. A rename that leaves the dependents' text
+  alone is rolled back at the end of the apply ("moved while this plan was running"): the
+  table reads the new name where the plan was approved over the old. Nothing is silently
+  broken.
+- **Refused by name, with the remedy:** a rename that also changes the object (rename in one
+  plan, change in the next: the census, the staged pin chain and the saved plan's admission
+  each key an object on one name); a rename into another schema; a held thesaurus that
+  names the dictionary in its option (declare the new one and move the thesaurus, in two plans;
+  a thesaurus the plan drops is no obstacle); a rename cycle in an ids file; a chain or swap
+  through the declarations (the target is still declared, `RenameTargetExists`); a
+  configuration that still maps the old name of a dictionary the plan renames.
+- **A configuration over a renamed dictionary is the same configuration.** The baseline is read
+  with the dictionary names the plan renames spelled the new way, so the dictionary's
+  rename plans no mapping change, and a real mapping change beside it is an alteration whose
+  `before` carries the new spelling. The recorded definition of such a configuration is
+  respelled the same way when the rename has run (otherwise the record reads as drift),
+  and the pin on an alteration reads the object respelled, since before the rename runs the
+  database still holds the old spelling.
+- **A vacated name is free.** The "retired and declared again" refusal looks past a name its
+  base object leaves by a rename, so a new object may take it; the rename runs first (class
+  1 against 7 and its slot release). A chain recorded in the ids runs the rename out of a
+  name before the one into it.
+- **Identity.** A third resolver of the shape `resolve_types` and `resolve_roles` share, built
+  from the same claim helpers and written beside them; folding the three into one is #3005, not
+  this change. A pending rename is not a removal in the drop inventory.
+- **Recording.** `after_applying` carries the previous record's definition from the old name to the
+  new, including at a staged checkpoint where the identities may still hold the old name.
+
+Rejected:
+- **A refusal for a text dependent.** It would refuse the common safe case, and the catalog cannot see a body.
+- **`SET SCHEMA` and an intermediate name.** It is plumbed through the dialect trait for types only; a move between schemas stays a drop and create.
+- **Allowing a rename with a change in one plan.** It needs a second name per alteration in four places.
+
+Formats: none moves. `rename_search` is a new `op` of the `search` family and `renamed_from` a new
+declaration key; under #2412 a change before the first release writes no number (DEC-2412.2).

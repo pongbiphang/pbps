@@ -355,6 +355,13 @@ pub fn names(
             search_address(name),
             ObjectKey::Search(Recorded(uid.clone())),
         ),
+        // A rename hands the address over: `from` is free and `to` taken once it has run,
+        // in the search kind's own namespace (DEC-2728.5).
+        Change::Search(SearchChange::RenameSearch { uid, from, to, .. }) => {
+            let holder = ObjectKey::Search(Recorded(uid.clone()));
+            nx.release(search_address(from), holder.clone());
+            nx.claim(search_address(to), holder);
+        }
         // The replacement holds its temporary name from its creation to the
         // swap, which hands the type back its own (DEC-1635.7).
         Change::TypeValue(TypeValueChange::EnumRebuild {
@@ -1023,6 +1030,82 @@ mod tests {
             .collect();
         // The creation supplies `t`, so no earlier holder may be required.
         assert_eq!(read, ["other"]);
+    }
+
+    /// A search rename frees the old name and takes the new one, each in the namespace of
+    /// its own kind, and moves nothing else (DEC-2728.5). Negatives: an in-place alteration
+    /// takes no name, and the same spelling of the other kind is a different address.
+    #[test]
+    fn a_search_rename_releases_its_old_name_and_claims_its_new_one() {
+        struct Unused;
+        impl Owners for Unused {
+            fn address_qualified(&self) -> bool {
+                true
+            }
+            fn table(&self, _: &TableName, _: Spelling) -> Result<crate::Uid, OwnerError> {
+                unreachable!("a search rename reads no table")
+            }
+            fn column(&self, _: &crate::ColumnRef, _: Spelling) -> Result<crate::Uid, OwnerError> {
+                unreachable!("a search rename reads no column")
+            }
+            fn role(&self, _: &crate::RoleName, _: Spelling) -> Result<crate::Uid, OwnerError> {
+                unreachable!("a search rename reads no role")
+            }
+        }
+        let uid = crate::Uid::derived(crate::UidKind::Search, "words", 0);
+        let from: crate::SearchRef = "dictionary app.words".parse().unwrap();
+        let to: crate::SearchRef = "dictionary app.terms".parse().unwrap();
+        let definition = Box::new(crate::SearchObject::Dictionary {
+            template: "pg_catalog.simple".parse().unwrap(),
+            options: Default::default(),
+        });
+        let held = |change: Change| {
+            let ops = super::super::Operations::of_plan(
+                &[crate::PlannedChange::new(change)],
+                super::super::ModuleEdits::InPlace,
+            );
+            let (schema, ids) = (crate::Schema::default(), crate::IdsFile::default());
+            names(
+                &ops.as_slice()[0],
+                &Unused,
+                super::super::Snapshot {
+                    schema: &schema,
+                    ids: &ids,
+                },
+            )
+            .unwrap()
+        };
+        let renamed = held(Change::Search(SearchChange::RenameSearch {
+            uid: uid.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            definition: definition.clone(),
+        }));
+        let holder = ObjectKey::Search(Recorded(uid.clone()));
+        assert_eq!(
+            renamed.releases,
+            [Named {
+                address: search_address(&from),
+                holder: holder.clone()
+            }]
+        );
+        assert_eq!(
+            renamed.claims,
+            [Named {
+                address: search_address(&to),
+                holder
+            }]
+        );
+        let other_kind: crate::SearchRef = "config app.words".parse().unwrap();
+        assert_ne!(search_address(&from), search_address(&other_kind));
+        let altered = held(Change::Search(SearchChange::AlterSearchDictionary {
+            uid,
+            name: from,
+            before: definition.clone(),
+            after: definition,
+            opaque: Vec::new(),
+        }));
+        assert!(altered.claims.is_empty() && altered.releases.is_empty());
     }
 
     #[test]

@@ -135,6 +135,8 @@ mod managed_types;
 mod sequences2721;
 #[path = "support/text_search2728.rs"]
 mod text_search2728;
+#[path = "support/text_search2728_rename.rs"]
+mod text_search2728_rename;
 
 #[path = "support/mixed_cast_defaults2456.rs"]
 mod mixed_cast_defaults2456;

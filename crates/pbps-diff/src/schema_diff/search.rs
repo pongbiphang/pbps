@@ -62,8 +62,14 @@ pub(crate) fn released_search<'a>(
 /// dropped, both by recorded identity, and a standing one whose mappings or options differ is
 /// altered in place (DEC-2728.3). **Refused here, by name**: a changed parser or template
 /// (no `ALTER` form exists), an in-place change whose dependents the target did not list or
-/// the catalog proves stale, and a rename, which arrives in a later part. An object the
-/// target has and the declarations do not, with no identity recorded, is left alone.
+/// the catalog proves stale, and a rename that also changes the object, crosses a schema or
+/// leaves a thesaurus naming the old dictionary. An object the target has and the
+/// declarations do not, with no identity recorded, is left alone.
+///
+/// A rename (DEC-2728.5) is an identity that moved to another name in the same schema. The
+/// engine keeps every reference by oid, so a configuration over a renamed dictionary is the
+/// same configuration, and the comparison reads the baseline with the dictionary names the
+/// plan renames already spelled the new way.
 pub(super) fn diff_search(
     base: Side<'_>,
     declared: Side<'_>,
@@ -82,6 +88,48 @@ pub(super) fn diff_search(
     // baseline holding it is no answer, since the drop comes after the create (class 18)
     // and the engine's RESTRICT would refuse it while anything still maps it.
     let dropped = dropped_search(base, declared);
+    // The renames of this plan, old name to new: one identity under another name in both
+    // sides, the object held on both. `renamed_from` is the inverse, by new name.
+    let search_renames: BTreeMap<pbps_model::SearchRef, pbps_model::SearchRef> = base
+        .ids
+        .search
+        .iter()
+        .filter_map(|(uid, old)| {
+            let new = declared.ids.search.get(uid)?;
+            (new != old
+                && base.schema.search.contains_key(old)
+                && declared.schema.search.contains_key(new))
+            .then(|| (old.clone(), new.clone()))
+        })
+        .collect();
+    let renamed_from: BTreeMap<_, _> = search_renames.iter().map(|(old, new)| (new, old)).collect();
+    // What the baseline holds under `name`: nothing once the plan renames it away (the name
+    // is vacated, and a new object may take it), and the dictionary names a rename moved
+    // spelled the new way, since the engine's mapping follows the dictionary, not its name.
+    let standing = |name: &pbps_model::SearchRef| -> Option<SearchObject> {
+        if search_renames.contains_key(name) {
+            return None;
+        }
+        base.schema
+            .search
+            .get(name)
+            .map(|object| object.respelled(&search_renames))
+    };
+    // A rename loop (a swap) in an ids file the resolver did not write: no order of
+    // `RENAME TO` can run it, because each target is the other's source (DEC-2728.5).
+    for start in search_renames.keys() {
+        let (mut seen, mut at) = (BTreeSet::new(), start);
+        while let Some(next) = search_renames.get(at) {
+            if !seen.insert(at) {
+                refuse(
+                    start,
+                    "is part of a rename cycle (a swap), which no order of renames runs; rename in separate plans",
+                );
+                break;
+            }
+            at = next;
+        }
+    }
     // A dictionary the project neither declares nor the target holds, in a schema no package
     // of the project provides and that is not the engine's own, is one the engine would refuse
     // at `ADD MAPPING`.
@@ -126,11 +174,28 @@ pub(super) fn diff_search(
             );
             continue;
         }
+        let moved: Vec<String> = now
+            .dictionaries()
+            .iter()
+            .filter(|used| !declared.schema.search.contains_key(used))
+            .filter_map(|used| search_renames.get(used))
+            .map(|new| new.shown().to_string())
+            .collect();
+        if !moved.is_empty() {
+            refuse(
+                name,
+                &format!(
+                    "uses a dictionary this plan renames; name it {} instead",
+                    moved.join(", ")
+                ),
+            );
+            continue;
+        }
         // The identity first, as for a package: a name the base holds under one recorded
         // identity and the declarations under another is an object retired and declared
         // again before the drop reached the target. Equal definitions would skip the create
         // while the drop of the old identity still came, leaving a declared object dropped.
-        if base.schema.search.contains_key(name)
+        if standing(name).is_some()
             && let (Some(was), Some(now)) =
                 (base.ids.search_uid(name), declared.ids.search_uid(name))
             && was != now
@@ -142,7 +207,24 @@ pub(super) fn diff_search(
             );
             continue;
         }
-        match base.schema.search.get(name) {
+        // A rename into a name the target already holds, by an object the ids do not record
+        // under it: the engine's `RENAME TO` would fail there, and reading that object as the
+        // renamed one would skip or alter it while the identity moved onto it and the
+        // original stayed.
+        if let Some(old) = renamed_from.get(name)
+            && standing(name).is_some()
+        {
+            refuse(
+                name,
+                &format!(
+                    "is the new name of {}, but the target already holds an object of that \
+                     name; drop or rename that one first",
+                    old.shown()
+                ),
+            );
+            continue;
+        }
+        match standing(name).as_ref() {
             Some(was) if was == now => {}
             Some(was) => {
                 let Some(uid) = declared.ids.search_uid(name) else {
@@ -253,12 +335,11 @@ pub(super) fn diff_search(
                         name,
                         "has no recorded identity; run `pbps plan` to record it",
                     ),
-                    Some(uid)
-                        if base.ids.search.get(uid).is_some_and(|was| {
-                            was != name && base.schema.search.contains_key(was)
-                        }) =>
-                    {
-                        refuse(name, "renaming one arrives in a later part of #2728");
+                    Some(uid) if let Some(old) = renamed_from.get(name) => {
+                        match rename_search(uid, old, name, now, base, &dropped, &search_renames) {
+                            Ok(change) => changes.push(change),
+                            Err(reason) => refuse(name, &reason),
+                        }
                     }
                     Some(uid) => {
                         // A dictionary the project neither declares nor the target holds, in a
@@ -322,4 +403,66 @@ pub(super) fn search_depth(
     });
     seen.remove(name);
     depth
+}
+
+/// The change for one object whose identity moved from `old` to `name` (DEC-2728.5): a lone
+/// `RenameSearch`, or the reason it cannot be planned. Refused by name: a move to another
+/// schema (`RENAME TO` keeps the schema and `SET SCHEMA` is not planned), a definition that
+/// also changes (the census, the staged pin chain and the saved plan's admission each key an
+/// object on one name), and a dictionary a held thesaurus names in its option, which the
+/// engine stores as text and does not follow (DEC-2728.3).
+fn rename_search(
+    uid: &Uid,
+    old: &pbps_model::SearchRef,
+    name: &pbps_model::SearchRef,
+    now: &SearchObject,
+    base: Side<'_>,
+    dropped: &BTreeSet<&pbps_model::SearchRef>,
+    renames: &BTreeMap<pbps_model::SearchRef, pbps_model::SearchRef>,
+) -> Result<Change, String> {
+    let was = base
+        .schema
+        .search
+        .get(old)
+        .map(|object| object.respelled(renames))
+        .ok_or_else(|| "renames an object the target does not hold".to_owned())?;
+    if old.kind != name.kind {
+        return Err("is declared as another kind of object than the target holds".into());
+    }
+    if old.name.schema() != name.name.schema() {
+        return Err(format!(
+            "moves from schema {} to {}; a rename keeps the schema, and moving one is not planned",
+            old.name.schema(),
+            name.name.schema()
+        ));
+    }
+    if was != *now {
+        return Err(format!(
+            "is renamed from {} and also changes; rename it in one plan and change it in the next",
+            old.shown()
+        ));
+    }
+    let naming: Vec<String> = base
+        .schema
+        .search
+        .iter()
+        .filter(|(other, object)| {
+            !dropped.contains(other) && object.dictionaries().contains(old) && **other != *old
+        })
+        .filter(|(_, object)| matches!(object, SearchObject::Dictionary { .. }))
+        .map(|(other, _)| other.shown().to_string())
+        .collect();
+    if !naming.is_empty() {
+        return Err(format!(
+            "is named by {} in its `dictionary` option, which the engine keeps as text and does \
+             not follow; declare the new dictionary under a new name and move that one, in two plans",
+            naming.join(", ")
+        ));
+    }
+    Ok(Change::Search(SearchChange::RenameSearch {
+        uid: uid.clone(),
+        from: old.clone(),
+        to: name.clone(),
+        definition: Box::new(was),
+    }))
 }

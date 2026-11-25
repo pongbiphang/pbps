@@ -174,8 +174,14 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             uid: "s_bbbbbb".parse().unwrap(),
             name: "config app.docs".parse().unwrap(),
             before: Box::new(search.clone()),
-            after: Box::new(search),
+            after: Box::new(search.clone()),
             opaque: Vec::new(),
+        }),
+        Change::Search(SearchChange::RenameSearch {
+            uid: "s_aaaaaa".parse().unwrap(),
+            from: "dictionary app.words".parse().unwrap(),
+            to: "dictionary app.terms".parse().unwrap(),
+            definition: Box::new(search),
         }),
     ] {
         pin(change, vec![], vec![], None);

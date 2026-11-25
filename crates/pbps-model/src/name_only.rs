@@ -31,7 +31,7 @@
 use crate::SearchChange;
 use crate::{
     Change, ChangeSet, ColumnType, IdsFile, ManagedType, ObjectName, Schema, SearchObject,
-    SearchRef, Sequence,
+    SearchRef, Sequence, Uid,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -249,16 +249,59 @@ impl NameOnly {
                 }
             })
             .collect();
+        // A rename moves an object's name and nothing else, so the record it had under the
+        // old name is the one it keeps under the new one (DEC-2728.5). Without this the
+        // new name has no record and the read-back would be recorded in its place. The record
+        // is found by identity, not by name: in a chain (`a` to `b`, `b` to `c`) the name `b`
+        // ends up holding what was `a`, and its own old record belongs to `c`. At a staged
+        // checkpoint an identity the rename has not reached still holds the old name, which
+        // the same lookup answers.
+        let renamed: BTreeMap<&Uid, &SearchRef> = applied
+            .changes
+            .iter()
+            .filter_map(|planned| {
+                if let Change::Search(SearchChange::RenameSearch { uid, from, .. }) =
+                    &planned.change
+                {
+                    Some((uid, from))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // And a configuration that maps a dictionary the plan renamed keeps the record it had,
+        // under the dictionary's new spelling: the read-back spells it that way, and a record
+        // left at the old name would read as drift. Only a rename that has run respells: at a
+        // staged checkpoint before the dictionary's rename the engine still spells the mapping
+        // the old way, and a record of the new spelling would refuse the resume as drift.
+        let moved: BTreeMap<SearchRef, SearchRef> = applied
+            .changes
+            .iter()
+            .filter_map(|planned| {
+                if let Change::Search(SearchChange::RenameSearch { uid, from, to, .. }) =
+                    &planned.change
+                    && live.search.get(uid) == Some(to)
+                {
+                    Some((from.clone(), to.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let search = live
             .search
-            .values()
-            .filter_map(|name| {
+            .iter()
+            .filter_map(|(uid, name)| {
                 let object = if made.contains(name) {
-                    read.get(name).or_else(|| previous.get(name))
+                    read.get(name).or_else(|| previous.get(name)).cloned()
                 } else {
-                    previous.get(name).or_else(|| read.get(name))
+                    renamed
+                        .get(uid)
+                        .map_or_else(|| previous.get(name), |from| previous.get(*from))
+                        .map(|held| held.respelled(&moved))
+                        .or_else(|| read.get(name).cloned())
                 };
-                object.map(|object| (name.clone(), object.clone()))
+                object.map(|object| (name.clone(), object))
             })
             .collect();
         // No plan touches a sequence, so the previous record's are carried as they were.

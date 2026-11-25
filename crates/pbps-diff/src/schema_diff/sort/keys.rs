@@ -83,6 +83,7 @@ pub(in super::super) fn dependency_rank(
         | Change::Search(SearchChange::CreateSearch { .. })
         | Change::Search(SearchChange::AlterSearchMapping { .. })
         | Change::Search(SearchChange::AlterSearchDictionary { .. })
+        | Change::Search(SearchChange::RenameSearch { .. })
         | Change::Search(SearchChange::DropSearch { .. })
         | Change::Extension(ExtensionChange::CreateExtension { .. })
         | Change::Extension(ExtensionChange::DropExtension { .. })
@@ -341,6 +342,7 @@ pub(in super::super) fn order_key(c: &Change) -> u8 {
         // are gone: late, like the type drops (DEC-2447.8).
         Change::Type(TypeChange::DropType { .. }) | Change::Search(SearchChange::DropSearch { .. }) | Change::Extension(ExtensionChange::DropExtension { .. }) => 18,
         Change::Type(TypeChange::RenameType { .. }) => 1,
+        Change::Search(SearchChange::RenameSearch { .. }) => 1,
         // A policy releases its bindings before module and column teardown.
         Change::Policy(PolicyChange::DropPolicy { .. }) => 0,
         // Modules go first and last, and both ends are load-bearing. A

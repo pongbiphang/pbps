@@ -718,6 +718,7 @@ impl Operation {
             Change::Search(SearchChange::CreateSearch { uid, .. })
             | Change::Search(SearchChange::AlterSearchMapping { uid, .. })
             | Change::Search(SearchChange::AlterSearchDictionary { uid, .. })
+            | Change::Search(SearchChange::RenameSearch { uid, .. })
             | Change::Search(SearchChange::DropSearch { uid, .. }) => {
                 ObjectKey::Search(recorded(uid))
             }
@@ -1001,6 +1002,7 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Partiti
             | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
             | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
             | Change::Type(TypeChange::RenameType { .. })
+            | Change::Search(SearchChange::RenameSearch { .. })
             // A text search object altered in place stands before and after it.
             | Change::Search(SearchChange::AlterSearchMapping { .. })
             | Change::Search(SearchChange::AlterSearchDictionary { .. })

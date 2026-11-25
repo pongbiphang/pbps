@@ -148,6 +148,26 @@ fn what_validation_refuses_is_refused_by_the_emitter_too() {
     );
 }
 
+/// SQLite has no text search objects: a rename is refused like the rest of the family, by the
+/// emitter as well as by validation (DEC-2728.5). Negative: a role change is a different refusal's
+/// own case and is not the answer here.
+#[test]
+fn a_text_search_rename_is_refused_not_written() {
+    let definition = pbps_model::SearchObject::Dictionary {
+        template: "pg_catalog.simple".parse().unwrap(),
+        options: Default::default(),
+    };
+    assert_eq!(
+        answer(Change::Search(pbps_model::SearchChange::RenameSearch {
+            uid: uid(UidKind::Search, "words"),
+            from: "dictionary app.words".parse().unwrap(),
+            to: "dictionary app.terms".parse().unwrap(),
+            definition: Box::new(definition),
+        })),
+        Answer::Unsupported
+    );
+}
+
 #[test]
 fn an_index_the_engine_cannot_hold_is_refused_not_written() {
     let mut expression = index(&["a"], false, None);

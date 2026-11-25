@@ -20,7 +20,7 @@ use std::borrow::Cow;
 /// it. One table for both: the names to list and the enum to ask. A kind added to
 /// a family enum needs its row here, and `the_ops_are_the_kinds_of_the_family_enums`
 /// fails until it has one.
-const OPS: [(&str, ChangeFamily); 69] = [
+const OPS: [(&str, ChangeFamily); 70] = [
     ("rebuild_partitioned_table", ChangeFamily::Partitions),
     ("copy_table_rows", ChangeFamily::Partitions),
     ("analyze_table_tree", ChangeFamily::Partitions),
@@ -36,6 +36,7 @@ const OPS: [(&str, ChangeFamily); 69] = [
     ("drop_search", ChangeFamily::Search),
     ("alter_search_mapping", ChangeFamily::Search),
     ("alter_search_dictionary", ChangeFamily::Search),
+    ("rename_search", ChangeFamily::Search),
     ("create_extension", ChangeFamily::Extensions),
     ("drop_extension", ChangeFamily::Extensions),
     ("update_extension", ChangeFamily::Extensions),

@@ -281,6 +281,66 @@ fn refuse_unpinned_search(
     at_close: bool,
     label: &str,
 ) -> anyhow::Result<()> {
+    // A configuration over a dictionary the plan renames reads the old spelling until the
+    // rename has run and the new one after it, and the plan's definitions are written for the
+    // new one. Before the close a read may stand on either side of a rename, so it is taken
+    // as read or respelled the way the renames respell it (DEC-2728.5). At the close every
+    // statement has run and the engine's names are final, so the read is compared as it is:
+    // respelling it there would turn a mapping to a replacement made under a vacated name
+    // into one to the renamed dictionary.
+    let renames: std::collections::BTreeMap<_, _> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::Search(pbps_model::SearchChange::RenameSearch {
+                from,
+                to,
+                ..
+            }) = &p.change
+            {
+                Some((from.clone(), to.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let readings = |name: &pbps_model::SearchRef| -> Vec<pbps_model::SearchObject> {
+        let Some(read) = held.search.get(name) else {
+            return Vec::new();
+        };
+        if at_close {
+            vec![read.clone()]
+        } else {
+            vec![read.clone(), read.respelled(&renames)]
+        }
+    };
+    // A renamed object is touched too: it stands at the definition the plan renames, under
+    // the old name until its statement and under the new one after it, and at the close under
+    // the new one. Another session's change to it between the baseline read and the
+    // read-back would otherwise be recorded under the new name as the plan's result. Before
+    // the close either name may hold it: in a chain (`a` to `b`, `b` to `c`) the new name
+    // still holds the next object until that one moves on, so a position matches when the
+    // object there is the pinned one, not merely when something stands there.
+    for p in &changes.changes {
+        if let pbps_model::Change::Search(pbps_model::SearchChange::RenameSearch {
+            from,
+            to,
+            definition,
+            ..
+        }) = &p.change
+        {
+            let mut positions = readings(to);
+            if !at_close {
+                positions.extend(readings(from));
+            }
+            if !positions.iter().any(|read| read == definition.as_ref()) {
+                bail!(
+                    "{} does not match what its plan promised during {label}",
+                    to.shown()
+                )
+            }
+        }
+    }
     for p in &changes.changes {
         if let pbps_model::Change::Search(
             pbps_model::SearchChange::AlterSearchMapping {
@@ -297,11 +357,15 @@ fn refuse_unpinned_search(
             },
         ) = &p.change
         {
-            let now = held.search.get(name);
             let passes = before.alteration_chain(after);
-            let stands = now
-                .is_some_and(|d| d == before.as_ref() || d == after.as_ref() || passes.contains(d));
-            if !stands || (at_close && now != Some(after.as_ref())) {
+            let read = readings(name);
+            let stands = if at_close {
+                read.iter().any(|d| d == after.as_ref())
+            } else {
+                read.iter()
+                    .any(|d| d == before.as_ref() || d == after.as_ref() || passes.contains(d))
+            };
+            if !stands {
                 bail!(
                     "{} does not match what its plan promised during {label}",
                     name.shown()

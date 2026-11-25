@@ -290,7 +290,8 @@ pub struct DeclaredTypeStatement {
 pub struct SearchStatement {
     pub uid: pbps_model::Uid,
     pub name: pbps_model::SearchRef,
-    /// `true` for the statement that creates it, `false` for the one that drops it.
+    /// `true` for the statement after which the object lives under `name` (the one that
+    /// creates it, or renames it to `name`), `false` for the one that drops it.
     pub created: bool,
 }
 

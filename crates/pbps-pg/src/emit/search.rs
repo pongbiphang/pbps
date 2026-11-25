@@ -23,6 +23,7 @@ pub(super) fn emit(search: &SearchChange) -> Sql {
             after,
             ..
         } => crate::search::alter(name, before, after),
+        SearchChange::RenameSearch { uid, from, to, .. } => crate::search::rename(uid, from, to),
         SearchChange::DropSearch { uid, name, .. } => crate::search::drop(uid, name),
     }
 }

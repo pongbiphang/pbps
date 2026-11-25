@@ -33,7 +33,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{
-    ColumnName, ColumnRef, IdsFile, Intent, ModuleId, Schema, TableName, Tombstone, Uid, UidKind,
+    Change, ChangeSet, ColumnName, ColumnRef, IdsFile, Intent, ModuleId, Schema, SearchChange,
+    TableName, Tombstone, Uid, UidKind,
 };
 
 pub mod removals;
@@ -222,6 +223,8 @@ pub struct Resolution {
     pub dropped_roles: Vec<(Uid, pbps_model::RoleName)>,
     pub dropped_extensions: Vec<(Uid, pbps_model::ObjectLocalName)>,
     pub dropped_search: Vec<(Uid, pbps_model::SearchRef)>,
+    /// `(uid, old name, new name)`
+    pub renamed_search: Vec<(Uid, pbps_model::SearchRef, pbps_model::SearchRef)>,
     /// `(uid, old name, new name)`
     pub renamed_roles: Vec<(Uid, pbps_model::RoleName, pbps_model::RoleName)>,
 }
@@ -462,7 +465,16 @@ fn resolve_with_provenance(
     }
 
     // Text search objects follow the packages' rule: no rename inference, and a drop
-    // needs a recorded intent (DEC-2728.2). A rename is a later part.
+    // needs a recorded intent (DEC-2728.2). A rename is decided first, by intent alone,
+    // so a renamed object is no longer gone when the drops below look for what is.
+    resolve_search_renames(
+        declared,
+        intents,
+        annotation_count,
+        &mut r,
+        &mut blockers,
+        &mut used,
+    );
     let gone: Vec<(Uid, pbps_model::SearchRef)> = r
         .ids
         .search
@@ -649,6 +661,7 @@ fn resolve_with_provenance(
             | Intent::RenameRole { .. }
             | Intent::DropRole { .. }
             | Intent::DropExtension { .. }
+            | Intent::RenameSearch { .. }
             | Intent::DropSearch { .. }
             | Intent::DropExclusion { .. }
             | Intent::MoveRows { .. } => None,
@@ -664,6 +677,7 @@ fn resolve_with_provenance(
                     | Intent::RenameColumn { .. }
                     | Intent::RenameType { .. }
                     | Intent::RenameRole { .. }
+                    | Intent::RenameSearch { .. }
             ) {
             RenameSource::Vacated
         } else {
@@ -682,6 +696,7 @@ fn resolve_with_provenance(
             | Intent::RenameColumn { .. }
             | Intent::RenameType { .. }
             | Intent::RenameRole { .. }
+            | Intent::RenameSearch { .. }
                 if current_decision =>
             {
                 false
@@ -690,6 +705,7 @@ fn resolve_with_provenance(
             | Intent::RenameColumn { .. }
             | Intent::RenameType { .. }
             | Intent::RenameRole { .. }
+            | Intent::RenameSearch { .. }
             | Intent::DropTable { .. }
             | Intent::DropColumn { .. }
             | Intent::DropType { .. }
@@ -735,6 +751,7 @@ fn resolve_with_provenance(
                     | Intent::DropTable { .. }
                     | Intent::RenameType { .. }
                     | Intent::RenameRole { .. }
+                    | Intent::RenameSearch { .. }
                     | Intent::DropType { .. }
                     | Intent::DropRole { .. }
                     | Intent::DropExtension { .. }
@@ -904,6 +921,31 @@ struct Conflicting {
 /// Public because `pbps fmt` shares this exact judgement: an annotation whose
 /// intent is absorbed is redundant and gets stripped, while a pending one must
 /// survive the rewrite (SPEC §6.2). Two definitions of "absorbed" would drift.
+/// Each text search rename a plan carries moves the object its uid names in the recorded
+/// identities: that uid stands at the rename's old name, or at its new one where a staged apply
+/// resumes past the rename. A saved plan's admission sees only the mapping after the plan, so a
+/// hand-edited `from` naming another object would pass it, and the apply would rename that one
+/// and record the uid at the new name (DEC-2728.5). The recorded mapping is pinned by the
+/// baseline's checksum, so it is the evidence to bind the source to.
+pub fn search_renames_bound(changes: &ChangeSet, recorded: &IdsFile) -> Result<(), String> {
+    for step in &changes.changes {
+        if let Change::Search(SearchChange::RenameSearch { uid, from, to, .. }) = &step.change
+            && !recorded
+                .search
+                .get(uid)
+                .is_some_and(|held| held == from || held == to)
+        {
+            return Err(format!(
+                "the rename of text search {} to {} names an object the recorded identities do \
+                 not hold under its identity; recompute and review the plan",
+                from.shown(),
+                to.shown()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) -> bool {
     let has_column = |c: &ColumnRef| ids.column_uid(c).is_some();
     let has_table = |t: &TableName| ids.table_uid(t).is_some();
@@ -943,6 +985,14 @@ pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) 
         Intent::DropRole { role, .. } => !has_role(role) && retired(UidKind::Role, role.raw()),
         Intent::DropExtension { name, .. } => {
             ids.extension_uid(name).is_none() && retired(UidKind::Extension, name.raw())
+        }
+        // A pair across kinds or schemas is no rename (DEC-2728.5), so it was never applied
+        // and cannot be absorbed: it stays for the unused-intent sweep.
+        Intent::RenameSearch { from, to } => {
+            from.kind == to.kind
+                && from.name.schema() == to.name.schema()
+                && ids.search_uid(to).is_some()
+                && vacated(ids.search_uid(from).is_some())
         }
         Intent::DropSearch { name, .. } => {
             ids.search_uid(name).is_none() && retired(UidKind::Search, &name.raw().to_string())
@@ -1013,6 +1063,7 @@ impl RenameSource {
             Intent::DropType { name, .. } => declared.types.contains_key(name),
             Intent::DropRole { role, .. } => declared.roles.contains_key(role),
             Intent::DropExtension { name, .. } => declared.extensions.contains_key(name),
+            Intent::RenameSearch { from, .. } => declared.search.contains_key(from),
             Intent::DropSearch { name, .. } => declared.search.contains_key(name),
             Intent::DropExclusion { table, name, .. } => declared
                 .tables
@@ -1174,6 +1225,110 @@ fn resolve_types(
         let uid = fresh_uid(&r.ids, UidKind::Type);
         r.ids.types.insert(uid.clone(), name.clone());
         r.created_types.push((uid, name));
+    }
+}
+
+/// Text search objects follow the declared type's rule: only a recorded intent carries an
+/// identity across a name change (DEC-2728.2, DEC-2728.5). Built from the same claim helpers
+/// as [`resolve_types`] and [`resolve_roles`]; the generic form of the three is #3005, so this
+/// stays its own function. It only renames. A vanished name with no rename is left for the
+/// drop pass that follows, and a new name for its fresh uid.
+///
+/// A rename's two names are of one kind. The file that carries `renamed_from:` names its own
+/// kind and `pbps intent --rename-search` refuses a mixed pair, but an intent that arrives
+/// otherwise is no claim here, so it matches nothing and the sweep reports it by name.
+fn resolve_search_renames(
+    declared: &Schema,
+    intents: &[Intent],
+    annotation_count: usize,
+    r: &mut Resolution,
+    blockers: &mut Vec<Blocker>,
+    used: &mut BTreeSet<usize>,
+) {
+    let known: BTreeMap<pbps_model::SearchRef, Uid> = r
+        .ids
+        .search
+        .iter()
+        .map(|(u, n)| (n.clone(), u.clone()))
+        .collect();
+    let mut disappeared: BTreeSet<&pbps_model::SearchRef> = known
+        .keys()
+        .filter(|name| !declared.search.contains_key(*name))
+        .collect();
+    let mut appeared: BTreeSet<&pbps_model::SearchRef> = declared
+        .search
+        .keys()
+        .filter(|name| !known.contains_key(*name))
+        .collect();
+
+    // The engine's `RENAME TO` keeps the kind and the schema (DEC-2728.5), so a pair across
+    // either is no rename: it claims nothing here and is left for the unused-intent sweep,
+    // and no identity records a move that no plan can run.
+    let in_place = |from: &pbps_model::SearchRef, to: &pbps_model::SearchRef| {
+        from.kind == to.kind && from.name.schema() == to.name.schema()
+    };
+    let claims: Vec<Claim<'_, &pbps_model::SearchRef>> = intents
+        .iter()
+        .filter_map(|intent| {
+            let Intent::RenameSearch { from, to } = intent else {
+                return None;
+            };
+            (in_place(from, to) && disappeared.contains(from) && appeared.contains(to)).then_some(
+                Claim {
+                    intent,
+                    source: from,
+                    target: to,
+                },
+            )
+        })
+        .collect();
+    let (rename_blockers, _) = contested_rename_claims(&claims, |n| n.raw().to_string());
+    blockers.extend(rename_blockers);
+
+    // A target that is known and still declared is not in `appeared`, so the rename cannot
+    // match: that is a swap or a chain, or a name another object holds. Say so by name and
+    // leave the source for the drop pass, as `resolve_types` does. A leading annotation
+    // defers to another matchable claim for the source; a current decision does not.
+    let mut occupied_targets = BTreeSet::new();
+    for (i, intent) in intents.iter().enumerate() {
+        let Intent::RenameSearch { from, to } = intent else {
+            continue;
+        };
+        if !in_place(from, to) {
+            continue;
+        }
+        let current_decision = i >= annotation_count;
+        let stale_annotation = i < annotation_count
+            && intents.iter().any(
+                |candidate| matches!(candidate, Intent::DropSearch { name, .. } if name == from),
+            );
+        if disappeared.contains(from) && declared.search.contains_key(to) && known.contains_key(to)
+        {
+            if (current_decision || !claims.iter().any(|claim| claim.source == from))
+                && !stale_annotation
+                && occupied_targets.insert(to.clone())
+            {
+                blockers.push(Blocker::RenameTargetExists {
+                    target: to.raw().to_string(),
+                });
+            }
+            used.insert(i);
+        }
+    }
+
+    for (i, intent) in intents.iter().enumerate() {
+        if let Intent::RenameSearch { from, to } = intent
+            && in_place(from, to)
+            && disappeared.contains(from)
+            && appeared.contains(to)
+        {
+            disappeared.remove(from);
+            appeared.remove(to);
+            let uid = known[from].clone();
+            r.ids.search.insert(uid.clone(), to.clone());
+            r.renamed_search.push((uid, from.clone(), to.clone()));
+            used.insert(i);
+        }
     }
 }
 
@@ -1968,6 +2123,7 @@ fn sort_resolution(r: &mut Resolution) {
     r.dropped_roles.sort();
     r.dropped_extensions.sort();
     r.dropped_search.sort();
+    r.renamed_search.sort();
     r.renamed_roles.sort();
 }
 
@@ -3138,5 +3294,362 @@ mod drop_exclusion_tests {
             gone.iter().all(|r| !matches!(r, Removal::Exclusion { .. })),
             "{gone:?}"
         );
+    }
+}
+
+/// A text search object keeps its uid across a rename only on a recorded intent, built from the
+/// same claim helpers a type's rename uses (DEC-2728.5). Each property has its negative beside it.
+#[cfg(test)]
+mod search_rename_tests {
+    use super::*;
+    use pbps_model::{SearchKind, SearchObject, SearchRef};
+
+    fn context() -> Context {
+        Context {
+            operator: "operator".into(),
+            today: "2026-11-21".into(),
+        }
+    }
+
+    fn name(text: &str) -> SearchRef {
+        text.parse().unwrap()
+    }
+
+    fn object(reference: &SearchRef) -> SearchObject {
+        match reference.kind {
+            SearchKind::Dictionary => SearchObject::Dictionary {
+                template: "pg_catalog.simple".parse().unwrap(),
+                options: Default::default(),
+            },
+            SearchKind::Config => SearchObject::Config {
+                parser: "pg_catalog.default".parse().unwrap(),
+                mappings: Default::default(),
+            },
+        }
+    }
+
+    fn declared(names: &[&str]) -> Schema {
+        let mut schema = Schema::default();
+        for text in names {
+            let reference = name(text);
+            schema.search.insert(reference.clone(), object(&reference));
+        }
+        schema
+    }
+
+    /// The ids file after one resolution of `names`, so each holds a uid.
+    fn recorded(names: &[&str]) -> IdsFile {
+        resolve(&declared(names), &IdsFile::default(), &[], &context())
+            .unwrap()
+            .ids
+    }
+
+    fn rename(from: &str, to: &str) -> Intent {
+        Intent::RenameSearch {
+            from: name(from),
+            to: name(to),
+        }
+    }
+
+    fn uid_of(ids: &IdsFile, text: &str) -> Uid {
+        ids.search_uid(&name(text)).unwrap().clone()
+    }
+
+    #[test]
+    fn a_rename_intent_keeps_the_uid_under_the_new_name() {
+        let ids = recorded(&["dictionary app.old"]);
+        let uid = uid_of(&ids, "dictionary app.old");
+        let resolution = resolve(
+            &declared(&["dictionary app.new"]),
+            &ids,
+            &[rename("dictionary app.old", "dictionary app.new")],
+            &context(),
+        )
+        .unwrap();
+        assert_eq!(uid_of(&resolution.ids, "dictionary app.new"), uid);
+        assert!(
+            resolution
+                .ids
+                .search_uid(&name("dictionary app.old"))
+                .is_none()
+        );
+        assert_eq!(
+            resolution.renamed_search,
+            [(uid, name("dictionary app.old"), name("dictionary app.new"))]
+        );
+        assert!(resolution.dropped_search.is_empty() && resolution.ids.tombstones.is_empty());
+
+        // Negative: with no intent the new name is a new object under a fresh uid.
+        let fresh = resolve(&declared(&["dictionary app.new"]), &ids, &[], &context()).unwrap();
+        assert_ne!(
+            uid_of(&fresh.ids, "dictionary app.new"),
+            uid_of(&ids, "dictionary app.old")
+        );
+        assert!(fresh.renamed_search.is_empty());
+    }
+
+    #[test]
+    fn a_rename_onto_an_occupied_name_is_refused_by_name_and_a_chain_is_the_same_refusal() {
+        // `b` stands and is still declared, so `a -> b` cannot match: a chain `a -> b -> c`
+        // in one plan reads exactly so.
+        let ids = recorded(&["dictionary app.a", "dictionary app.b"]);
+        let refused = resolve(
+            &declared(&["dictionary app.b", "dictionary app.c"]),
+            &ids,
+            &[
+                rename("dictionary app.a", "dictionary app.b"),
+                rename("dictionary app.b", "dictionary app.c"),
+            ],
+            &context(),
+        )
+        .unwrap_err();
+        assert!(
+            refused.iter().any(|blocker| matches!(
+                blocker,
+                Blocker::RenameTargetExists { target } if target == "dictionary app.b"
+            )),
+            "{refused:?}"
+        );
+        // Negative: the same rename into a free name is no refusal.
+        resolve(
+            &declared(&["dictionary app.c", "dictionary app.b"]),
+            &ids,
+            &[rename("dictionary app.a", "dictionary app.c")],
+            &context(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_rename_across_kinds_is_no_rename_and_is_reported_as_an_unused_intent() {
+        let ids = recorded(&["config app.old"]);
+        let across = rename("config app.old", "dictionary app.new");
+        let refused = resolve(
+            &declared(&["dictionary app.new"]),
+            &ids,
+            std::slice::from_ref(&across),
+            &context(),
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains(&Blocker::UnusedIntent { intent: across }),
+            "{refused:?}"
+        );
+        // Negative: the same pair of one kind resolves.
+        resolve(
+            &declared(&["config app.new"]),
+            &ids,
+            &[rename("config app.old", "config app.new")],
+            &context(),
+        )
+        .unwrap();
+    }
+
+    /// A saved plan's search rename must move the object its uid names in the recorded
+    /// identities (DEC-2728.5). Negatives: the uid at the old name binds, and so does the uid
+    /// already at the new name, as a staged apply resumed past the rename has it.
+    #[test]
+    fn a_search_rename_whose_source_is_not_its_recorded_identity_is_refused() {
+        let ids = recorded(&["dictionary app.old", "dictionary app.other"]);
+        let uid = uid_of(&ids, "dictionary app.old");
+        let plan = |from: &str| ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(Change::Search(
+                SearchChange::RenameSearch {
+                    uid: uid.clone(),
+                    from: name(from),
+                    to: name("dictionary app.new"),
+                    definition: Box::new(object(&name("dictionary app.new"))),
+                },
+            ))],
+        };
+        assert!(search_renames_bound(&plan("dictionary app.old"), &ids).is_ok());
+        let error = search_renames_bound(&plan("dictionary app.other"), &ids).unwrap_err();
+        assert!(error.contains("app.other"), "{error}");
+        assert!(search_renames_bound(&plan("dictionary app.stranger"), &ids).is_err());
+        assert!(search_renames_bound(&plan("dictionary app.old"), &IdsFile::default()).is_err());
+        let mut resumed = ids.clone();
+        resumed
+            .search
+            .insert(uid.clone(), name("dictionary app.new"));
+        assert!(search_renames_bound(&plan("dictionary app.old"), &resumed).is_ok());
+    }
+
+    /// A rename across schemas is no rename either: `RENAME TO` keeps the schema (DEC-2728.5),
+    /// so the identity must not record a move no plan can run. Negative: the same names in one
+    /// schema resolve and move the identity.
+    #[test]
+    fn a_rename_across_schemas_records_no_identity_and_is_reported_as_an_unused_intent() {
+        let ids = recorded(&["dictionary app.old"]);
+        let across = rename("dictionary app.old", "dictionary other.new");
+        let refused = resolve(
+            &declared(&["dictionary other.new"]),
+            &ids,
+            std::slice::from_ref(&across),
+            &context(),
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains(&Blocker::UnusedIntent { intent: across }),
+            "{refused:?}"
+        );
+        let resolved = resolve(
+            &declared(&["dictionary app.new"]),
+            &ids,
+            &[rename("dictionary app.old", "dictionary app.new")],
+            &context(),
+        )
+        .unwrap();
+        assert_eq!(
+            uid_of(&resolved.ids, "dictionary app.new"),
+            uid_of(&ids, "dictionary app.old")
+        );
+    }
+
+    #[test]
+    fn a_rename_whose_source_is_still_declared_matches_nothing() {
+        let ids = recorded(&["dictionary app.old"]);
+        let stale = rename("dictionary app.old", "dictionary app.new");
+        let refused = resolve(
+            &declared(&["dictionary app.old", "dictionary app.new"]),
+            &ids,
+            std::slice::from_ref(&stale),
+            &context(),
+        )
+        .unwrap_err();
+        assert_eq!(refused, [Blocker::UnusedIntent { intent: stale }]);
+    }
+
+    #[test]
+    fn two_renames_that_claim_one_name_are_a_conflict_not_a_choice() {
+        let ids = recorded(&["dictionary app.a", "dictionary app.b"]);
+        let refused = resolve(
+            &declared(&["dictionary app.c"]),
+            &ids,
+            &[
+                rename("dictionary app.a", "dictionary app.c"),
+                rename("dictionary app.b", "dictionary app.c"),
+            ],
+            &context(),
+        )
+        .unwrap_err();
+        assert!(
+            refused.iter().any(|blocker| matches!(
+                blocker,
+                Blocker::ConflictingRenameIntents {
+                    side: RenameSide::Target,
+                    ..
+                }
+            )),
+            "{refused:?}"
+        );
+    }
+
+    /// An annotation of a rename already recorded is redundant and is not an unused intent (so
+    /// `fmt` can strip it); one that has not happened is not absorbed. A source the declarations
+    /// ask for again is not one a rename is waiting to leave (DEC-2728.5).
+    #[test]
+    fn a_recorded_rename_is_absorbed_and_a_pending_one_is_not() {
+        let after = recorded(&["dictionary app.new"]);
+        let intent = rename("dictionary app.old", "dictionary app.new");
+        let redone = declared(&["dictionary app.new"]);
+        assert!(intent_is_absorbed(
+            &intent,
+            &after,
+            RenameSource::of(&intent, &redone)
+        ));
+        // Resolving the standing annotation again is no refusal.
+        resolve_with_annotations(
+            &redone,
+            &after,
+            std::slice::from_ref(&intent),
+            1,
+            &context(),
+        )
+        .unwrap();
+        // Negative: before the rename ran, the target is unknown to the ids.
+        let before = recorded(&["dictionary app.old"]);
+        assert!(!intent_is_absorbed(
+            &intent,
+            &before,
+            RenameSource::of(&intent, &redone)
+        ));
+        // The old name taken again by a new object is a redeclared source, not a pending rename.
+        let reused = declared(&["dictionary app.old", "dictionary app.new"]);
+        let both = recorded(&["dictionary app.old", "dictionary app.new"]);
+        // Negative: both names recorded but only the new one declared is a rename still waiting
+        // to vacate the old name.
+        assert!(!intent_is_absorbed(
+            &intent,
+            &both,
+            RenameSource::of(&intent, &redone)
+        ));
+        assert_eq!(RenameSource::of(&intent, &reused), RenameSource::Redeclared);
+        assert!(intent_is_absorbed(
+            &intent,
+            &both,
+            RenameSource::of(&intent, &reused)
+        ));
+        assert_eq!(RenameSource::of(&intent, &redone), RenameSource::Vacated);
+    }
+
+    /// A rename annotation across schemas or kinds is never absorbed, even when its target is
+    /// already recorded: no such rename can have run (DEC-2728.5), so it reaches the
+    /// unused-intent sweep rather than being stripped by `fmt`. Negative: the same recorded
+    /// target with a source in its own schema and kind is absorbed.
+    #[test]
+    fn a_rename_across_schemas_or_kinds_is_never_absorbed() {
+        let after = recorded(&["dictionary other.new", "config app.new"]);
+        let redone = declared(&["dictionary other.new", "config app.new"]);
+        for intent in [
+            rename("dictionary app.old", "dictionary other.new"),
+            rename("dictionary app.old", "config app.new"),
+        ] {
+            assert!(
+                !intent_is_absorbed(&intent, &after, RenameSource::of(&intent, &redone)),
+                "{intent:?}"
+            );
+            let refused = resolve_with_annotations(
+                &redone,
+                &after,
+                std::slice::from_ref(&intent),
+                1,
+                &context(),
+            )
+            .unwrap_err();
+            assert!(
+                refused.contains(&Blocker::UnusedIntent { intent }),
+                "{refused:?}"
+            );
+        }
+        let within = rename("dictionary other.old", "dictionary other.new");
+        assert!(intent_is_absorbed(
+            &within,
+            &after,
+            RenameSource::of(&within, &redone)
+        ));
+    }
+
+    /// A pending rename is not a removal, so it raises no `DropSearchNeedsReason`; the same
+    /// object with no rename and no declaration is one (DEC-2728.5).
+    #[test]
+    fn a_pending_rename_is_not_a_removal_and_a_missing_object_is_one() {
+        use removals::{Removal, inventory};
+        let base = declared(&["dictionary app.old"]);
+        let ids = recorded(&["dictionary app.old"]);
+        let side = crate::Side {
+            schema: &base,
+            ids: &ids,
+        };
+        let desired = declared(&["dictionary app.new"]);
+        let intent = rename("dictionary app.old", "dictionary app.new");
+        assert!(inventory(side, &ids, &desired, std::slice::from_ref(&intent)).is_empty());
+        let found = inventory(side, &ids, &desired, &[]);
+        assert!(
+            matches!(found.as_slice(), [Removal::Search { name, .. }] if *name == self::name("dictionary app.old")),
+            "{found:?}"
+        );
+        // A source the declarations hold again is no pending rename: the new name does not take
+        // the old object's place and the old name stays declared.
+        assert!(inventory(side, &ids, &base, &[intent]).is_empty());
     }
 }

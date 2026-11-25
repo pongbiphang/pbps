@@ -761,7 +761,7 @@ pub(crate) fn write_declarations_with_deps(
     }
     for (name, definition) in &schema.search {
         let path = declaration_file::search_path(dir, name)?;
-        std::fs::write(&path, pbps_load::render_search(name, definition))
+        std::fs::write(&path, pbps_load::render_search(name, definition, &[]))
             .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);
     }

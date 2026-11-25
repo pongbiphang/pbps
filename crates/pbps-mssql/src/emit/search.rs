@@ -5,7 +5,8 @@ use super::*;
 
 pub(super) fn emit(search: &SearchChange) -> Sql {
     match search {
-        SearchChange::CreateSearch { name, .. }
+        SearchChange::RenameSearch { from: name, .. }
+        | SearchChange::CreateSearch { name, .. }
         | SearchChange::AlterSearchMapping { name, .. }
         | SearchChange::AlterSearchDictionary { name, .. }
         | SearchChange::DropSearch { name, .. } => Err(DialectError::Unsupported {

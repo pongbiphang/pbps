@@ -839,6 +839,14 @@ impl Cx<'_> {
                 self.exists(ObjectKey::Search(Recorded(uid.clone())));
                 self.search_uses(after);
             }
+            // A rename rewrites the object at its final name, so a configuration's mapping
+            // of a renamed dictionary waits for it, as a type's users wait for its rename
+            // (DEC-2728.5).
+            Change::Search(SearchChange::RenameSearch { uid, .. }) => {
+                let key = ObjectKey::Search(Recorded(uid.clone()));
+                self.exists(key.clone());
+                self.rewrites(Resource::Object(key, Incarnation::Final));
+            }
             // The reverse: a dictionary leaves only once every configuration of
             // the baseline that maps it is gone, as the engine's RESTRICT demands. One the
             // plan keeps and alters stopped mapping it in class 7, before this drop; the

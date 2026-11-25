@@ -2105,6 +2105,14 @@
         "text_search_config": {
           "type": "string"
         },
+        "renamed_from": {
+          "description": "One-shot intent, as for [`DomainTypeDto::renamed_from`]: this object was called\nthis, in the same schema, before. The name is of the file's own kind, so\n`text_search_config: app.new` with `renamed_from: app.old` means `config app.old`\n(DEC-2728.5).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "parser": {
           "description": "The parser, qualified by its schema. Only the built-in one,\n`pg_catalog.\"default\"`, is held.",
           "type": "string"
@@ -2133,6 +2141,14 @@
       "properties": {
         "text_search_dictionary": {
           "type": "string"
+        },
+        "renamed_from": {
+          "description": "One-shot intent, as for [`SearchConfigDto::renamed_from`].",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "template": {
           "description": "The template, qualified by its schema. Only the built-in ones are held.",

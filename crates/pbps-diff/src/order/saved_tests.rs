@@ -992,3 +992,112 @@ fn admission_holds_a_text_search_alteration_to_the_object_it_alters() {
         assert!(error.contains("text search alteration"), "{what}: {error}");
     }
 }
+
+/// A rename ends at the name the plan's identity mapping gives the object, keeps its kind and
+/// its schema and is not a no-op (DEC-2728.5): a hand-edited plan that moves one object onto
+/// another's name, out of its schema or into the other kind is refused at admission whatever its
+/// checksum. Negative: the honest rename passes the payload checks (the minimal dialect then
+/// refuses text search for its own reason).
+#[test]
+fn admission_holds_a_text_search_rename_to_the_identity_mapping() {
+    let admit_text = |plan: SavedPlan| {
+        let checksum = plan.wire_fingerprint();
+        admit(plan, &MinimalDialect, Path::new("plan.json"), &checksum).map(|_| ())
+    };
+    let rename = |uid: &str, from: &str, to: &str, definition: pbps_model::SearchObject| {
+        Change::Search(SearchChange::RenameSearch {
+            uid: uid.parse().unwrap(),
+            from: from.parse().unwrap(),
+            to: to.parse().unwrap(),
+            definition: Box::new(definition),
+        })
+    };
+    let mut ids = IdsFile::default();
+    ids.search.insert(
+        "s_aaaaaa".parse().unwrap(),
+        "dictionary app.terms".parse().unwrap(),
+    );
+    let refused = |change| {
+        admit_text(with_search(change, ids.clone()))
+            .unwrap_err()
+            .to_string()
+    };
+    let honest = refused(rename(
+        "s_aaaaaa",
+        "dictionary app.words",
+        "dictionary app.terms",
+        dictionary(),
+    ));
+    assert!(!honest.contains("text search rename"), "{honest}");
+    for (what, change) in [
+        (
+            "a target the identity does not hold",
+            rename(
+                "s_aaaaaa",
+                "dictionary app.words",
+                "dictionary app.other",
+                dictionary(),
+            ),
+        ),
+        (
+            "an identity the plan does not record",
+            rename(
+                "s_bbbbbb",
+                "dictionary app.words",
+                "dictionary app.terms",
+                dictionary(),
+            ),
+        ),
+        (
+            "a uid of another kind",
+            rename(
+                "y_aaaaaa",
+                "dictionary app.words",
+                "dictionary app.terms",
+                dictionary(),
+            ),
+        ),
+        (
+            "no change of name",
+            rename(
+                "s_aaaaaa",
+                "dictionary app.terms",
+                "dictionary app.terms",
+                dictionary(),
+            ),
+        ),
+        (
+            "another schema",
+            rename(
+                "s_aaaaaa",
+                "dictionary other.words",
+                "dictionary app.terms",
+                dictionary(),
+            ),
+        ),
+        (
+            "the other kind",
+            rename(
+                "s_aaaaaa",
+                "config app.words",
+                "dictionary app.terms",
+                dictionary(),
+            ),
+        ),
+        (
+            "a definition of the other kind",
+            rename(
+                "s_aaaaaa",
+                "dictionary app.words",
+                "dictionary app.terms",
+                pbps_model::SearchObject::Config {
+                    parser: "pg_catalog.default".parse().unwrap(),
+                    mappings: Default::default(),
+                },
+            ),
+        ),
+    ] {
+        let error = refused(change);
+        assert!(error.contains("text search rename"), "{what}: {error}");
+    }
+}
