@@ -122,7 +122,8 @@ impl schemars::JsonSchema for ColumnName {
 #[serde(transparent)]
 pub struct RoleName(String);
 
-// Keep String's Debug spelling for byte-identical History collision diagnostics.
+// Debug stays String's spelling so a debug dump does not nest a wrapper.
+// Refusal texts take `raw()` and never read this.
 impl fmt::Debug for RoleName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
