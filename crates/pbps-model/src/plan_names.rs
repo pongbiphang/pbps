@@ -8,7 +8,6 @@
 
 use crate::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Debug;
 
 use crate::ColumnChange;
 use crate::IndexChange;
@@ -117,28 +116,34 @@ fn at<A>(history: &[(usize, Option<A>)], boundary: usize) -> Option<&A> {
     n.checked_sub(1).and_then(|i| history[i].1.as_ref())
 }
 
-trait HistoryAddress: Clone + Ord + Debug {
-    fn error_address(&self) -> String {
-        format!("{self:?}")
-    }
+trait HistoryAddress: Clone + Ord {
+    // PlanNamesError escapes this address when it displays it.
+    fn error_address(&self) -> String;
+}
 
-    fn expected_address(address: Option<&Self>) -> String {
-        format!("{address:?}")
+impl HistoryAddress for TableName {
+    fn error_address(&self) -> String {
+        self.raw().to_string()
     }
 }
 
-impl HistoryAddress for TableName {}
-impl HistoryAddress for (Uid, ColumnName) {}
-impl HistoryAddress for crate::RoleName {}
+impl HistoryAddress for (Uid, ColumnName) {
+    fn error_address(&self) -> String {
+        let (table, column) = self;
+        let name = column.raw();
+        format!("{name} on table {table}")
+    }
+}
+
+impl HistoryAddress for crate::RoleName {
+    fn error_address(&self) -> String {
+        self.raw().to_owned()
+    }
+}
 
 impl HistoryAddress for crate::TypeRef {
     fn error_address(&self) -> String {
-        // The history error escapes its address field when displaying it.
         self.raw().to_string()
-    }
-
-    fn expected_address(address: Option<&Self>) -> String {
-        address.map_or_else(|| "<no address>".to_owned(), Self::error_address)
     }
 }
 
@@ -198,7 +203,10 @@ impl<A: HistoryAddress> History<A> {
                 return Err(PlanNamesError::Source {
                     namespace,
                     uid: event.uid.clone(),
-                    expected: A::expected_address(event.before.as_ref()),
+                    expected: event
+                        .before
+                        .as_ref()
+                        .map_or_else(|| "<no address>".to_owned(), HistoryAddress::error_address),
                     step: event.step,
                 });
             }

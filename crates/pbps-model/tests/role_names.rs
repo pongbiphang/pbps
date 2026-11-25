@@ -138,7 +138,7 @@ fn role_subject_keys_and_grantee_identity_keep_original_spelling() {
 }
 
 #[test]
-fn role_history_collision_keeps_the_previous_string_debug_message() {
+fn role_history_collision_escapes_the_address_once() {
     let name = RoleName::from("role\\path\nline");
     let changes = [
         PlannedChange::new(Change::Role(RoleChange::CreateRole {
@@ -158,7 +158,7 @@ fn role_history_collision_keeps_the_previous_string_debug_message() {
     let error = PlanNames::of(&changes, &ids).unwrap_err();
     assert_eq!(
         error.to_string(),
-        r#"role address "role\\\\path\\nline" is held by both r_aaaaaa and r_bbbbbb at boundary 1"#
+        r"role address role\\path\nline is held by both r_aaaaaa and r_bbbbbb at boundary 1"
     );
 }
 
@@ -207,7 +207,7 @@ fn owner_errors_show_names_once_without_changing_raw_holder_lookups() {
     ] {
         assert_eq!(
             error.to_string(),
-            format!("no managed object is recorded under `{shown}` (Base)")
+            format!("no managed object is recorded under `{shown}` (in the baseline)")
         );
     }
     for (error, shown) in [
@@ -226,7 +226,7 @@ fn owner_errors_show_names_once_without_changing_raw_holder_lookups() {
     ] {
         assert_eq!(
             error.to_string(),
-            format!("nothing holds `{shown}` at At(Start)")
+            format!("nothing holds `{shown}` at the start of the plan")
         );
     }
     assert_eq!(
@@ -246,7 +246,11 @@ fn owner_errors_show_names_once_without_changing_raw_holder_lookups() {
         uid("r_aaaaaa")
     );
     let absent = PlanOwners::new(PlanNames::of(&[], &empty).unwrap(), &empty, &empty);
-    for spelling in [Spelling::Base, Spelling::Final, Spelling::At(At::Start)] {
+    for (spelling, position) in [
+        (Spelling::Base, "in the baseline"),
+        (Spelling::Final, "in the final declarations"),
+        (Spelling::At(At::Start), "at the start of the plan"),
+    ] {
         for (error, shown) in [
             (
                 absent.table(&table, spelling).unwrap_err(),
@@ -261,10 +265,17 @@ fn owner_errors_show_names_once_without_changing_raw_holder_lookups() {
             assert!(matches!(error, OwnerError::Unmanaged { .. }));
             assert_eq!(
                 error.to_string(),
-                format!("no managed object is recorded under `{shown}` ({spelling:?})")
+                format!("no managed object is recorded under `{shown}` ({position})")
             );
         }
     }
+    assert_eq!(
+        owners
+            .role(&role, Spelling::At(At::After(7)))
+            .unwrap_err()
+            .to_string(),
+        "the position after change 7 is outside the indexed plan"
+    );
     assert!(
         owners
             .role(&RoleName::from(SHOWN), Spelling::Final)

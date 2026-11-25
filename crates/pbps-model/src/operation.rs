@@ -429,10 +429,10 @@ pub struct Definition {
 pub enum OwnerError {
     /// Neither the plan nor the identity files record anything under the
     /// name: not evidence that nothing is there.
-    #[error("no managed object is recorded under `{name}` ({spelling:?})")]
+    #[error("no managed object is recorded under `{name}` ({spelling})")]
     Unmanaged { name: String, spelling: Spelling },
     /// A managed name nothing holds at that boundary.
-    #[error("nothing holds `{name}` at {spelling:?}")]
+    #[error("nothing holds `{name}` {spelling}")]
     Vacant { name: String, spelling: Spelling },
     #[error("cannot bind {name} {spelling}: {why}")]
     Names {
@@ -441,7 +441,7 @@ pub enum OwnerError {
         why: String,
     },
     /// The step's position is outside the logical plan the owners index.
-    #[error("{spelling:?} is outside the indexed plan")]
+    #[error("the position {spelling} is outside the indexed plan")]
     Outside { spelling: Spelling },
     #[error("rebuild of `{name}` is unavailable: {why}")]
     Rebuild { name: String, why: &'static str },
