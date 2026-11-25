@@ -10255,3 +10255,28 @@ Formats: the published declaration document gains the entry's `exclude:`, which 
 and not `SCHEMA_VERSION`, no archive being added before the first release (DEC-2412.3); the ids layout
 gains a section and keeps its numbers. No plan or state number, as DEC-2448.6 said: `DetachedKind` and
 `PartitionIndexDefinition` gain a variant each without one.
+
+<a id="dec-2961-1"></a>
+
+**DEC-2961.1. An expression key's operator class decides adoption, as a column key's does (#2961).**
+
+`adopts` and `adopts_exclusion` compared a column key's class but matched any two expression keys,
+whatever their classes. So a parent's new index or exclusion was refused by name over a partition's own
+under another class, which the engine would not adopt.
+
+Measured on 18.6, for a new parent index over a standing partition's own index, and for a parent's
+exclusion over a partition's own exclusion:
+- the same expression under another class is not adopted: the engine builds a clone and the own stays
+  local;
+- under the same class it is adopted;
+- under no class on either side it is adopted.
+
+The class is compared because, unlike the expression's text, it has one spelling on both sides. Absent is
+the default: a declaration may not spell the default (`DefaultSpelledOut`), and the catalog reads it back
+as none (DEC-2449.2). So the expression arm is as sound as the column arm.
+
+Still matched whatever their text (DEC-1545.1), now acceptance cases of #1671, which rehearses them with
+a resolver and refuses them by name without one:
+- the expression itself and the predicate;
+- a column key against an expression key;
+- an expression key's collation, which the model does not hold (`IndexColumn::collation`).

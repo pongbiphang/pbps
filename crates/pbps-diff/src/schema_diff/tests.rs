@@ -3205,8 +3205,9 @@ fn partitioned_booking(
 }
 
 /// `adopts_exclusion` is the engine's rule (measured on 18.6, on `ATTACH` and on a
-/// parent's `ADD` over a standing leaf): method, keys with operators, `INCLUDE` and
-/// the predicate decide; timing, storage parameters and name do not (DEC-2448.6).
+/// parent's `ADD` over a standing leaf): method, keys with operators and classes,
+/// `INCLUDE` and the predicate decide; timing, storage parameters and name do not
+/// (DEC-2448.6, DEC-2961.1).
 #[test]
 fn an_own_exclusion_is_taken_as_a_clone_by_shape_and_not_by_timing_or_options() {
     let parent = parent_exclusion();
@@ -3237,6 +3238,15 @@ fn an_own_exclusion_is_taken_as_a_clone_by_shape_and_not_by_timing_or_options() 
     let mut other = parent.clone();
     other.keys.pop();
     assert!(!adopts_exclusion(&parent, &other));
+    // An expression key's class is compared as a column key's is (measured on
+    // 18.6; DEC-2961.1), and its text is not (DEC-1545.1).
+    let mut other = parent.clone();
+    other.keys[1].key.opclass = Some(pbps_model::OpClassRef::bare("range_ops"));
+    assert!(!adopts_exclusion(&parent, &other));
+    assert!(!adopts_exclusion(&other, &parent));
+    let mut same = other.clone();
+    same.keys[1].key.key = pbps_model::IndexKey::Expression("int4range(b,c)".into());
+    assert!(adopts_exclusion(&other, &same));
 }
 
 /// A standing parent takes an exclusion by one change; the engine's key rule and
@@ -5045,6 +5055,38 @@ fn a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken() {
             "which can take app.ev_1's `ev_1_x`",
         );
     }
+    // An expression key's class is not text: the same expression under another
+    // class is another index to the engine, so the parent's is planned and the
+    // own stays beside its clone (measured on 18.6, BRIN's
+    // `int4_minmax_multi_ops`; DEC-2961.1). Negative: under the same class it
+    // is still refused by name.
+    let expression = |class: Option<&str>| {
+        let mut x = index(&["n"], false, None);
+        x.columns[0].key = pbps_model::IndexKey::Expression("n + 1".into());
+        x.columns[0].opclass = class.map(pbps_model::OpClassRef::bare);
+        x
+    };
+    let own = [("ev_1_x", expression(Some("int4_minmax_multi_ops")))];
+    assert!(
+        outcome(
+            &tree(&[], &own, false),
+            &tree(&[("ev_x", expression(None))], &own, false),
+            false,
+        )
+        .is_ok()
+    );
+    refused(
+        outcome(
+            &tree(&[], &own, false),
+            &tree(
+                &[("ev_x", expression(Some("int4_minmax_multi_ops")))],
+                &own,
+                false,
+            ),
+            false,
+        ),
+        "which can take app.ev_1's `ev_1_x`",
+    );
     // Negative: an own index the plan redefines is dropped before the
     // parent's is built and added after it, so it is its own.
     let redefined = planned(

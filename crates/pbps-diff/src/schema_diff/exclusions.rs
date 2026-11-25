@@ -23,7 +23,9 @@ pub fn holds_key_with_equality(
 /// collations and operators, the `INCLUDE` columns and the predicate must
 /// match; the timing, the storage parameters and the name need not. As for
 /// an index, an expression key or a predicate matches whatever its text, since
-/// the engine compares what each binds to.
+/// the engine compares what each binds to, but an expression key's class is
+/// compared, as [`adopts`] compares it (DEC-2961.1). Its collation is not:
+/// the model holds none for an expression key (`IndexColumn::collation`).
 pub fn adopts_exclusion(
     parent: &pbps_model::ExclusionConstraint,
     own: &pbps_model::ExclusionConstraint,
@@ -40,6 +42,7 @@ pub fn adopts_exclusion(
                             && p.key.opclass == o.key.opclass
                             && p.key.collation == o.key.collation
                     }
+                    (None, None) => p.key.opclass == o.key.opclass,
                     _ => true,
                 }
         })

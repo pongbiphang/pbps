@@ -228,6 +228,8 @@ fn plan_assertions_pass_are_recorded_and_kept_in_the_ledger_on_postgres_16() {
 #[path = "support/census2444.rs"]
 mod census2444;
 
+#[path = "support/adoption_class2961.rs"]
+mod adoption_class2961;
 #[path = "support/comments2729.rs"]
 mod comments2729;
 #[path = "support/exclude2448.rs"]
