@@ -117,7 +117,32 @@ fn at<A>(history: &[(usize, Option<A>)], boundary: usize) -> Option<&A> {
     n.checked_sub(1).and_then(|i| history[i].1.as_ref())
 }
 
-impl<A: Clone + Ord + Debug> History<A> {
+trait HistoryAddress: Clone + Ord + Debug {
+    fn error_address(&self) -> String {
+        format!("{self:?}")
+    }
+
+    fn expected_address(address: Option<&Self>) -> String {
+        format!("{address:?}")
+    }
+}
+
+impl HistoryAddress for TableName {}
+impl HistoryAddress for (Uid, ColumnName) {}
+impl HistoryAddress for crate::RoleName {}
+
+impl HistoryAddress for crate::TypeRef {
+    fn error_address(&self) -> String {
+        // The history error escapes its address field when displaying it.
+        self.raw().to_string()
+    }
+
+    fn expected_address(address: Option<&Self>) -> String {
+        address.map_or_else(|| "<no address>".to_owned(), Self::error_address)
+    }
+}
+
+impl<A: HistoryAddress> History<A> {
     fn of(
         events: &[Transition<A>],
         after: &BTreeMap<Uid, A>,
@@ -173,7 +198,7 @@ impl<A: Clone + Ord + Debug> History<A> {
                 return Err(PlanNamesError::Source {
                     namespace,
                     uid: event.uid.clone(),
-                    expected: format!("{:?}", event.before),
+                    expected: A::expected_address(event.before.as_ref()),
                     step: event.step,
                 });
             }
@@ -221,7 +246,7 @@ impl<A: Clone + Ord + Debug> History<A> {
         {
             return Err(PlanNamesError::Collision {
                 namespace,
-                address: format!("{address:?}"),
+                address: address.error_address(),
                 a: other.clone(),
                 b: uid.clone(),
                 boundary,

@@ -854,9 +854,18 @@ impl Contract {
             if reference.root != root && declaration.root != root {
                 continue;
             }
-            let bound = registry
-                .bind(reference, owners, op.origin().spelling().produced())
-                .map_err(|e| e.to_string())?;
+            let bound = match op.change() {
+                // The previous type holder still has to release its slot.
+                // The create payload identifies the new holder before that
+                // handover is scheduled.
+                Change::Type(TypeChange::CreateType { uid, .. }) => ObjectRef {
+                    root: BoundRoot::Recorded(uid.clone()),
+                    part: reference.part.clone(),
+                },
+                _ => registry
+                    .bind(reference, owners, op.origin().spelling().produced())
+                    .map_err(|e| e.to_string())?,
+            };
             // A typed recipe part owns its final surface. CREATE can already
             // expose an inherited fallback without installing the extracted
             // declaration belonging to the same logical source (DEC-2469.3).

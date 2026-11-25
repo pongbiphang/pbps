@@ -69,9 +69,17 @@ impl Project {
     /// The plan, as the steps it orders (`op target`, in order), and how many
     /// edges it records; or what the refusal said.
     fn plan(&self) -> Result<(Vec<String>, usize), String> {
+        self.plan_since(None)
+    }
+
+    fn plan_since(&self, revision: Option<&str>) -> Result<(Vec<String>, usize), String> {
         let out = self.root.join("plan.json");
         let _ = std::fs::remove_file(&out);
-        let (code, text) = self.said(&["plan", "--out", out.to_str().unwrap()]);
+        let mut args = vec!["plan", "--out", out.to_str().unwrap()];
+        if let Some(revision) = revision {
+            args.extend(["--since", revision]);
+        }
+        let (code, text) = self.said(&args);
         if code != Some(0) {
             return Err(text);
         }
@@ -825,6 +833,225 @@ fn a_baseline_revision_with_an_ambiguous_typed_spelling_is_refused() {
     assert!(refusal.contains("ambiguous"), "{refusal}");
     // Negative: the spelling that says which was meant is a readable baseline.
     since("module::table::app.t").unwrap();
+}
+
+const RECREATED_TYPES: [(&str, &str); 2] = [
+    ("app.positive", "domain: app.positive\n{dep}type: int\n"),
+    ("app.mood", "enum: app.mood\n{dep}values: [a, b]\n"),
+];
+const STANDING_TABLE: &str = "table: app.k\n{dep}columns:\n  id: {type: int}\n";
+const BEFORE_TYPE_DROP: Option<&str> = Some("HEAD~1");
+
+fn type_dependency(target: &str) -> String {
+    format!("depends_on: [\"{target}\"]\n")
+}
+
+fn recreated_type(name: &str, definition: &str, recorded: bool) -> Project {
+    let p = Project::new("postgres");
+    let line = type_dependency(&format!("type::{name}"));
+    let standing = |line| STANDING_TABLE.replace("{dep}", line);
+    p.file("k.yml", &standing(if recorded { &line } else { "" }));
+    p.file("type.yml", &definition.replace("{dep}", ""));
+    p.plan().unwrap();
+    p.git(&["add", "-A"]);
+    p.git(&["commit", "-qm", "base"]);
+
+    // The intermediate revision no longer declares the provider of that line.
+    p.file("k.yml", &standing(""));
+    std::fs::remove_file(p.root.join("schema/type.yml")).unwrap();
+    let (code, text) = p.said(&["intent", "--drop-type", name, "recreate"]);
+    assert_eq!(code, Some(0), "{text}");
+    p.plan().unwrap();
+    p.git(&["add", "-A"]);
+    p.git(&["commit", "-qm", "retired"]);
+    p.file("type.yml", &definition.replace("{dep}", ""));
+    p
+}
+
+#[test]
+fn a_recreated_type_keeps_its_steps_with_an_agreeing_or_unrelated_annotation() {
+    for (name, definition) in RECREATED_TYPES {
+        let p = recreated_type(name, definition, false);
+        let dependent = |line: &str| format!("domain: app.value\n{line}type: {name}\n");
+        p.file("value.yml", &dependent(""));
+        let plain = p.plan_since(BEFORE_TYPE_DROP).unwrap().0;
+        assert_eq!(
+            plain,
+            [
+                format!("drop_type {name}"),
+                format!("create_type {name}"),
+                "create_type app.value".into(),
+            ]
+        );
+        let line = type_dependency(&format!("type::{name}"));
+        p.file("value.yml", &dependent(&line));
+        assert_eq!(p.plan_since(BEFORE_TYPE_DROP).unwrap(), (plain.clone(), 1));
+
+        p.file("value.yml", &dependent(""));
+        p.file("k.yml", &STANDING_TABLE.replace("{dep}", &line));
+        assert_eq!(p.plan_since(BEFORE_TYPE_DROP).unwrap(), (plain, 1));
+    }
+}
+
+#[test]
+fn a_recreated_type_refuses_a_reversed_creation_fact_by_naming_the_line() {
+    for (name, definition) in RECREATED_TYPES {
+        let p = recreated_type(name, definition, false);
+        p.file("value.yml", &format!("domain: app.value\ntype: {name}\n"));
+        p.plan_since(BEFORE_TYPE_DROP).unwrap();
+        p.file(
+            "type.yml",
+            &definition.replace("{dep}", &type_dependency("type::app.value")),
+        );
+        let said = p.plan_since(BEFORE_TYPE_DROP).unwrap_err();
+        assert!(said.contains("these steps wait on one another"), "{said}");
+        assert!(said.contains(&format!("`{name}`")), "{said}");
+        assert!(said.contains("`app.value`"), "{said}");
+        assert!(
+            said.contains(&format!(
+                "line you wrote: annotation `type::{name}` depends on `type::app.value`"
+            )),
+            "{said}"
+        );
+        assert!(
+            !said.contains("At(") && !said.contains("TypeRef {"),
+            "{said}"
+        );
+    }
+}
+
+#[test]
+fn a_recreated_type_installs_before_a_new_table_that_uses_it() {
+    for (name, definition) in RECREATED_TYPES {
+        let p = recreated_type(name, definition, false);
+        let consumer =
+            |line: &str| format!("table: app.consumer\n{line}columns:\n  v: {{type: {name}}}\n");
+        p.file("consumer.yml", &consumer(""));
+        let plain = p.plan_since(BEFORE_TYPE_DROP).unwrap().0;
+        assert_eq!(
+            plain,
+            [
+                format!("drop_type {name}"),
+                format!("create_type {name}"),
+                "create_table app.consumer".into(),
+            ]
+        );
+        let line = type_dependency(&format!("type::{name}"));
+        p.file("consumer.yml", &consumer(&line));
+        assert_eq!(p.plan_since(BEFORE_TYPE_DROP).unwrap(), (plain, 1));
+    }
+}
+
+#[test]
+fn an_annotated_view_follows_the_installation_of_its_recreated_type() {
+    let (name, definition) = RECREATED_TYPES[0];
+    let p = recreated_type(name, definition, false);
+    let view = "view: app.typed\n{dep}definition: SELECT 1::app.positive AS value\n";
+    p.file("view.yml", &view.replace("{dep}", ""));
+    let (mut plain, _) = p.plan_since(BEFORE_TYPE_DROP).unwrap();
+    assert_eq!(
+        plain,
+        [
+            "create_module app.typed",
+            "drop_type app.positive",
+            "create_type app.positive",
+        ]
+    );
+
+    // The line supplies the dependency on the new type for this cast in SQL text.
+    p.file(
+        "view.yml",
+        &view.replace("{dep}", &type_dependency("type::app.positive")),
+    );
+    let (mut annotated, edges) = p.plan_since(BEFORE_TYPE_DROP).unwrap();
+    assert_eq!(edges, 1);
+    let position = |step: &str| annotated.iter().position(|p| p == step).unwrap();
+    assert!(position("drop_type app.positive") < position("create_type app.positive"));
+    assert!(position("create_type app.positive") < position("create_module app.typed"));
+    annotated.sort_unstable();
+    plain.sort_unstable();
+    assert_eq!(annotated, plain);
+}
+
+#[test]
+fn a_recorded_type_annotation_binds_even_when_only_the_goal_holds_the_new_uid() {
+    for (name, definition) in RECREATED_TYPES {
+        let plain = recreated_type(name, definition, false)
+            .plan_since(BEFORE_TYPE_DROP)
+            .unwrap();
+        let p = recreated_type(name, definition, true);
+        assert_eq!(p.plan_since(BEFORE_TYPE_DROP).unwrap(), plain);
+
+        let line = type_dependency(&format!("type::{name}"));
+        p.file("k.yml", &STANDING_TABLE.replace("{dep}", &line));
+        assert_eq!(p.plan_since(BEFORE_TYPE_DROP).unwrap(), (plain.0, 1));
+    }
+}
+
+#[test]
+fn a_recreated_domain_part_is_installed_with_the_new_uid() {
+    let name = "app.positive";
+    let definition = "domain: app.positive\n{dep}type: int\ndefault: \"1\"\nnot_null: true\nchecks:\n  positive: \"VALUE > 0\"\n";
+    let p = recreated_type(name, definition, false);
+    let consumer =
+        |line: &str| format!("table: app.consumer\n{line}columns:\n  v: {{type: {name}}}\n");
+    p.file("consumer.yml", &consumer(""));
+    let plain = p.plan_since(BEFORE_TYPE_DROP).unwrap().0;
+    p.file(
+        "consumer.yml",
+        &consumer(&type_dependency("type::app.positive")),
+    );
+    assert_eq!(p.plan_since(BEFORE_TYPE_DROP).unwrap(), (plain, 1));
+
+    for selector in [
+        "default::type::app.positive",
+        "not_null::type::app.positive",
+        "check::type::app.positive.positive",
+    ] {
+        let annotated = consumer(&type_dependency(selector));
+        // The part annotation splits domain creation even in a fresh project.
+        // Recreating the domain also has to drop the old UID first.
+        let (fresh, edges) = planned(&[
+            ("type.yml", definition.replace("{dep}", "")),
+            ("consumer.yml", annotated.clone()),
+        ])
+        .unwrap();
+        let mut expected = vec![format!("drop_type {name}")];
+        expected.extend(fresh);
+        p.file("consumer.yml", &annotated);
+        assert_eq!(
+            p.plan_since(BEFORE_TYPE_DROP).unwrap(),
+            (expected, edges),
+            "{selector}"
+        );
+    }
+
+    p.file(
+        "consumer.yml",
+        &consumer(&type_dependency("type::app.missing")),
+    );
+    let missing = p.plan_since(BEFORE_TYPE_DROP).unwrap_err();
+    assert!(
+        missing.contains("unknown dependency target: type::app.missing"),
+        "{missing}"
+    );
+
+    let occupied = planned(&[
+        (
+            "table.yml",
+            "table: app.positive\ncolumns:\n  id: {type: int}\n".into(),
+        ),
+        ("type.yml", definition.replace("{dep}", "")),
+        (
+            "consumer.yml",
+            consumer(&type_dependency("type::app.positive")),
+        ),
+    ])
+    .unwrap_err();
+    assert!(
+        occupied.contains("type `app.positive`: pg_type name is already occupied"),
+        "{occupied}"
+    );
 }
 
 #[test]

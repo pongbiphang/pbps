@@ -108,3 +108,53 @@ fn unreadable_type_history_is_not_an_unknown_or_vacant_name() {
         Err(OwnerError::Names { .. })
     ));
 }
+
+#[test]
+fn a_type_history_refuses_a_second_holder_with_a_readable_address() {
+    let old: Uid = "y_aaaaaa".parse().unwrap();
+    let new: Uid = "y_bbbbbb".parse().unwrap();
+    let name = TypeRef::new("app", "line\nbreak").unwrap();
+    let create = PlannedChange::new(Change::Type(TypeChange::CreateType {
+        uid: new.clone(),
+        name: name.clone(),
+        definition: definition(),
+    }));
+    let drop = PlannedChange::new(Change::Type(TypeChange::DropType {
+        uid: old.clone(),
+        name: name.clone(),
+        definition: definition(),
+    }));
+    let before = IdsFile {
+        types: [(old.clone(), name.clone())].into(),
+        ..Default::default()
+    };
+    let after = IdsFile {
+        types: [(new.clone(), name.clone())].into(),
+        ..Default::default()
+    };
+    let boundary = Spelling::At(At::After(0));
+    let overlap = [create.clone(), drop.clone()];
+    let owners = PlanOwners::new(PlanNames::of(&overlap, &after).unwrap(), &before, &after);
+    let error = owners.managed_type(&name, boundary).unwrap_err();
+    let address = name.shown();
+    assert!(matches!(error, OwnerError::Names { .. }));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "cannot bind {address} after change 0: type address {address} is held by both {old} and {new} at boundary 1"
+        )
+    );
+
+    let handover = [drop, create];
+    let owners = PlanOwners::new(PlanNames::of(&handover, &after).unwrap(), &before, &after);
+    assert!(matches!(
+        owners.managed_type(&name, boundary),
+        Err(OwnerError::Vacant { .. })
+    ));
+    assert_eq!(
+        owners
+            .managed_type(&name, Spelling::At(At::After(1)))
+            .unwrap(),
+        new
+    );
+}
