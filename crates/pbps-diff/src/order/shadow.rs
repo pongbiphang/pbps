@@ -348,7 +348,10 @@ pub(crate) fn observe_plan(
         Stage::BeforeSchedule,
         None,
     ) {
-        sink(&operations, &[format!("names refused: {error}")], true);
+        // Reported, not failed: the plan's own ordering reads the same
+        // baseline next and returns this as its refusal. A panic here would
+        // replace that named refusal in every debug build.
+        sink(&operations, &[format!("names refused: {error}")], false);
     }
 }
 
