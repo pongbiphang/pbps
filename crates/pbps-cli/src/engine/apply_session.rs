@@ -15,6 +15,7 @@ use pbps_dialect::routines::RoutineAdmission;
 pub(crate) mod extensions;
 mod mssql;
 mod postgres;
+mod sqlite;
 
 /// SQL execution has different owners; statement count cannot identify them.
 #[derive(Clone, Copy)]
@@ -889,7 +890,9 @@ pub(crate) fn selected(driver: Driver) -> crate::emission::SelectedDialect {
     match driver {
         Driver::Mssql => crate::emission::SelectedDialect::Mssql(pbps_mssql::Mssql),
         Driver::Postgres => crate::emission::SelectedDialect::Postgres(pbps_pg::Postgres::new()),
-        Driver::Sqlite => crate::db::sqlite_not_wired(),
+        Driver::Sqlite => {
+            crate::emission::SelectedDialect::Sqlite(pbps_sqlite::dialect::Sqlite::default())
+        }
     }
 }
 

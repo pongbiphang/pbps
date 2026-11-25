@@ -1661,3 +1661,45 @@ come after.
   `read_assertion_target` keep the trait's defaults in this entry; the first two
   are answered with the sessions, where `doctor` on a SQLite file first has a
   caller.
+
+<a id="dec-2950-19"></a>
+
+**DEC-2950.19. SQLite's sessions answer "does not exist here" with the true constant and refuse what nobody has written (#2950).** `pbps-cli` gains
+SQLite's `PlanSession`, `ApplySession` and `Profile` row, and the last
+unreachable arms of the selections by driver go. No command can select SQLite
+yet.
+
+- **Three kinds of answer, named on each method.** A feature the engine does
+  not have (roles, routines, declared types, extensions, partitions, temporal
+  tables, row security) answers the constant that is true for a SQLite plan,
+  and refuses a plan that carries the feature, since such a plan was not built
+  for SQLite. A question `pbps-sqlite` already answers calls that code in
+  place. A question nobody has written the logic for refuses by name:
+  `requirement`, `drop_blockers`, `rename_report` and
+  `check_module_dependency_facts`. An empty answer there would read as
+  "nothing blocks" or "nothing depends".
+- **The role questions refuse.** `role_owned_securables`, `role_drop_facts`,
+  `alike_role_names` and `principal_name_holders` are asked only to clear a
+  role statement, which this dialect never plans; empty would read as "owns
+  nothing" (DECISIONS 417).
+- **`strategy: online` is refused by the apply's limits.** The emitter ignores
+  the strategy, and the verdict type's empty list means "every one is
+  honoured", which would be false.
+- **`PlanSession`'s provided methods keep their refusing defaults** (the
+  maintainer's decision of 2026-11-23). Read to the end, nine of them refuse
+  plans SQLite can otherwise make: the two name checks, the schedule, the
+  ordering by catalog, the final order, the site vetting, the support rows, the
+  server limits and, when staged, the transactional rebuilds. Until they are
+  overridden only a plan that creates, drops, renames and retypes nothing
+  passes, which is why the configuration value comes after them.
+- **Left as they are, and known not to fit.** `preflight_limits` returns
+  SQL Server's verdict type, and its caller prints none of the notes SQLite's
+  check produces. `Profile`'s lock wording presumes a database principal and a
+  grant; SQLite's row says "process" and never offers a statement. The engine
+  selected from a driver alone carries the default version floor, not the
+  project's. Each is settled before a project can select SQLite.
+
+Pinned by the tests of `plan_session::sqlite`, `apply_session::sqlite` and
+`profile`: each call into real code runs on a real file, each refusal names
+SQLite and what is not supported, and the lock remedy never contains a
+statement.

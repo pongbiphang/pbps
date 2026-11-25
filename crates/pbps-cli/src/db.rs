@@ -101,26 +101,11 @@ impl Target {
 /// read `pbps.yml`, so it names the drivers it can speak and this match says
 /// which belongs to which dialect — exhaustively, so a third engine cannot be
 /// added to `DialectName` without an answer here.
-///
-/// It is also the only place a command gets a [`pbps_db::Driver`] from, which
-/// is what [`sqlite_not_wired`] relies on.
 pub const fn driver_for(dialect: DialectName) -> pbps_db::Driver {
     match dialect {
         DialectName::Mssql => pbps_db::Driver::Mssql,
         DialectName::Postgres => pbps_db::Driver::Postgres,
     }
-}
-
-/// The arm of a selection by driver that SQLite has no answer for yet.
-///
-/// `pbps-db` can open a SQLite file (#2950), and no project can ask for one:
-/// `DialectName` has no such value, and [`driver_for`] is the only way a
-/// command obtains a driver. So this cannot be reached from any input, and it
-/// is a panic that says so instead of a wrong engine's answer. The selections
-/// that call it return something SQLite does not have until its engine and
-/// sessions exist; each call goes away in the change that adds them.
-pub(crate) const fn sqlite_not_wired() -> ! {
-    panic!("SQLite is not selectable by any project yet; no command can reach a SQLite driver")
 }
 
 /// Resolves `--db` / `--env` into one target.

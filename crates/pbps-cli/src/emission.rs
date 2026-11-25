@@ -8,12 +8,14 @@ use pbps_model::{PlanMode, SessionZone};
 pub enum SelectedDialect {
     Postgres(pbps_pg::Postgres),
     Mssql(pbps_mssql::Mssql),
+    Sqlite(pbps_sqlite::dialect::Sqlite),
 }
 impl AsRef<dyn Dialect> for SelectedDialect {
     fn as_ref(&self) -> &(dyn Dialect + 'static) {
         match self {
             Self::Postgres(dialect) => dialect,
             Self::Mssql(dialect) => dialect,
+            Self::Sqlite(dialect) => dialect,
         }
     }
 }
@@ -29,6 +31,7 @@ mod sealed {
     pub trait Engine {}
     impl Engine for pbps_pg::Postgres {}
     impl Engine for pbps_mssql::Mssql {}
+    impl Engine for pbps_sqlite::dialect::Sqlite {}
     pub trait Script {}
     impl Script for super::LoweredPlan {}
     impl Script for super::BootstrapScript {}
@@ -107,6 +110,26 @@ impl Engine for pbps_mssql::Mssql {
         *self
     }
 }
+impl Engine for pbps_sqlite::dialect::Sqlite {
+    fn trusts_roles(&self) -> bool {
+        false
+    }
+    /// PostgreSQL's server version number has no meaning on SQLite; the
+    /// project's version floor is already carried by `self`.
+    fn with_planning_version(&self, _version: i64) -> Self {
+        *self
+    }
+    /// SQLite has no partitions or staged-attach scan CHECKs.
+    fn with_attach_constraint_names(
+        &self,
+        _names: std::collections::BTreeMap<
+            pbps_model::Uid,
+            std::collections::BTreeSet<pbps_model::ObjectLocalName>,
+        >,
+    ) -> Self {
+        *self
+    }
+}
 
 /// Keep the selected concrete type in the rest of the existing route without
 /// moving any stage, query or refusal across the selection point.
@@ -117,12 +140,14 @@ macro_rules! with_plan_dialect {
         match $selected {
             $crate::emission::SelectedDialect::Postgres($dialect) => $body,
             $crate::emission::SelectedDialect::Mssql($dialect) => $body,
+            $crate::emission::SelectedDialect::Sqlite($dialect) => $body,
         }
     };
     ($selected:expr, |mut $dialect:ident| $body:block) => {
         match $selected {
             $crate::emission::SelectedDialect::Postgres(mut $dialect) => $body,
             $crate::emission::SelectedDialect::Mssql(mut $dialect) => $body,
+            $crate::emission::SelectedDialect::Sqlite(mut $dialect) => $body,
         }
     };
 }
@@ -313,7 +338,20 @@ mod tests {
     #[test]
     fn only_postgresql_may_be_given_trusted_roles_at_bootstrap() {
         assert!(pbps_pg::Postgres::new().trusts_roles());
-        // Negative: SQL Server is refused them before its guard is prepared.
+        // Negative: SQL Server and SQLite are refused them before any guard is prepared.
         assert!(!pbps_mssql::Mssql.trusts_roles());
+        assert!(!pbps_sqlite::dialect::Sqlite::default().trusts_roles());
+    }
+
+    #[test]
+    fn sqlite_engine_keeps_its_floor_through_server_only_configuration_hooks() {
+        let custom = pbps_sqlite::dialect::Sqlite::with_floor(pbps_sqlite::Version::new(3, 40, 0));
+        assert_eq!(custom.with_planning_version(170_000), custom);
+        assert_eq!(
+            custom.with_attach_constraint_names(Default::default()),
+            custom
+        );
+        // Negative: a different floor is not folded into the default.
+        assert_ne!(custom, pbps_sqlite::dialect::Sqlite::default());
     }
 }

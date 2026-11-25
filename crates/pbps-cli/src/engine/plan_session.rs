@@ -76,6 +76,7 @@ use pbps_dialect::routines::RoutineAdmission;
 
 pub(super) mod mssql;
 pub(super) mod postgres;
+pub(super) mod sqlite;
 
 /// A `NOT VALID` check of a standing domain, as a position reports it.
 ///

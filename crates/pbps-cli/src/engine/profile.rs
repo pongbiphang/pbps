@@ -76,7 +76,7 @@ pub(crate) const fn profile(driver: Driver) -> &'static Profile {
     match driver {
         Driver::Mssql => &MSSQL,
         Driver::Postgres => &POSTGRES,
-        Driver::Sqlite => crate::db::sqlite_not_wired(),
+        Driver::Sqlite => &SQLITE,
     }
 }
 
@@ -117,6 +117,29 @@ static POSTGRES: Profile = Profile {
     capabilities_unknown_message: postgres_capabilities_unknown_message,
     impact_notes: pbps_pg::impact::notes,
     owned_test: Some(&owned_test::POSTGRES),
+};
+
+static SQLITE: Profile = Profile {
+    externals_draft_refusal: Some(
+        "`pbps resolver externals` reads a PostgreSQL target; SQLite has no resolver or binding \
+         adapter",
+    ),
+    scratch_compiles_base_namespace: false,
+    target_identity_unread: sqlite_identity_unread,
+    scratch_may_share_the_instance: false,
+    cost_report_engine: "sqlite",
+    truncate_reason: pbps_sqlite::state::truncate_reason,
+    revalidates_read_inside_own_transaction: false,
+    // SQLite has no database principals or GRANTs; the operating-system
+    // process and file permissions control access.
+    lock_principal_noun: "process",
+    lock_principal_placeholder: "operating-system user",
+    lock_remedy: sqlite_lock_remedy,
+    permission_read_advice: sqlite_permission_read_advice,
+    online_depends_on_the_edition: false,
+    capabilities_unknown_message: sqlite_capabilities_unknown_message,
+    impact_notes: sqlite_impact_notes,
+    owned_test: None,
 };
 
 fn mssql_identity_unread(error: DbError) -> crate::resolution::Refused {
@@ -265,6 +288,69 @@ fn mssql_impact_notes(report: &ImpactReport) -> Vec<String> {
     }
 }
 
+fn sqlite_identity_unread(error: DbError) -> crate::resolution::Refused {
+    crate::resolution::Refused::Unanswerable(anyhow::anyhow!(
+        "SQLite has no resolver target identity to read: {error}"
+    ))
+}
+
+fn sqlite_lock_remedy(
+    gap: pbps_db::doctor::LockReadGap,
+    _how: &str,
+    _next: &str,
+    _principal: &str,
+) -> LockRemedy {
+    // SQLite has no database principals or SQL GRANTs, and `LockReadGap` has
+    // no file-permission or busy-file variant. Never fabricate a GRANT
+    // statement: point the operator at the database file, its permissions and
+    // the ledger lock table instead.
+    let _ = gap;
+    LockRemedy {
+        why: format!(
+            "SQLite has no database grants; check that this process can read the database file \
+             and its directory, that no other writer holds it busy, and that {} is intact, then \
+             rerun doctor",
+            pbps_sqlite::state::LOCK_TABLE
+        ),
+        statement: None,
+    }
+}
+
+fn sqlite_permission_read_advice() -> String {
+    format!(
+        "check that the database file and its directory are readable and writable by this \
+         process, that the file is not held busy by another writer, and that {} is intact, then \
+         rerun doctor",
+        pbps_sqlite::state::STATE_TABLE
+    )
+}
+
+fn sqlite_capabilities_unknown_message(cause: &str) -> String {
+    format!(
+        "this SQLite library's version could not be read ({cause}), so doctor cannot report it; \
+         connection settings, library support and file writability are checked again before a \
+         plan is applied"
+    )
+}
+
+fn sqlite_impact_notes(report: &ImpactReport) -> Vec<String> {
+    let mut out = Vec::new();
+    if !report.carried.is_empty() {
+        out.push(
+            "SQLite rewrites those references to the new name when `legacy_alter_table` is off."
+                .to_owned(),
+        );
+    }
+    if !report.advisory.is_empty() || !report.carried.is_empty() {
+        out.push(
+            "Nothing outside the database file is visible here: applications and downstream \
+             consumers need a human's checklist."
+                .to_owned(),
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +444,83 @@ mod tests {
         assert!(refuse_externals_draft_unsupported(Driver::Postgres).is_ok());
         let refused = refuse_externals_draft_unsupported(Driver::Mssql).unwrap_err();
         assert!(refused.to_string().contains("SQL Server"), "{refused}");
+        let refused = refuse_externals_draft_unsupported(Driver::Sqlite).unwrap_err();
+        assert!(refused.to_string().contains("SQLite"), "{refused}");
+    }
+
+    #[test]
+    fn sqlite_profile_readers_return_its_own_facts_and_never_fabricate_a_grant() {
+        let facts = profile(Driver::Sqlite);
+        assert_eq!(facts.cost_report_engine, "sqlite");
+        assert!(!scratch_compiles_base_namespace(Driver::Sqlite));
+        assert!(!online_depends_on_the_edition(Driver::Sqlite));
+        assert!(!needs_readback_revalidation(
+            Driver::Sqlite,
+            Read::InsideOwnTransaction
+        ));
+        assert!(!needs_readback_revalidation(Driver::Sqlite, Read::Snapshot));
+        assert_eq!(
+            permission_read_advice(Driver::Sqlite),
+            (facts.permission_read_advice)()
+        );
+        assert!(permission_read_advice(Driver::Sqlite).contains(pbps_sqlite::state::STATE_TABLE));
+        assert_eq!(
+            capabilities_unknown_message(Driver::Sqlite, "boom"),
+            (facts.capabilities_unknown_message)("boom")
+        );
+        assert!(capabilities_unknown_message(Driver::Sqlite, "boom").contains("SQLite"));
+        // Character-based truncation matches `pbps_sqlite::state::truncate_reason`.
+        let long = "é".repeat(pbps_sqlite::state::REASON_CHARS + 5);
+        assert_eq!(
+            truncate_reason(Driver::Sqlite, &long).chars().count(),
+            pbps_sqlite::state::REASON_CHARS
+        );
+        // SQLite has no database grants, so every LockReadGap produces no SQL statement.
+        for gap in [
+            None,
+            Some(LockReadGap::Hidden),
+            Some(LockReadGap::TableSelect),
+            Some(LockReadGap::SchemaUsage),
+            Some(LockReadGap::Unexplained),
+        ] {
+            let remedy = lock_remedy(Driver::Sqlite, gap);
+            assert_eq!(remedy.statement, None, "{gap:?}");
+            assert!(
+                remedy.why.contains("SQLite")
+                    && remedy.why.contains(pbps_sqlite::state::LOCK_TABLE),
+                "{}",
+                remedy.why
+            );
+        }
+        // Negative: SQLite owns no test scratch container and refuses by name.
+        let owned = require_owned_test(Driver::Sqlite)
+            .err()
+            .expect("SQLite owns no test scratch");
+        assert!(owned.to_string().contains("SQLite"), "{owned}");
+        // Negative: an empty impact report produces no note, while a carried or
+        // advisory referrer produces SQLite's notes.
+        assert!(impact_notes(Driver::Sqlite, &ImpactReport::default()).is_empty());
+        let with_carried = ImpactReport {
+            target: "main.t".into(),
+            carried: vec![pbps_db::impact::Referrer {
+                kind: "view".into(),
+                name: "main.v".into(),
+                detail: None,
+                removed_with: None,
+            }],
+            ..Default::default()
+        };
+        let notes = impact_notes(Driver::Sqlite, &with_carried);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("legacy_alter_table"), "{notes:?}");
+        // Target identity read failure names SQLite as unanswerable.
+        match target_identity_unread(Driver::Sqlite, DbError::Refused("no resolver".into())) {
+            crate::resolution::Refused::Unanswerable(err) => {
+                assert!(err.to_string().contains("SQLite"), "{err}");
+            }
+            crate::resolution::Refused::Finding(f) => {
+                panic!("expected Unanswerable, got finding: {f:?}");
+            }
+        }
     }
 }
