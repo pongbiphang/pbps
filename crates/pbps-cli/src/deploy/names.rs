@@ -3,6 +3,7 @@
 //! already took.
 
 use super::*;
+use pbps_model::operation::{Operations, OwnerError, Owners, Snapshot};
 
 /// The relation names this plan creates: its tables, the views it creates
 /// that it does not also drop, the indexes it creates by name, and fixed
@@ -255,7 +256,7 @@ pub(crate) fn order_carried_moves<S: Clone>(
     sides: (pbps_diff::Side<'_>, pbps_diff::Side<'_>),
     dialect: &dyn pbps_dialect::Dialect,
     catalog: &pbps_dialect::slots::CatalogFacts,
-) {
+) -> Result<(), OwnerError> {
     use pbps_model::ColumnChange;
     use pbps_model::PartitionChange;
     use pbps_model::TableChange;
@@ -263,14 +264,14 @@ pub(crate) fn order_carried_moves<S: Clone>(
 
     let clashes = name_clashes(&cs.changes, occupants, relations, catalog);
     if clashes.is_empty() {
-        return;
+        return Ok(());
     }
     let mut facts = occupant_slots(occupants);
     facts.detach_releases.clone_from(&catalog.detach_releases);
     let Ok(mut schedule) =
         pbps_diff::order::slots::handovers(&cs.changes, sides.0, sides.1, dialect, &facts)
     else {
-        return;
+        return Ok(());
     };
     // A retype and a numbering change are both possible leavers to the
     // generic slots. The PostgreSQL identity release is exact, so state its
@@ -335,7 +336,7 @@ pub(crate) fn order_carried_moves<S: Clone>(
         }
     }
     let Ok(mut settled) = schedule.settle(cs.clone()) else {
-        return;
+        return Ok(());
     };
     let renames: Vec<bool> = cs
         .changes
@@ -348,13 +349,12 @@ pub(crate) fn order_carried_moves<S: Clone>(
         })
         .collect();
     if !only_crossed_by(&settled.sequence, &renames) {
-        use pbps_diff::order::{Baseline, Checks, Schedule, analyse_with_catalog, graph};
-        use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+        use pbps_model::operation::{ModuleEdits, PlanOwners};
         if !moving.iter().any(|&moves| moves) {
-            return;
+            return Ok(());
         }
         let Ok(names) = pbps_model::plan_names::PlanNames::of(&cs.changes, sides.1.ids) else {
-            return;
+            return Ok(());
         };
         let owners = PlanOwners::new(names, sides.0.ids, sides.1.ids);
         let operations = Operations::of_plan(&cs.changes, ModuleEdits::Rebuilt);
@@ -366,18 +366,9 @@ pub(crate) fn order_carried_moves<S: Clone>(
             schema: sides.1.schema,
             ids: sides.1.ids,
         };
-        let effects = analyse_with_catalog(&operations, &owners, before, after, dialect, None);
-        if !effects.unowned.is_empty() {
-            return;
-        }
-        let graph = graph(
-            operations.as_slice(),
-            &effects.effects,
-            &Baseline::of(before, &owners),
-            &pbps_model::ModuleDeps::new(),
-            Checks::ALL,
-        );
-        let effects = Schedule::of_graph(&graph, operations.as_slice());
+        let Some(effects) = carried_effects(&operations, &owners, before, after, dialect)? else {
+            return Ok(());
+        };
         // A delayed claimant carries its consumers with it. Other steps
         // retain their relative order: this is not permission to reorder
         // the rest of the plan using an incomplete set of catalog facts.
@@ -410,13 +401,37 @@ pub(crate) fn order_carried_moves<S: Clone>(
             schedule.edge(edge.before, edge.after, edge.source, edge.reason);
         }
         let Ok(ordered) = schedule.settle(cs.clone()) else {
-            return;
+            return Ok(());
         };
         settled = ordered;
     }
     if name_clashes(&settled.changes.changes, occupants, relations, catalog).len() < clashes.len() {
         *cs = settled.changes;
     }
+    Ok(())
+}
+
+/// Reads the dependencies of a delayed claimant in the same ownership view.
+pub(super) fn carried_effects(
+    operations: &Operations,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    after: Snapshot<'_>,
+    dialect: &dyn pbps_dialect::Dialect,
+) -> Result<Option<pbps_diff::order::Schedule>, OwnerError> {
+    use pbps_diff::order::{Baseline, Checks, Schedule, analyse_with_catalog, graph};
+    let effects = analyse_with_catalog(operations, owners, before, after, dialect, None)?;
+    if !effects.unowned.is_empty() {
+        return Ok(None);
+    }
+    let graph = graph(
+        operations.as_slice(),
+        &effects.effects,
+        &Baseline::of(before, owners)?,
+        &pbps_model::ModuleDeps::new(),
+        Checks::ALL,
+    );
+    Ok(Some(Schedule::of_graph(&graph, operations.as_slice())))
 }
 
 /// Whether every step `sequence` moves past another, or another moves past,

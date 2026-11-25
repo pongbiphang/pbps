@@ -155,7 +155,7 @@ impl Rule<'_> {
         let violations = order::verify::verify(
             ops.as_slice(),
             &self.effects(&ops)?,
-            &order::Baseline::of(before, &owners),
+            &order::Baseline::of(before, &owners).map_err(|e| e.to_string())?,
             &self
                 .input
                 .hints
@@ -258,7 +258,7 @@ impl Expansion for Rule<'_> {
         let graph = order::graph(
             ops.as_slice(),
             &self.effects(&ops)?,
-            &order::Baseline::of(before, &owners),
+            &order::Baseline::of(before, &owners).map_err(|e| e.to_string())?,
             &self
                 .input
                 .hints

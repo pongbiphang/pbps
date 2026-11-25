@@ -338,9 +338,9 @@ mod default_rebuild_matrix {
             ids: &f.after_ids,
         };
         let shadow =
-            crate::order::shadow::analyse(&planned.operations, &owners, before, after, &Candidates);
+            crate::order::shadow::analyse(&planned.operations, &owners, before, after, &Candidates).expect("read the analysis baseline");
         assert!(shadow.unowned.is_empty(), "{:?}", shadow.unowned);
-        let baseline = crate::order::edges::Baseline::of(before, &owners);
+        let baseline = crate::order::edges::Baseline::of(before, &owners).expect("read the test baseline");
         let violations = crate::order::verify::verify(
             planned.operations.as_slice(),
             &shadow.effects,
@@ -684,7 +684,7 @@ mod default_rebuild_matrix {
             after,
             &dialect,
             &Default::default(),
-        );
+        ).expect("read the schedule baseline");
         let planned =
             crate::resolver::plan_operations(before, after, &hints, &resolution, &dialect)
                 .unwrap_or_else(|e| {
@@ -791,7 +791,7 @@ mod default_rebuild_matrix {
                 ids: &after_ids,
             },
             &dialect,
-        );
+        ).expect("read the analysis baseline");
         assert!(
             shadow.unowned.is_empty(),
             "{}: {:?}",
@@ -804,7 +804,7 @@ mod default_rebuild_matrix {
                 ids: &before_ids,
             },
             &owners,
-        );
+        ).expect("read the test baseline");
         let violations = crate::order::verify::verify(
             planned.operations.as_slice(),
             &shadow.effects,

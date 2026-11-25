@@ -178,15 +178,21 @@ impl Baseline {
         self.symbolic = state;
         self
     }
-    pub fn of(before: Snapshot<'_>, owners: &dyn pbps_model::operation::Owners) -> Self {
-        Self {
-            held: baseline_keys(before, owners),
-            bindings: baseline_bindings(before, owners)
+    /// What the baseline holds, by key. A name that cannot be read is the
+    /// refusal: a baseline built around it would answer "not held" for an
+    /// object that may well be there (DEC-2993.3).
+    pub fn of(
+        before: Snapshot<'_>,
+        owners: &dyn pbps_model::operation::Owners,
+    ) -> Result<Self, pbps_model::operation::OwnerError> {
+        Ok(Self {
+            held: baseline_keys(before, owners)?,
+            bindings: baseline_bindings(before, owners)?
                 .into_iter()
                 .map(|b| (b.surface, b.target))
                 .collect(),
             symbolic: Default::default(),
-        }
+        })
     }
 
     /// A baseline that holds nothing: only for the guard check that shows what

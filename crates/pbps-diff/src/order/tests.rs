@@ -94,7 +94,7 @@ impl Plan {
             .iter()
             .map(|op| effects(op, &owners, before, after).unwrap())
             .collect();
-        let baseline = Baseline::of(before, &owners);
+        let baseline = Baseline::of(before, &owners).expect("read the test baseline");
         (ops, fx, baseline)
     }
 }
@@ -486,7 +486,11 @@ fn rebuilt_routine() -> (Operations, Vec<Effects>, Baseline) {
         .iter()
         .map(|op| effects(op, &owners, snapshot, snapshot).unwrap())
         .collect();
-    (ops, fx, Baseline::of(snapshot, &owners))
+    (
+        ops,
+        fx,
+        Baseline::of(snapshot, &owners).expect("read the test baseline"),
+    )
 }
 
 #[test]
@@ -1737,7 +1741,8 @@ fn the_scheduled_observer_accepts_the_right_order_and_refuses_a_wrong_one() {
                 stage,
                 None,
                 &Default::default(),
-            );
+            )
+            .expect("read the observed baseline");
         })
         .is_ok()
     };
@@ -4325,9 +4330,10 @@ fn a_parent_row_is_deleted_after_a_foreign_key_the_plan_rebuilds() {
             ids: &plan.after_ids,
         },
     );
-    let baseline = Baseline::of(before, &owners);
+    let baseline = Baseline::of(before, &owners).expect("read the test baseline");
     let shadowed =
-        super::shadow::analyse(&ops, &owners, before, after, &pbps_dialect::MinimalDialect);
+        super::shadow::analyse(&ops, &owners, before, after, &pbps_dialect::MinimalDialect)
+            .expect("read the analysis baseline");
     let fx = shadowed.effects;
     assert_eq!(
         run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),

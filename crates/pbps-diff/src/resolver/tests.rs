@@ -79,6 +79,30 @@ fn cycles_and_edges_outside_the_change_set_refuse_before_output() {
     ));
 }
 
+#[test]
+fn resolver_schedule_refuses_a_vacant_baseline_name() {
+    crate::order::rebuild_tests::with_vacant_baseline(|before, owners, why| {
+        let side = crate::Side {
+            schema: before.schema,
+            ids: before.ids,
+        };
+        let refusal = scheduled(
+            &ChangeSet::default(),
+            &[],
+            &Operations::of_plan(&[], ModuleEdits::InPlace),
+            owners,
+            &[],
+            &Default::default(),
+            side,
+            side,
+            &pbps_dialect::MinimalDialect,
+            &Default::default(),
+        )
+        .err();
+        assert_eq!(refusal, Some(Error::Names(why.to_string())));
+    });
+}
+
 /// DEC-1968.1: an edge only the evidence states is an obligation like any
 /// other. A cycle through one is refused by name, whichever source closes it.
 #[test]
@@ -324,7 +348,8 @@ mod unowned_steps {
                 ids: &after_ids,
             },
         );
-        let shadowed = analyse(&operations, &owners, before, after, &Candidates);
+        let shadowed = analyse(&operations, &owners, before, after, &Candidates)
+            .expect("read the analysis baseline");
         if let Some(at) = order.iter().position(|&i| i == 2) {
             assert!(matches!(
                 shadowed.unowned.as_slice(),
@@ -355,7 +380,8 @@ mod unowned_steps {
             },
             &Candidates,
             &Default::default(),
-        );
+        )
+        .expect("read the schedule baseline");
         (changes, schedule)
     }
 
@@ -2742,7 +2768,8 @@ mod generated_surface_coverage {
             },
             &pbps_dialect::MinimalDialect,
             &Default::default(),
-        );
+        )
+        .expect("read the schedule baseline");
         let edges = schedule.constraints();
         let between = |before, after| edges.iter().any(|e| e.before == before && e.after == after);
         assert!(between(1, 2), "after the rename into app.b: {edges:?}");

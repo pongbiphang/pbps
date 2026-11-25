@@ -3020,16 +3020,22 @@ fn has_expression(source: &ValueSource) -> bool {
     }
 }
 
-/// Known baseline FK targets. Unmanaged/unreadable bindings supply no fact;
-/// consumers must keep that distinct from an absent surface.
-pub fn baseline_bindings(before: Snapshot<'_>, owners: &dyn Owners) -> Vec<ForeignKeyBinding> {
+/// Known baseline FK targets. An undeclared name supplies no fact; consumers
+/// must keep that distinct from an absent surface. A name that cannot be read,
+/// or a declared one nobody holds, is the original refusal, because a binding
+/// that is missing reads as "this foreign key points at nothing" (DEC-2993.3).
+pub fn baseline_bindings(
+    before: Snapshot<'_>,
+    owners: &dyn Owners,
+) -> Result<Vec<ForeignKeyBinding>, OwnerError> {
     let mut out = Vec::new();
     for (name, table) in &before.schema.tables {
-        let Ok(owner) = owners.table(name, Spelling::Base) else {
+        let Some(owner) = door(owners.table(name, Spelling::Base))?.reference()? else {
             continue;
         };
         for (name, fk) in &table.foreign_keys {
-            if let Ok(target) = owners.table(&fk.references_table, Spelling::Base) {
+            let target = door(owners.table(&fk.references_table, Spelling::Base))?.reference()?;
+            if let Some(target) = target {
                 out.push(ForeignKeyBinding {
                     surface: Cx::part(&Recorded(owner.clone()), PartKey::ForeignKey(name.clone())),
                     incarnation: Incarnation::Base,
@@ -3038,7 +3044,7 @@ pub fn baseline_bindings(before: Snapshot<'_>, owners: &dyn Owners) -> Vec<Forei
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Every object the baseline holds that a requirement can name, by key.
@@ -3047,14 +3053,24 @@ pub fn baseline_bindings(before: Snapshot<'_>, owners: &dyn Owners) -> Vec<Forei
 /// the rows a database has, nor its grants, so [`holds_unknown`] says which
 /// keys have no answer rather than letting their absence read as "nothing
 /// there" (absent, empty and unreadable are three different things).
-pub fn baseline_keys(before: Snapshot<'_>, owners: &dyn Owners) -> BTreeSet<ObjectKey> {
+///
+/// The same holds for a name: an undeclared one gives no key, and one that
+/// cannot be read, or that is declared and vacant, is the original refusal and
+/// not a shorter list (DEC-2993.3).
+pub fn baseline_keys(
+    before: Snapshot<'_>,
+    owners: &dyn Owners,
+) -> Result<BTreeSet<ObjectKey>, OwnerError> {
     let mut held = BTreeSet::new();
-    let table = |name: &TableName| owners.table(name, Spelling::Base).ok().map(Recorded);
     for (name, t) in &before.schema.tables {
-        let Some(owner) = table(name) else { continue };
+        let Some(uid) = door(owners.table(name, Spelling::Base))?.reference()? else {
+            continue;
+        };
+        let owner = Recorded(uid);
         held.insert(ObjectKey::Table(owner.clone()));
         for (c, column) in &t.columns {
-            let Ok(uid) = owners.column(&name.column(c.raw()), Spelling::Base) else {
+            let column_name = name.column(c.raw());
+            let Some(uid) = door(owners.column(&column_name, Spelling::Base))?.reference()? else {
                 continue;
             };
             let key = ColumnKey::Recorded(Recorded(uid));
@@ -3116,7 +3132,7 @@ pub fn baseline_keys(before: Snapshot<'_>, owners: &dyn Owners) -> BTreeSet<Obje
             .filter(|(_, name)| before.schema.extensions.contains_key(*name))
             .map(|(uid, _)| ObjectKey::Extension(Recorded(uid.clone()))),
     );
-    held
+    Ok(held)
 }
 
 /// Whether the baseline model can say if it holds `key` at all.

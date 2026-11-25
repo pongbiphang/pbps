@@ -103,7 +103,8 @@ pub fn release_schedule(
         dialect,
         None,
         plan.captured(),
-    );
+    )
+    .map_err(|e| e.to_string())?;
     if let Some((id, why)) = effects.unowned.first() {
         return Err(format!(
             "policy release operation {id} has unread effects: {why}"
@@ -112,7 +113,7 @@ pub fn release_schedule(
     let graph = super::graph(
         operations.as_slice(),
         &effects.effects,
-        &super::Baseline::of(before, &owners),
+        &super::Baseline::of(before, &owners).map_err(|e| e.to_string())?,
         deps,
         super::Checks::ALL,
     );

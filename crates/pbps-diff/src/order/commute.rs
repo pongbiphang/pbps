@@ -61,12 +61,10 @@ pub fn read(
         schema: desired.schema,
         ids: desired.ids,
     };
-    let baseline = Baseline::of(before, &owners);
-    let report = analyse(&operations, &owners, before, after, dialect).report(
-        &operations,
-        &baseline,
-        declared,
-    );
+    let baseline = Baseline::of(before, &owners).map_err(|e| e.to_string())?;
+    let report = analyse(&operations, &owners, before, after, dialect)
+        .map_err(|e| e.to_string())?
+        .report(&operations, &baseline, declared);
     Ok(Read { operations, report })
 }
 

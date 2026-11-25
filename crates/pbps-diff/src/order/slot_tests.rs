@@ -236,7 +236,7 @@ impl Plan {
         let effect_violations = super::verify::verify(
             ops.as_slice(),
             &fx,
-            &Baseline::of(before, &owners),
+            &Baseline::of(before, &owners).expect("read the test baseline"),
             &ModuleDeps::new(),
         )
         .len();

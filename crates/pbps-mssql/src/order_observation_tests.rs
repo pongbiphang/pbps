@@ -120,7 +120,8 @@ fn assert_observational(shape: Shape) {
         schema: &after,
         ids: &ids,
     };
-    let analysed = order::analyse(&operations, &owners, base, end, &Mssql);
+    let analysed = order::analyse(&operations, &owners, base, end, &Mssql)
+        .expect("read the analysis baseline");
     assert!(analysed.unowned.is_empty(), "{:?}", analysed.unowned);
     assert!(analysed.effects.iter().all(|fx| fx.symbolic.is_empty()));
     assert!(analysed.effects.iter().any(|fx| {
@@ -131,7 +132,7 @@ fn assert_observational(shape: Shape) {
     let graph = graph(
         operations.as_slice(),
         &analysed.effects,
-        &Baseline::of(base, &owners),
+        &Baseline::of(base, &owners).expect("read the test baseline"),
         &ModuleDeps::new(),
         Checks::ALL,
     );

@@ -600,7 +600,7 @@ impl Contract {
         let graph = graph(
             operations.as_slice(),
             &fx,
-            &Baseline::of(before, owners),
+            &Baseline::of(before, owners).map_err(|e| e.to_string())?,
             &Default::default(),
             Checks::ALL,
         );

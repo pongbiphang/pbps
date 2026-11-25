@@ -18,7 +18,7 @@
 use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
-use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+use pbps_model::operation::{ModuleEdits, Operations, OwnerError, PlanOwners, Snapshot};
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{
     CheckConstraint, Column, Hints, IdsFile, Index, IndexColumn, Module, ModuleDeps, ModuleId,
@@ -195,7 +195,7 @@ struct Measured {
 
 /// Measures `shape`; `reversed` runs its operations backwards instead of in
 /// the pipeline's order, for the negative.
-fn measure(shape: Shape, reversed: bool) -> Measured {
+fn measure(shape: Shape, reversed: bool) -> Result<Measured, OwnerError> {
     let dialect = pbps_dialect::MinimalDialect;
     let base_ids = crate::resolve(&shape.base, &IdsFile::default(), &[], &ctx())
         .expect("resolve the base")
@@ -290,8 +290,8 @@ fn measure(shape: Shape, reversed: bool) -> Measured {
         ids: &ids,
     };
     let started = Instant::now();
-    let shadowed = analyse(&operations, &owners, before, after, &dialect);
-    let baseline = Baseline::of(before, &owners);
+    let shadowed = analyse(&operations, &owners, before, after, &dialect)?;
+    let baseline = Baseline::of(before, &owners)?;
     let effects = started.elapsed();
     let ops = operations.as_slice();
     let started = Instant::now();
@@ -326,7 +326,7 @@ fn measure(shape: Shape, reversed: bool) -> Measured {
         Checks::ALL,
     );
     let verify = started.elapsed();
-    Measured {
+    Ok(Measured {
         shape: shape.name,
         operations: ops.len(),
         pipeline,
@@ -337,7 +337,7 @@ fn measure(shape: Shape, reversed: bool) -> Measured {
         graph: graph_time,
         verify,
         violations: violations.len(),
-    }
+    })
 }
 
 #[test]
@@ -354,7 +354,7 @@ fn the_benchmark_shapes_plan_and_the_effects_find_only_the_cycle() {
     );
     println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for shape in [independent(size), dense(size), chain(size), cycle(size)] {
-        let m = measure(shape, false);
+        let m = measure(shape, false).expect("read the benchmark baseline");
         // Only the cycle's order breaks a declaration: the one closing it.
         let cycle = m.shape == "cycle";
         assert_eq!(m.violations, usize::from(cycle), "{}: violations", m.shape);
@@ -378,6 +378,6 @@ fn the_benchmark_shapes_plan_and_the_effects_find_only_the_cycle() {
 /// before the one it reads.
 #[test]
 fn a_chain_run_backwards_is_refused_by_the_effects() {
-    let m = measure(chain(SMALL), true);
+    let m = measure(chain(SMALL), true).expect("read the benchmark baseline");
     assert_eq!(m.violations, SMALL - 1, "one per link of the chain");
 }

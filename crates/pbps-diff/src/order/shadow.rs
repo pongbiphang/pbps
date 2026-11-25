@@ -42,7 +42,7 @@ pub fn analyse(
     before: Snapshot<'_>,
     after: Snapshot<'_>,
     dialect: &(impl Dialect + ?Sized),
-) -> Shadowed {
+) -> Result<Shadowed, OwnerError> {
     analyse_with_membership(operations, owners, before, after, dialect, None, None)
 }
 
@@ -57,7 +57,7 @@ pub fn analyse_with_catalog(
     after: Snapshot<'_>,
     dialect: &(impl Dialect + ?Sized),
     catalog: Option<&pbps_dialect::slots::CatalogFacts>,
-) -> Shadowed {
+) -> Result<Shadowed, OwnerError> {
     analyse_scoped(
         operations,
         owners,
@@ -83,7 +83,7 @@ pub fn analyse_captured(
     dialect: &(impl Dialect + ?Sized),
     catalog: Option<&pbps_dialect::slots::CatalogFacts>,
     captured: &pbps_model::operation::Captured,
-) -> Shadowed {
+) -> Result<Shadowed, OwnerError> {
     analyse_scoped(
         operations,
         owners,
@@ -110,7 +110,7 @@ pub fn analyse_with_membership(
     dialect: &(impl Dialect + ?Sized),
     catalog: Option<&pbps_dialect::slots::CatalogFacts>,
     stored: Option<&pbps_model::operation::MembershipCatalog>,
-) -> Shadowed {
+) -> Result<Shadowed, OwnerError> {
     analyse_scoped(
         operations,
         owners,
@@ -139,7 +139,7 @@ pub(super) fn analyse_planning<S>(
     stored: Option<&pbps_model::operation::MembershipCatalog>,
     plan: &super::PlanningPlan<S>,
     annotations: &[super::Constraint],
-) -> Shadowed {
+) -> Result<Shadowed, OwnerError> {
     analyse_scoped(
         operations,
         owners,
@@ -166,7 +166,7 @@ pub(super) fn analyse_scoped(
     membership: bool,
     annotations: &[super::Constraint],
     captured: &pbps_model::operation::Captured,
-) -> Shadowed {
+) -> Result<Shadowed, OwnerError> {
     use pbps_model::operation::{End, Lineage, MembershipCatalog};
     let lineage = Lineage::of(before, after);
     let payload = pbps_model::ChangeSet {
@@ -284,16 +284,16 @@ pub(super) fn analyse_scoped(
         super::boundaries::bind(
             operations,
             &mut effects,
-            &Baseline::of(before, owners).with_symbolic(facts.base.clone()),
+            &Baseline::of(before, owners)?.with_symbolic(facts.base.clone()),
             annotations,
         );
         super::boundaries::transfers(&mut effects, &facts.base, dialect);
     }
-    Shadowed {
+    Ok(Shadowed {
         effects,
         unowned,
         symbolic: facts.base,
-    }
+    })
 }
 
 impl Shadowed {
@@ -338,7 +338,7 @@ pub(crate) fn observe_plan(
         ModuleEdits::InPlace
     };
     let operations = Operations::of_plan(&changes.changes, modes);
-    observe(
+    if let Err(error) = observe(
         base,
         desired,
         dialect,
@@ -347,7 +347,9 @@ pub(crate) fn observe_plan(
         &operations,
         Stage::BeforeSchedule,
         None,
-    );
+    ) {
+        sink(&operations, &[format!("names refused: {error}")], true);
+    }
 }
 
 /// Which order a plan is observed at. The differ's and the schedule's are not
@@ -382,7 +384,7 @@ pub fn observe_scheduled(
     stage: Stage,
     facts: Option<&pbps_dialect::slots::CatalogFacts>,
     captured: &pbps_model::operation::Captured,
-) {
+) -> Result<(), OwnerError> {
     use pbps_model::operation::ModuleEdits;
     let modes = if dialect.rebuilds_modules() {
         ModuleEdits::Rebuilt
@@ -400,7 +402,7 @@ pub fn observe_scheduled(
         stage,
         facts,
         captured,
-    );
+    )
 }
 
 /// [`observe_plan`] for operations an expansion made, in the order they run:
@@ -416,7 +418,7 @@ pub(crate) fn observe(
     operations: &Operations,
     stage: Stage,
     facts: Option<&pbps_dialect::slots::CatalogFacts>,
-) {
+) -> Result<(), OwnerError> {
     observe_captured(
         base,
         desired,
@@ -427,7 +429,7 @@ pub(crate) fn observe(
         stage,
         facts,
         &Default::default(),
-    );
+    )
 }
 
 /// [`observe`] on the effects the plan was ordered by: a plan ordered from a
@@ -445,7 +447,7 @@ pub(crate) fn observe_captured(
     stage: Stage,
     facts: Option<&pbps_dialect::slots::CatalogFacts>,
     captured: &pbps_model::operation::Captured,
-) {
+) -> Result<(), OwnerError> {
     use pbps_model::operation::PlanOwners;
     use pbps_model::plan_names::PlanNames;
     let operations = operations.clone();
@@ -453,7 +455,7 @@ pub(crate) fn observe_captured(
         Ok(names) => names,
         Err(error) => {
             sink(&operations, &[format!("names refused: {error}")], false);
-            return;
+            return Ok(());
         }
     };
     let owners = PlanOwners::new(names, base.ids, desired.ids);
@@ -467,17 +469,35 @@ pub(crate) fn observe_captured(
             ids: desired.ids,
         },
     );
-    let baseline = Baseline::of(before, &owners);
-    let shadowed = analyse_captured(
+    observe_with_owners(
         &operations,
         &owners,
         before,
         after,
         dialect,
+        declared,
+        stage,
         facts,
         captured,
-    );
-    let report = shadowed.report(&operations, &baseline, declared);
+    )
+}
+
+#[cfg(any(test, debug_assertions))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn observe_with_owners(
+    operations: &Operations,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    after: Snapshot<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    declared: &ModuleDeps,
+    stage: Stage,
+    facts: Option<&pbps_dialect::slots::CatalogFacts>,
+    captured: &pbps_model::operation::Captured,
+) -> Result<(), OwnerError> {
+    let baseline = Baseline::of(before, owners)?;
+    let shadowed = analyse_captured(operations, owners, before, after, dialect, facts, captured)?;
+    let report = shadowed.report(operations, &baseline, declared);
     let mut lines: Vec<String> = report
         .unowned
         .iter()
@@ -486,7 +506,7 @@ pub(crate) fn observe_captured(
     let ops = operations.as_slice();
     let (violations, any) = judge(ops, &report, stage);
     lines.extend(violations);
-    let (slot_lines, slot_fail) = judge_slots(ops, &owners, before, dialect, facts, stage);
+    let (slot_lines, slot_fail) = judge_slots(ops, owners, before, dialect, facts, stage);
     lines.extend(slot_lines);
     let any = any || slot_fail;
     if std::env::var_os("PBPS_ORDER_SHADOW").is_some() {
@@ -511,7 +531,8 @@ pub(crate) fn observe_captured(
             report.graph.unmet.len()
         ));
     }
-    sink(&operations, &lines, any);
+    sink(operations, &lines, any);
+    Ok(())
 }
 
 /// Cuts `text` to at most `max` bytes without splitting a character: a

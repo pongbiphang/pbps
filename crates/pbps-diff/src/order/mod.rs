@@ -120,7 +120,7 @@ pub use resolver_finish::reordered_operations;
 pub(crate) use plan::differ;
 
 #[cfg(test)]
-mod rebuild_tests;
+pub(crate) mod rebuild_tests;
 
 #[cfg(test)]
 mod read_tests;

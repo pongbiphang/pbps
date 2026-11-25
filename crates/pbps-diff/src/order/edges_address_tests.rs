@@ -79,7 +79,7 @@ fn rename_dependencies_follow_consumed_versions_when_endpoint_names_are_equal() 
     let graph = graph(
         ops.as_slice(),
         &fx,
-        &Baseline::of(snapshot, &owners),
+        &Baseline::of(snapshot, &owners).expect("read the test baseline"),
         &Default::default(),
         Checks::ALL,
     );

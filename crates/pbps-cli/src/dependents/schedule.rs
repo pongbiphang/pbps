@@ -516,7 +516,8 @@ fn oracle_schedule(
         pbps_diff::order::shadow::Stage::Differ,
         None,
         &Default::default(),
-    );
+    )
+    .map_err(|e| Refusal(e.to_string()))?;
     Ok(OracleScheduled {
         changes: cs,
         added,
@@ -560,14 +561,15 @@ fn keep_handover_dependents(
         schema: declared.schema,
         ids: declared.sources.after,
     };
-    let effects = shadow::analyse_with_catalog(&operations, &owners, before, after, dialect, None);
+    let effects = shadow::analyse_with_catalog(&operations, &owners, before, after, dialect, None)
+        .map_err(|e| Refusal(e.to_string()))?;
     if let Some((_, error)) = effects.unowned.first() {
         return Err(Refusal(error.to_string()));
     }
     let graph = edges::graph(
         operations.as_slice(),
         &effects.effects,
-        &edges::Baseline::of(before, &owners),
+        &edges::Baseline::of(before, &owners).map_err(|e| Refusal(e.to_string()))?,
         &declared.module_deps(),
         edges::Checks::ALL,
     );

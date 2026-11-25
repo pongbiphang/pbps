@@ -504,6 +504,54 @@ fn order_carried_moves(
     crate::test_planning(cs, |plan| {
         super::order_carried_moves(plan, occupants, relations, sides, dialect, catalog)
     })
+    .expect("read the carried moves baseline");
+}
+
+#[test]
+fn carried_move_effects_refuse_an_unreadable_baseline_name() {
+    use pbps_model::operation::{ModuleEdits, Operations, OwnerError, Owners, Snapshot, Spelling};
+    use pbps_model::{ColumnRef, IdsFile, RoleName, Schema, Table, Uid};
+
+    struct Unreadable;
+    impl Owners for Unreadable {
+        fn table(&self, name: &TableName, spelling: Spelling) -> Result<Uid, OwnerError> {
+            Err(OwnerError::Names {
+                name: name.shown().to_string(),
+                spelling,
+                why: "two holders".to_string(),
+            })
+        }
+        fn column(&self, _: &ColumnRef, _: Spelling) -> Result<Uid, OwnerError> {
+            unreachable!("the table's owner must be read first")
+        }
+        fn role(&self, _: &RoleName, _: Spelling) -> Result<Uid, OwnerError> {
+            unreachable!("the baseline scans no roles here")
+        }
+    }
+
+    let name = TableName::new("app", "unreadable");
+    let mut schema = Schema::default();
+    schema.tables.insert(name.clone(), Table::default());
+    let before = Snapshot {
+        schema: &schema,
+        ids: &IdsFile::default(),
+    };
+    let refused = super::names::carried_effects(
+        &Operations::of_plan(&[], ModuleEdits::Rebuilt),
+        &Unreadable,
+        before,
+        before,
+        &pbps_pg::Postgres::new(),
+    )
+    .err();
+    assert_eq!(
+        refused,
+        Some(OwnerError::Names {
+            name: name.shown().to_string(),
+            spelling: Spelling::Base,
+            why: "two holders".to_string(),
+        })
+    );
 }
 
 #[test]

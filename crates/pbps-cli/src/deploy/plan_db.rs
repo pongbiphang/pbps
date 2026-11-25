@@ -1054,7 +1054,7 @@ pub(super) async fn plan_db_selected(
                 pbps_diff::order::shadow::Stage::Final,
                 Some(&ordered.facts.unwrap_or_default()),
                 &captured,
-            ); }
+            )?; }
             // The observer's own gate: a release test build has `cfg(test)`
             // but no observer, so the facts are spent here too (#2089).
             #[cfg(not(debug_assertions))]

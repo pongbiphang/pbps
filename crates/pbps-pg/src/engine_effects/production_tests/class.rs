@@ -112,7 +112,8 @@ fn column_membership_classes_finish_or_name_the_retained_endpoint_limit() {
                             ids: &s.ids,
                         },
                         &pg,
-                    );
+                    )
+                    .expect("read the analysis baseline");
                     assert!(fx.unowned.is_empty(), "{label}: {:?}", fx.unowned);
                     let result = pbps_diff::order::membership::project(
                         operations.as_slice(),
@@ -130,6 +131,7 @@ fn column_membership_classes_finish_or_name_the_retained_endpoint_limit() {
                             },
                             &owners,
                         )
+                        .expect("read the test baseline")
                         .with_symbolic(fx.symbolic.clone()),
                         &Default::default(),
                         Checks::ALL,
@@ -290,7 +292,8 @@ fn a_missing_ordinary_uid_is_an_obligation_before_any_name_projection() {
                 ids: &s.ids,
             },
             &Postgres::new().with_server_version(180000),
-        );
+        )
+        .expect("read the analysis baseline");
         assert!(fx.effects[1].symbolic.iter().any(|c|matches!(c,pbps_model::operation::symbolic::Clause::Require(pbps_model::operation::symbolic::Fact::Unsupported{reason,..}) if reason.contains("ordinary column without a recorded UID"))),"{:?}",fx.effects[1].symbolic);
     }
 }

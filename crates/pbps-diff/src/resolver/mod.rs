@@ -27,7 +27,7 @@ use crate::order::{Baseline, Checks, Schedule, graph};
 use crate::order::{Source, analyse};
 use pbps_dialect::Dialect;
 use pbps_model::escape::Escaped;
-use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+use pbps_model::operation::{ModuleEdits, Operations, OwnerError, PlanOwners, Snapshot};
 #[cfg(test)]
 use pbps_model::resolver::OrderReason;
 use pbps_model::resolver::{Surface, SurfaceResolution};
@@ -220,7 +220,7 @@ pub fn plan_operations_captured<D: Dialect + ?Sized>(
         desired,
         dialect,
         captured,
-    );
+    )?;
     let (ordered, sequence) = settle(prepared.changes, &schedule)?;
     let (ordered, operations) = crate::order::resolver_finish::finish(
         ordered,
@@ -248,7 +248,8 @@ pub fn plan_operations_captured<D: Dialect + ?Sized>(
         crate::order::shadow::Stage::Differ,
         None,
         captured,
-    );
+    )
+    .map_err(|e| Error::Names(e.to_string()))?;
     Ok(Planned {
         ordered,
         operations,
@@ -273,7 +274,7 @@ fn scheduled(
     desired: crate::Side<'_>,
     dialect: &(impl Dialect + ?Sized),
     captured: &pbps_model::operation::Captured,
-) -> Schedule {
+) -> Result<Schedule, Error> {
     let (before, after) = (
         Snapshot {
             schema: base.schema,
@@ -284,9 +285,11 @@ fn scheduled(
             ids: desired.ids,
         },
     );
-    let baseline = Baseline::of(before, owners);
+    let refusal = |e: OwnerError| Error::Names(e.to_string());
+    let baseline = Baseline::of(before, owners).map_err(refusal)?;
     let shadowed =
-        crate::order::analyse_captured(operations, owners, before, after, dialect, None, captured);
+        crate::order::analyse_captured(operations, owners, before, after, dialect, None, captured)
+            .map_err(refusal)?;
     let effect_graph = graph(
         operations.as_slice(),
         &shadowed.effects,
@@ -336,7 +339,7 @@ fn scheduled(
             }
         }
     }
-    schedule
+    Ok(schedule)
 }
 
 /// [`plan_operations`]' ordering over a plan that is its own logical plan,
@@ -376,7 +379,7 @@ fn order_logical(
         desired,
         dialect,
         &Default::default(),
-    );
+    )?;
     settle(changes, &schedule).map(|(ordered, _)| ordered)
 }
 

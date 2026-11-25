@@ -112,7 +112,8 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
             ids: &ids,
         };
         let analysed =
-            order::analyse_with_catalog(&ops, &owners, base, end, &pbps_mssql::Mssql, Some(&facts));
+            order::analyse_with_catalog(&ops, &owners, base, end, &pbps_mssql::Mssql, Some(&facts))
+                .expect("read the analysis baseline");
         assert!(analysed.unowned.is_empty());
         let g = ops
             .iter()
@@ -133,7 +134,8 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
             matches,
             "{collation}"
         );
-        let offline = order::analyse(&ops, &owners, base, end, &pbps_mssql::Mssql);
+        let offline = order::analyse(&ops, &owners, base, end, &pbps_mssql::Mssql)
+            .expect("read the analysis baseline");
         assert!(
             !offline.effects[g].requires.contains(&requirement),
             "offline stays lexical"
@@ -147,7 +149,7 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
             order::verify(
                 ordered.as_slice(),
                 &effects,
-                &Baseline::of(base, &owners),
+                &Baseline::of(base, &owners).expect("read the test baseline"),
                 &Default::default(),
             )
         };
@@ -177,6 +179,7 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
                     Some(&facts),
                     &Default::default(),
                 )
+                .expect("read the observed baseline")
             })
             .is_err();
             assert_eq!(refused, matches, "{collation}");

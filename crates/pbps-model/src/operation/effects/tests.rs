@@ -1100,6 +1100,71 @@ fn baseline_names_refuse_an_unreadable_table_column_or_role_and_name_it() {
     }
 }
 
+#[test]
+fn baseline_keys_keep_held_names_and_refuse_unreadable_names() {
+    let (mut schema, ids) = baseline_with_everything();
+    schema.tables.insert(t("external"), Table::default());
+    let before = Snapshot {
+        schema: &schema,
+        ids: &ids,
+    };
+    let held = Script::default().held_table("child");
+    let table_only = baseline_keys(before, &held).unwrap();
+    assert!(table_only.contains(&table_key("child")));
+    assert!(!table_only.contains(&column_key("c")));
+    assert!(!table_only.contains(&table_key("external")));
+    let held = held.held_column("child", "c");
+    let keys = baseline_keys(before, &held).unwrap();
+    assert!(keys.contains(&table_key("child")));
+    assert!(keys.contains(&column_key("c")));
+    for why in faults("app.child") {
+        let owners = held.clone().table("child", Reply::Fail(why.clone()));
+        assert_eq!(baseline_keys(before, &owners), Err(why));
+    }
+    for why in faults("app.child.c") {
+        let owners = held.clone().column("child", "c", Reply::Fail(why.clone()));
+        assert_eq!(baseline_keys(before, &owners), Err(why));
+    }
+}
+
+#[test]
+fn baseline_bindings_keep_held_targets_and_refuse_unreadable_names() {
+    let (mut schema, ids) = baseline_with_everything();
+    let child = schema.tables.get_mut(&t("child")).unwrap();
+    for name in ["parent", "external"] {
+        let Change::Constraint(ConstraintChange::AddForeignKey { constraint, .. }) =
+            foreign_key("child", name)
+        else {
+            unreachable!()
+        };
+        child.foreign_keys.insert(name.into(), *constraint);
+    }
+    let before = Snapshot {
+        schema: &schema,
+        ids: &ids,
+    };
+    let held = Script::default().held_table("parent");
+    assert!(baseline_bindings(before, &held).unwrap().is_empty());
+    let held = held.held_table("child");
+    assert_eq!(
+        baseline_bindings(before, &held).unwrap(),
+        [ForeignKeyBinding {
+            surface: ObjectKey::Part {
+                table: recorded(UidKind::Table, "child"),
+                part: PartKey::ForeignKey("parent".into()),
+            },
+            incarnation: Incarnation::Base,
+            target: recorded(UidKind::Table, "parent"),
+        }]
+    );
+    for name in ["child", "parent", "external"] {
+        for why in faults(&format!("app.{name}")) {
+            let owners = held.clone().table(name, Reply::Fail(why.clone()));
+            assert_eq!(baseline_bindings(before, &owners), Err(why));
+        }
+    }
+}
+
 fn baseline_with_type() -> (Schema, IdsFile) {
     let mut schema = Schema::default();
     schema.types.insert(
