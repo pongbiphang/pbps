@@ -1397,6 +1397,7 @@ dependencies = [
  "pbps-mssql",
  "pbps-pg",
  "pbps-policy",
+ "pbps-sqlite",
  "pbps-ui",
  "rand 0.10.2",
  "regex-lite",
@@ -1556,6 +1557,7 @@ dependencies = [
 name = "pbps-sqlite"
 version = "0.0.0"
 dependencies = [
+ "futures-util",
  "pbps-db",
  "pbps-dialect",
  "pbps-diff",

@@ -38,6 +38,7 @@ pbps-diff    = { path = "crates/pbps-diff" }
 pbps-dialect = { path = "crates/pbps-dialect" }
 pbps-mssql   = { path = "crates/pbps-mssql" }
 pbps-pg      = { path = "crates/pbps-pg" }
+pbps-sqlite  = { path = "crates/pbps-sqlite" }
 pbps-docs    = { path = "crates/pbps-docs" }
 pbps-db      = { path = "crates/pbps-db" }
 pbps-policy  = { path = "crates/pbps-policy" }

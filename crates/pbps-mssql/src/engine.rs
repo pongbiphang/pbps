@@ -99,8 +99,10 @@ impl Engine for MssqlEngine {
         &'a self,
         conn: &'a mut Conn,
         holder: &'a str,
-    ) -> EngineFuture<'a, Result<(), LedgerError>> {
-        Box::pin(crate::state::lock(conn, holder))
+    ) -> EngineFuture<'a, Result<Option<LockInfo>, LedgerError>> {
+        // A lock on this engine is either taken or refused: there is no stale
+        // holder to clear on the way, so there is never one to report.
+        Box::pin(async move { crate::state::lock(conn, holder).await.map(|()| None) })
     }
 
     fn unlock<'a>(&'a self, conn: &'a mut Conn) -> EngineFuture<'a, Result<bool, DbError>> {

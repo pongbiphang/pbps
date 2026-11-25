@@ -1624,3 +1624,40 @@ Pinned by `sqlite_conn_tests`: a missing file is refused and not created while
 refuses by name while statements run and bind; the three transaction calls
 restore foreign keys, refuse to nest, roll back and commit; a parked value is
 never replaced and is dropped with the connection.
+
+<a id="dec-2950-18"></a>
+
+**DEC-2950.18. SQLite answers the driver-level engine, and taking a lock reports the stale holder it cleared (#2950).** `pbps-sqlite` implements
+`pbps_db::engine::Engine`, and the one selection of an engine by driver returns
+it. No command can select SQLite yet; the sessions and the configuration value
+come after.
+
+- **`Engine::lock` returns `Option<LockInfo>`.** SQLite's lock clears the row of
+  a holder it proves gone and takes the lock in the same call
+  (DEC-2950.13), and SPEC promises the run prints whose row that was. The
+  trait's `()` had no room for it, so the method returns the cleared row.
+  PostgreSQL and SQL Server answer `None`: their lock is taken or refused and
+  never clears anybody. The neutral caller prints one line from the row,
+  `LockInfo::cleared_notice`, on standard error; no engine prints. Rejected: a
+  second method that asks afterwards "did you clear someone", which would have
+  to remember the answer on the connection between two calls.
+- **`unlock` releases this run's lock when the connection holds its guard, and
+  clears the row whoever holds it when it holds none.** The first is a command
+  ending; it deletes only the row with its own token, so a run whose row was
+  cleared by hand does not delete the next run's. The second is `pbps unlock`,
+  whose connection never took the lock. A parked value that is not the engine's
+  guard is put back and the call refuses.
+- **A second lock on one connection is refused.** The slot holds one guard
+  (DEC-2950.17), and replacing it would let go of the first lock.
+- **Managed rows are refused by table.** Reference data is not read on SQLite
+  yet. A read with no scope asks nothing and answers nothing; a scope is
+  `RowsError::Unreadable` naming its table, since an empty answer would say the
+  table has no such rows.
+- **The provided questions.** `server_version` is the library's version,
+  because the library in the process is what runs every statement.
+  `partition_runway` answers an empty report: the engine has no partitions,
+  and the default would say it had not declared whether it has. `capabilities`,
+  `permissions`, `lock_read_gap`, `resolver_discovery` and
+  `read_assertion_target` keep the trait's defaults in this entry; the first two
+  are answered with the sessions, where `doctor` on a SQLite file first has a
+  caller.
