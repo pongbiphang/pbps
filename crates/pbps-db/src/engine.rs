@@ -234,11 +234,16 @@ pub trait Engine: Send + Sync {
     ) -> EngineFuture<'a, Result<String, DbError>>;
 
     /// Takes the lock, recording the already-rendered `holder` text.
+    ///
+    /// Returns the row of a dead holder this call cleared on the way, when it
+    /// cleared one, so the command can say whose it was (DEC-2950.18). `None`
+    /// is "cleared nobody's", which is every lock on an engine whose lock
+    /// cannot outlive its holder's proof of life.
     fn lock<'a>(
         &'a self,
         conn: &'a mut Conn,
         holder: &'a str,
-    ) -> EngineFuture<'a, Result<(), LedgerError>>;
+    ) -> EngineFuture<'a, Result<Option<LockInfo>, LedgerError>>;
 
     /// Releases the lock; `false` when it was not held.
     fn unlock<'a>(&'a self, conn: &'a mut Conn) -> EngineFuture<'a, Result<bool, DbError>>;
@@ -453,7 +458,7 @@ mod tests {
             &'a self,
             _: &'a mut Conn,
             _: &'a str,
-        ) -> EngineFuture<'a, Result<(), LedgerError>> {
+        ) -> EngineFuture<'a, Result<Option<LockInfo>, LedgerError>> {
             refused_ledger()
         }
         fn unlock<'a>(&'a self, _: &'a mut Conn) -> EngineFuture<'a, Result<bool, DbError>> {

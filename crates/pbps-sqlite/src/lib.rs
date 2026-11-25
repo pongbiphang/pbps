@@ -41,6 +41,7 @@ pub mod catalog;
 pub mod dialect;
 pub mod drop_requirements;
 pub mod emit;
+pub mod engine;
 pub mod ident;
 pub mod keywords;
 pub mod lexis;

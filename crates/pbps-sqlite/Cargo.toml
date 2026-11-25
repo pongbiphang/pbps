@@ -29,6 +29,8 @@ pbps-diff = { workspace = true, features = ["test-fixtures"] }
 # The harness names each test's directory with a random suffix, as the CLI's
 # own tests do.
 rand.workspace = true
+# The engine's futures are polled once: they must be ready without a runtime.
+futures-util.workspace = true
 
 [lints]
 workspace = true

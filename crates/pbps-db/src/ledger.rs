@@ -237,6 +237,17 @@ impl LockInfo {
             .map(|lookup| format!("\n{lookup}"))
             .unwrap_or_default()
     }
+
+    /// What a run prints when taking the lock cleared this row: its holder was
+    /// proved gone, so the run replaced the row and did not wait
+    /// ([`crate::engine::Engine::lock`]).
+    #[must_use]
+    pub fn cleared_notice(&self) -> String {
+        format!(
+            "note: cleared a stale lock left by `{}` since {}: its holder is gone.",
+            self.locked_by, self.locked_at
+        )
+    }
 }
 
 /// The widest `locked_by` either engine's lock table holds, in characters.

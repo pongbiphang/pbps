@@ -58,10 +58,11 @@ use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapsh
 pub(crate) fn of(driver: Driver) -> &'static dyn pbps_db::engine::Engine {
     static MSSQL: pbps_mssql::engine::MssqlEngine = pbps_mssql::engine::MssqlEngine;
     static POSTGRES: pbps_pg::engine::PostgresEngine = pbps_pg::engine::PostgresEngine;
+    static SQLITE: pbps_sqlite::engine::SqliteEngine = pbps_sqlite::engine::SqliteEngine;
     match driver {
         Driver::Mssql => &MSSQL,
         Driver::Postgres => &POSTGRES,
-        Driver::Sqlite => crate::db::sqlite_not_wired(),
+        Driver::Sqlite => &SQLITE,
     }
 }
 
@@ -255,7 +256,12 @@ pub async fn lock(conn: &mut Conn, operator: &str) -> Result<(), LedgerError> {
         application_name: &application_name,
     }
     .render();
-    engine.lock(conn, &holder).await
+    if let Some(cleared) = engine.lock(conn, &holder).await? {
+        // The one line the run owes whoever reads its output: a lock was
+        // there, its holder was proved gone, and this run removed it.
+        eprintln!("{}", cleared.cleared_notice());
+    }
+    Ok(())
 }
 
 pub async fn unlock(conn: &mut Conn) -> Result<bool, DbError> {
