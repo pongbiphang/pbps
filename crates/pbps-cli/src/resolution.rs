@@ -32,6 +32,7 @@ pub(crate) trait Continuation:
 }
 impl Continuation for pbps_pg::Postgres {}
 impl Continuation for pbps_mssql::Mssql {}
+impl Continuation for pbps_sqlite::dialect::Sqlite {}
 
 /// Which case a connected plan is in.
 pub enum Case<'a> {

@@ -70,6 +70,16 @@ impl PlanningDialect for pbps_mssql::Mssql {
         Self
     }
 }
+impl PlanningDialect for pbps_sqlite::dialect::Sqlite {
+    type Resolver = crate::resolver::contract::NoResolver<Self>;
+    const DRIVER: Driver = Driver::Sqlite;
+    const NAME: &'static str = "SQLite";
+    /// SQLite has no server-side resolver scratch (`NoResolver`); the project's
+    /// version floor is carried by the selected dialect, not a server version.
+    fn configured(_: &[String], _: Option<i64>) -> Self {
+        Self::default()
+    }
+}
 
 /// The standard the scratch is put into, for the engine the dialect names. A
 /// standard for another engine is a type error, not a runtime refusal:

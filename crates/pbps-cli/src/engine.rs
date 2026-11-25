@@ -89,16 +89,21 @@ mod of_tests {
 
     #[test]
     fn of_answers_with_the_engine_of_the_driver_asked_for() {
-        for driver in [Driver::Mssql, Driver::Postgres] {
+        for driver in [Driver::Mssql, Driver::Postgres, Driver::Sqlite] {
             assert_eq!(of(driver).driver(), driver);
         }
     }
 
     #[test]
-    fn the_two_engines_are_told_apart_by_name() {
-        assert_ne!(
+    fn the_engines_are_told_apart_by_name() {
+        let names = [
             of(Driver::Mssql).name(),
             of(Driver::Postgres).name(),
+            of(Driver::Sqlite).name(),
+        ];
+        assert_eq!(
+            names.iter().copied().collect::<BTreeSet<_>>().len(),
+            names.len(),
             "error messages name the engine, so two engines sharing a name would blur them"
         );
     }
@@ -4195,12 +4200,20 @@ mod resolver_name_tests {
 
     #[test]
     fn a_refusal_names_the_engine_as_the_engine_names_itself() {
-        for (refusal, engine) in [named::<pbps_pg::Postgres>(), named::<pbps_mssql::Mssql>()] {
+        let all = [
+            named::<pbps_pg::Postgres>(),
+            named::<pbps_mssql::Mssql>(),
+            named::<pbps_sqlite::dialect::Sqlite>(),
+        ];
+        for (refusal, engine) in all {
             assert_eq!(refusal, engine);
         }
-        assert_ne!(
-            named::<pbps_pg::Postgres>().0,
-            named::<pbps_mssql::Mssql>().0,
+        assert_eq!(
+            all.iter()
+                .map(|(n, _)| *n)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            all.len(),
             "two engines must not share a name"
         );
     }
