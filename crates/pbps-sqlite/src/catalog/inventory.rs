@@ -4,23 +4,25 @@
 //! Reads `main` in the caller's transaction without loading any virtual table's
 //! module (DEC-2950.14). Any failed query is an error, never an empty inventory.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::DbError;
 use pbps_db::sqlite::Connection;
 use pbps_dialect::Dialect as _;
 use pbps_dialect::slots::{CatalogFacts, Namespace, Occupant, SlotKey, TableSpace};
+use pbps_diff::order::catalog::{Dependent, Holds};
 use pbps_diff::order::slots::SlotViolation;
 use pbps_model::escape::Escaped;
 use pbps_model::operation::{
     ModuleEdits, ObjectKey, Operations, PlanOwners, Snapshot, base_table_named,
 };
 use pbps_model::plan_names::PlanNames;
-use pbps_model::{Change, ChangeSet, ColumnChange, ModuleKind, TableChange, TableName};
+use pbps_model::{Change, ChangeSet, ColumnChange, ModuleId, ModuleKind, TableChange, TableName};
 
 use crate::dialect::Sqlite;
 use crate::pragma::{self, table_list, table_xinfo};
-use crate::{ident, names};
+use crate::{ident, lexis, names};
 
 /// The kind of a row in `main.sqlite_schema`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -56,12 +58,13 @@ impl EntryKind {
     }
 }
 
-/// One row of `main.sqlite_schema` (`type`, `name`, `tbl_name`).
+/// One row of `main.sqlite_schema` (`type`, `name`, `tbl_name`, `sql`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaEntry {
     pub kind: EntryKind,
     pub name: String,
     pub table: String,
+    pub sql: Option<String>,
 }
 
 impl SchemaEntry {
@@ -115,13 +118,13 @@ pub struct Inventory {
     pub columns: BTreeMap<String, TableColumns>,
 }
 
-/// Reads `main.sqlite_schema` (`type`, `name`, `tbl_name`) and, for each table
-/// in `column_tables`, its columns via `PRAGMA main.table_xinfo`, without
+/// Reads `main.sqlite_schema` (`type`, `name`, `tbl_name`, `sql`) and, for each
+/// table in `column_tables`, its columns via `PRAGMA main.table_xinfo`, without
 /// loading any virtual table's module.
 pub fn read(c: &Connection, column_tables: &[&str]) -> Result<Inventory, DbError> {
     let entries = c
         .query(
-            "SELECT type, name, tbl_name FROM main.sqlite_schema ORDER BY type, name",
+            "SELECT type, name, tbl_name, sql FROM main.sqlite_schema ORDER BY type, name",
             &[],
         )?
         .into_iter()
@@ -130,6 +133,7 @@ pub fn read(c: &Connection, column_tables: &[&str]) -> Result<Inventory, DbError
                 kind: EntryKind::parse(row.text(0)?)?,
                 name: row.text(1)?.to_owned(),
                 table: row.text(2)?.to_owned(),
+                sql: row.optional_text(3)?.map(str::to_owned),
             })
         })
         .collect::<Result<Vec<_>, DbError>>()?;
@@ -496,6 +500,211 @@ pub fn verify_names(
         problems.len(),
         problems.join("\n  "),
     ))
+}
+
+/// Returns, for each view in `views`, every view and trigger in `inventory`
+/// that may read it (directly or through other views) or is attached to it,
+/// ordered deepest-first so each dependent is dropped before what it reads.
+///
+/// Absent, empty and unreadable stay distinct: a view in `views` missing from
+/// `main.sqlite_schema`, or any view or trigger row with NULL or empty `sql`,
+/// returns an error rather than "no readers".
+pub fn view_dependents(
+    inventory: &Inventory,
+    views: &[ModuleId],
+    known_modules: &BTreeSet<ModuleId>,
+) -> Result<BTreeMap<ModuleId, Vec<Dependent>>, DbError> {
+    if views.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut catalog_views: Vec<(&SchemaEntry, Cow<'_, str>)> = Vec::new();
+    let mut catalog_triggers: Vec<(&SchemaEntry, &str)> = Vec::new();
+    for entry in &inventory.entries {
+        match entry.kind {
+            EntryKind::View => {
+                let sql = require_stored_sql(entry)?;
+                let body = crate::catalog::text::view(&entry.name, sql)
+                    .map(|v| Cow::Owned(v.body))
+                    .unwrap_or(Cow::Borrowed(sql));
+                catalog_views.push((entry, body));
+            }
+            EntryKind::Trigger => {
+                let sql = require_stored_sql(entry)?;
+                catalog_triggers.push((entry, sql));
+            }
+            EntryKind::Table | EntryKind::Index => {}
+        }
+    }
+
+    let resolve_view = |name: &str| -> ModuleId {
+        known_modules
+            .iter()
+            .find(|id| {
+                matches!(
+                    id,
+                    ModuleId::Named(n)
+                        if ident::same(&n.schema, crate::validate::SCHEMA)
+                            && ident::same(&n.name, name)
+                )
+            })
+            .cloned()
+            .unwrap_or_else(|| ModuleId::Named(TableName::new(crate::validate::SCHEMA, name)))
+    };
+
+    let mut out = BTreeMap::new();
+    for root in views {
+        let ModuleId::Named(root_name) = root else {
+            return Err(DbError::Refused(format!(
+                "SQLite only manages views, not `{}`",
+                root.shown()
+            )));
+        };
+        if !ident::same(&root_name.schema, crate::validate::SCHEMA) {
+            return Err(DbError::Refused(format!(
+                "SQLite manages only schema `main`, not `{}`",
+                root.shown()
+            )));
+        }
+        let Some((root_entry, _)) = catalog_views
+            .iter()
+            .find(|(e, _)| ident::same(&e.name, &root_name.name))
+        else {
+            return Err(DbError::Refused(format!(
+                "view `{}` is not in SQLite's catalog",
+                root.shown()
+            )));
+        };
+
+        let root_folded = ident::fold(&root_entry.name).into_owned();
+        let mut found: BTreeMap<String, Dependent> = BTreeMap::new();
+        let mut depends_on_me: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut visited_views: BTreeSet<String> = [root_folded.clone()].into_iter().collect();
+        let mut frontier: Vec<(String, Option<String>)> = vec![(root_entry.name.clone(), None)];
+
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for (target, parent_key) in std::mem::take(&mut frontier) {
+                for (view, body) in &catalog_views {
+                    if ident::same(&view.name, &target) || !sql_may_read(body, &target) {
+                        continue;
+                    }
+                    let folded = ident::fold(&view.name).into_owned();
+                    if folded == root_folded {
+                        continue;
+                    }
+                    let key = format!("view:{folded}");
+                    if let Some(parent) = &parent_key {
+                        depends_on_me
+                            .entry(parent.clone())
+                            .or_default()
+                            .insert(key.clone());
+                    }
+                    if !found.contains_key(&key) {
+                        found.insert(
+                            key.clone(),
+                            Dependent {
+                                // Shared dependent formatting escapes `described` once.
+                                described: format!("view main.{}", view.name),
+                                holds: Holds::Module(resolve_view(&view.name)),
+                            },
+                        );
+                    }
+                    if visited_views.insert(folded) {
+                        next.push((view.name.clone(), Some(key)));
+                    }
+                }
+                for (trigger, body) in &catalog_triggers {
+                    let attached = ident::same(&trigger.table, &target);
+                    if !attached && !sql_may_read(body, &target) {
+                        continue;
+                    }
+                    let key = format!("trigger:{}", ident::fold(&trigger.name));
+                    if let Some(parent) = &parent_key {
+                        depends_on_me
+                            .entry(parent.clone())
+                            .or_default()
+                            .insert(key.clone());
+                    }
+                    found.entry(key).or_insert_with(|| Dependent {
+                        described: format!(
+                            "trigger main.{} on main.{}",
+                            trigger.name, trigger.table
+                        ),
+                        holds: Holds::Unrepresentable(if attached {
+                            "an INSTEAD OF trigger on this view would be dropped with it by \
+                             SQLite, and triggers are not managed on SQLite"
+                                .to_owned()
+                        } else {
+                            "triggers are not managed on SQLite, so this plan cannot remove or \
+                             restore it"
+                                .to_owned()
+                        }),
+                    });
+                }
+            }
+            frontier = next;
+        }
+        out.insert(root.clone(), drop_order(found, &depends_on_me));
+    }
+    Ok(out)
+}
+
+fn require_stored_sql(entry: &SchemaEntry) -> Result<&str, DbError> {
+    match entry.sql.as_deref() {
+        Some(sql) if lexis::has_token(sql) => Ok(sql),
+        Some(_) | None => Err(DbError::BadRow(format!(
+            "{} `main.{}` is listed by SQLite's catalog and has no stored SQL to read",
+            entry.kind.as_str(),
+            Escaped(&entry.name)
+        ))),
+    }
+}
+
+/// Conservative lexical match against stored SQLite DDL (`lexis::names_or_quotes`
+/// with `ident::same`, as `crate::ordering` uses). Because this scans all
+/// identifier and quoted tokens without parsing `FROM`/`JOIN` clauses, a view
+/// or trigger that merely names a column, alias or string literal like the
+/// target view is reported as a reader. A trigger's statement is scanned
+/// whole, so a trigger that is itself named like the view is reported too.
+/// Reading the `FROM` and `JOIN` targets is the way to narrow this.
+fn sql_may_read(sql: &str, view_name: &str) -> bool {
+    lexis::names_or_quotes(sql, view_name, ident::same)
+}
+
+fn drop_order(
+    mut found: BTreeMap<String, Dependent>,
+    depends_on_me: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<Dependent> {
+    let mut remaining: BTreeSet<String> = found.keys().cloned().collect();
+    let mut out = Vec::new();
+    while !remaining.is_empty() {
+        let ready: Vec<String> = remaining
+            .iter()
+            .filter(|node| {
+                depends_on_me
+                    .get(*node)
+                    .is_none_or(|theirs| theirs.iter().all(|d| !remaining.contains(d)))
+            })
+            .cloned()
+            .collect();
+        if ready.is_empty() {
+            // Two views mutually naming each other (e.g. as column aliases):
+            // SQLite accepts dropping views in any order, so emit deterministically.
+            for node in std::mem::take(&mut remaining) {
+                if let Some(dependent) = found.remove(&node) {
+                    out.push(dependent);
+                }
+            }
+            break;
+        }
+        for node in ready {
+            remaining.remove(&node);
+            if let Some(dependent) = found.remove(&node) {
+                out.push(dependent);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
