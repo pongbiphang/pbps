@@ -153,28 +153,7 @@ fn an_empty_file_in_a_read_only_directory_is_also_a_write_permission_gap() {
 }
 
 #[test]
-fn a_query_only_connection_is_a_write_gap_and_an_open_descriptor_is_asked_through_sqlite() {
-    // A file write-protected before it is opened never gets here: the driver
-    // refuses to open it. Measured: one write-protected after the open is
-    // still writable through the open descriptor, and SQLite, which a
-    // deployment on this connection would write through, reports no gap.
-    let mut fresh = Fresh::file();
-    let path = fresh.path().to_path_buf();
-    fresh
-        .connection()
-        .execute_batch("CREATE TABLE app (id INTEGER PRIMARY KEY)")
-        .expect("table");
-    let mut perms = std::fs::metadata(&path).expect("meta").permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(&path, perms).expect("chmod ro");
-    let result = permissions(fresh.connection());
-    let mut perms = std::fs::metadata(&path).expect("meta").permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    perms.set_readonly(false);
-    std::fs::set_permissions(&path, perms).expect("chmod rw");
-    assert!(result.expect("answered").gaps.is_empty());
-
-    // `PRAGMA query_only = ON` makes the connection itself read-only.
+fn a_query_only_connection_is_a_write_gap_on_the_connection() {
     let mut q = Fresh::file();
     q.connection()
         .execute_batch("PRAGMA query_only = ON")
@@ -182,22 +161,70 @@ fn a_query_only_connection_is_a_write_gap_and_an_open_descriptor_is_asked_throug
     let held = permissions(q.connection()).expect("query_only is a permission gap");
     assert_eq!(held.gaps.len(), 1, "{held:?}");
     assert_eq!(held.gaps[0].permission, "WRITE");
-    assert!(held.gaps[0].why.contains("read-only"), "{:?}", held.gaps[0]);
+    assert!(held.gaps[0].securable.contains("connection"), "{held:?}");
+    // Negative: turned off again, the same connection has no gap.
+    q.connection()
+        .execute_batch("PRAGMA query_only = OFF")
+        .expect("query_only off");
+    assert!(
+        permissions(q.connection())
+            .expect("answered")
+            .gaps
+            .is_empty()
+    );
+}
+
+// Unix only: the operating system is asked with `access`, and Windows keeps
+// the answer in access control lists that only an attempt reads.
+#[cfg(unix)]
+#[test]
+fn a_file_write_protected_after_the_open_is_a_write_gap_on_the_file() {
+    // One write-protected before the open never gets here: the driver refuses
+    // to open it. After the open, the next connection would be refused.
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut fresh = Fresh::file();
+    let path = fresh.path().to_path_buf();
+    fresh
+        .connection()
+        .execute_batch("CREATE TABLE app (id INTEGER PRIMARY KEY)")
+        .expect("table");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("chmod ro");
+    // A process that may write anything (root) is told so, and has no gap.
+    // Learnt from a sibling: the database file itself is never opened again.
+    let sibling = path.with_extension("sibling");
+    std::fs::write(&sibling, b"").expect("sibling");
+    std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+    let refused = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&sibling)
+        .is_err();
+    let result = permissions(fresh.connection());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod rw");
+    let held = result.expect("answered");
+    if refused {
+        assert_eq!(held.gaps.len(), 1, "{held:?}");
+        assert!(held.gaps[0].securable.contains("database file"), "{held:?}");
+    } else {
+        assert!(held.gaps.is_empty(), "{held:?}");
+    }
 }
 
 #[test]
-fn busy_and_journal_off_databases_are_errors_not_clean_or_gaps() {
-    // Busy (another writer holds `BEGIN IMMEDIATE`).
+fn a_writer_holding_the_file_does_not_stop_the_question_and_journal_off_is_an_error() {
+    // Nothing is tried and no lock is taken, so another connection's write
+    // lock neither blocks the answer nor is disturbed by it.
     let mut busy = Fresh::file();
     busy.connection()
         .execute_batch("CREATE TABLE app (id INTEGER PRIMARY KEY)")
         .expect("table");
     let other = Connection::open(busy.path(), OpenMode::ExistingOnly).expect("second");
-    other.execute_batch("BEGIN IMMEDIATE").expect("hold lock");
-    let err = permissions_within(busy.connection(), Duration::from_millis(50))
-        .expect_err("busy must be an error");
-    assert!(err.to_string().contains("busy"), "{err}");
-    other.execute_batch("ROLLBACK").expect("release");
+    other
+        .execute_batch("BEGIN IMMEDIATE; INSERT INTO app VALUES (1)")
+        .expect("hold lock");
+    let held = permissions_within(busy.connection(), Duration::from_millis(50))
+        .expect("answered beside a writer");
+    assert!(held.gaps.is_empty(), "{held:?}");
+    other.execute_batch("COMMIT").expect("the writer commits");
 
     // `journal_mode = OFF`: rollback is not reliable, so refused rather than risked.
     let mut off = Fresh::file();

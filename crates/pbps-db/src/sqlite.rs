@@ -911,6 +911,35 @@ fn driver_error(error: rusqlite::Error) -> DbError {
 #[cfg(test)]
 mod copy_tests;
 
+/// Whether the operating system would let this process write `path`: for a
+/// file, change it; for a directory, create a file in it.
+///
+/// Asked, never tried: nothing is opened, created or locked, so a readiness
+/// check can ask it of a database another process is writing. `None` where the
+/// platform has no such question (on Windows the answer is in the access
+/// control lists, and only an attempt reads them).
+#[cfg(unix)]
+pub fn may_write(path: &Path, directory: bool) -> std::io::Result<Option<bool>> {
+    use rustix::fs::Access;
+    use rustix::io::Errno;
+    let wanted = if directory {
+        Access::WRITE_OK | Access::EXEC_OK
+    } else {
+        Access::WRITE_OK
+    };
+    match rustix::fs::access(path, wanted) {
+        Ok(()) => Ok(Some(true)),
+        Err(Errno::ACCESS | Errno::ROFS | Errno::PERM) => Ok(Some(false)),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// See the Unix half: there is nothing to ask here without trying.
+#[cfg(not(unix))]
+pub fn may_write(_path: &Path, _directory: bool) -> std::io::Result<Option<bool>> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;

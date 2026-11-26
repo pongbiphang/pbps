@@ -1,10 +1,14 @@
 //! Readiness questions for a SQLite file (`pbps doctor`, SPEC §14.1, #2950).
 //!
-//! SQLite has no accounts or SQL `GRANT`s: deployment readiness depends on OS
-//! permissions on the database file and its directory (journal and lock sidecar)
-//! and readability/writability of existing ledger tables. Absent, empty and
-//! unreadable stay three answers: an absent ledger is not a gap, and a busy,
-//! unlinked, unreadable or `journal_mode = OFF` database returns `Err`.
+//! SQLite has no accounts or SQL `GRANT`s: what stops a deployment on a file is
+//! whether this process may write the file and create a journal beside it.
+//! `doctor` writes nothing and tries nothing (DECISIONS 38), so each is asked:
+//! the connection for what it knows, the operating system for the rest. No
+//! lock is taken, so the check can run beside a writer. The apply's preflight
+//! is what tries, before it changes anything.
+//!
+//! Absent, empty and unreadable stay three answers: an absent ledger is not a
+//! gap, and a file that is gone or whose journal is off is an error.
 
 use std::path::Path;
 use std::time::Duration;
@@ -12,19 +16,14 @@ use std::time::Duration;
 use pbps_db::DbError;
 use pbps_db::doctor::{PermissionGap, Permissions};
 use pbps_db::ledger::{LOCK_TABLE_NAME, STATE_TABLE_NAME};
-use pbps_db::sqlite::Connection;
+use pbps_db::sqlite::{Connection, may_write};
 use pbps_model::escape::Escaped;
 
 use crate::ident;
-use crate::preflight::{WriteProbe, probe_writable_within};
+use crate::preflight::journal_off;
 use crate::state::{BUSY_WAIT, LOCK_TABLE, STATE_TABLE, database_file, occupants, waiting};
 
-/// `SQLITE_READONLY_DBMOVED`.
-const READONLY_MOVED: u32 = 1032;
-
-/// Checks database file access, journal-directory writability, and access to
-/// existing ledger/lock tables. Uses [`probe_writable_within`], which runs
-/// inside a rolled-back transaction and refuses if `journal_mode = OFF`.
+/// What a deployment on this file needs and this process lacks.
 pub fn permissions(c: &Connection) -> Result<Permissions, DbError> {
     permissions_within(c, BUSY_WAIT)
 }
@@ -35,70 +34,89 @@ pub(crate) fn permissions_within(c: &Connection, wait: Duration) -> Result<Permi
         Ok(path) => path,
         Err(why) => return Err(DbError::Refused(why.reason())),
     };
-    // The file is not opened a second time to ask: closing any descriptor of
-    // a file drops this process's POSIX locks on it, SQLite's own included.
-    // SQLite answers through the probe below.
 
     // Absent ledger tables are not a gap; non-table occupants are left to
     // `ledger_problems` (`ledger.untrusted`) so they stay exit-2 findings.
-    let tables = existing_ledger_tables(c, wait)?;
-    for &qualified in &tables {
+    for qualified in existing_ledger_tables(c, wait)? {
         waiting(c, wait, || {
             c.query(&format!("SELECT 1 FROM {qualified} LIMIT 0"), &[])
         })?;
     }
 
-    let extra_sql: Vec<String> = tables
-        .iter()
-        .map(|table| format!("DELETE FROM {table} WHERE 0"))
-        .collect();
-    let extra_refs: Vec<&str> = extra_sql.iter().map(String::as_str).collect();
-    match probe_writable_within(c, wait, &extra_refs)? {
-        WriteProbe::Writable => {}
-        WriteProbe::JournalOff(line) => return Err(DbError::Refused(line)),
-        WriteProbe::ReadOnlyDirectory { code } => {
-            let securable = path
-                .as_deref()
-                .and_then(Path::parent)
-                .filter(|dir| !dir.as_os_str().is_empty())
-                .map_or_else(
-                    || "the database directory".to_owned(),
-                    |d| format!("database directory `{}`", Escaped(&d.display().to_string())),
-                );
+    // The apply refuses a connection with no journal, so it is not ready.
+    if let Some(line) = journal_off(c)? {
+        return Err(DbError::Refused(line));
+    }
+    if query_only(c)? {
+        gaps.push(PermissionGap {
+            permission: "WRITE",
+            securable: "the database connection".to_owned(),
+            why: "`PRAGMA query_only` is on, so this connection is read-only; deployments \
+                  write through it"
+                .to_owned(),
+        });
+    }
+
+    // The file is not opened a second time to ask: closing any descriptor of
+    // a file drops this process's POSIX locks on it, SQLite's own included.
+    if let Some(path) = path.as_deref() {
+        let shown = |p: &Path| Escaped(&p.display().to_string()).to_string();
+        if !asked(path, false)? {
             gaps.push(PermissionGap {
                 permission: "WRITE",
-                securable,
-                why: format!(
-                    "SQLite cannot create its journal beside the database file (code {code}); \
-                     deployments need write access to this directory"
-                ),
+                securable: format!("database file `{}`", shown(path)),
+                why: "the operating system does not let this process write the file".to_owned(),
             });
         }
-        // The file was moved or removed under the open connection: nothing
-        // was learnt about the file a deployment would open.
-        WriteProbe::ReadOnly { code } if code == READONLY_MOVED => {
-            return Err(DbError::Refused(format!(
-                "the database file was moved or removed while it was open (SQLite code {code}); \
-                 what this process may do to it could not be read"
-            )));
+        let directory = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if !asked(directory, true)? {
+            gaps.push(PermissionGap {
+                permission: "WRITE",
+                securable: format!("database directory `{}`", shown(directory)),
+                why: "SQLite creates its journal beside the database file, and the operating \
+                      system does not let this process create a file in this directory"
+                    .to_owned(),
+            });
         }
-        WriteProbe::ReadOnly { code } => gaps.push(PermissionGap {
-            permission: "WRITE",
-            securable: path.as_deref().map_or_else(
-                || "the database connection".to_owned(),
-                |p| format!("database file `{}`", Escaped(&p.display().to_string())),
-            ),
-            why: format!(
-                "SQLite cannot write to this database (code {code}): the file, its \
-                 directory or the connection (`PRAGMA query_only`) is read-only"
-            ),
-        }),
     }
 
     Ok(Permissions {
         gaps,
         ..Permissions::default()
     })
+}
+
+/// The operating system's answer, with "nothing to ask on this platform" read
+/// as no gap found and everything else that is not an answer as an error.
+fn asked(path: &Path, directory: bool) -> Result<bool, DbError> {
+    match may_write(path, directory) {
+        Ok(answer) => Ok(answer.unwrap_or(true)),
+        // Nothing was learnt about the file a deployment would open.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(DbError::Refused(format!(
+                "`{}` was moved or removed while the database was open; what this process may \
+                 do to it could not be read",
+                Escaped(&path.display().to_string())
+            )))
+        }
+        Err(error) => Err(DbError::Refused(format!(
+            "what this process may do to `{}` could not be read: {error}",
+            Escaped(&path.display().to_string())
+        ))),
+    }
+}
+
+fn query_only(c: &Connection) -> Result<bool, DbError> {
+    let rows = c.query("PRAGMA query_only", &[])?;
+    match rows.first() {
+        Some(row) => Ok(row.integer(0)? != 0),
+        None => Err(DbError::BadRow(
+            "`PRAGMA query_only` returned no row".into(),
+        )),
+    }
 }
 
 fn existing_ledger_tables(c: &Connection, wait: Duration) -> Result<Vec<&'static str>, DbError> {
