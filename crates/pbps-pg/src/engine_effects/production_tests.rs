@@ -155,12 +155,15 @@ fn read_input(
         before,
         after,
         &Postgres::new().with_server_version(180000),
-    );
+    )
+    .expect("read the analysis baseline");
     assert!(fx.unowned.is_empty(), "{:?}", fx.unowned);
     let g = graph(
         ops.as_slice(),
         &fx.effects,
-        &Baseline::of(before, &owners).with_symbolic(fx.symbolic.clone()),
+        &Baseline::of(before, &owners)
+            .expect("read the test baseline")
+            .with_symbolic(fx.symbolic.clone()),
         &Default::default(),
         Checks::ALL,
     );
@@ -235,6 +238,73 @@ fn an_unread_expression_binding_does_not_turn_into_an_empty_binding_set() {
 }
 
 #[test]
+fn scoped_membership_analysis_refuses_an_unreadable_baseline_name() {
+    use pbps_model::operation::{OwnerError, Owners, Spelling};
+    use pbps_model::{ColumnRef, RoleName, Uid};
+
+    struct Unreadable<'a>(PlanOwners<'a>, TableName);
+    impl Owners for Unreadable<'_> {
+        fn table(&self, name: &TableName, spelling: Spelling) -> Result<Uid, OwnerError> {
+            if name == &self.1 && spelling == Spelling::Base {
+                return Err(OwnerError::Names {
+                    name: name.shown().to_string(),
+                    spelling,
+                    why: "two holders".to_string(),
+                });
+            }
+            self.0.table(name, spelling)
+        }
+        fn column(&self, column: &ColumnRef, spelling: Spelling) -> Result<Uid, OwnerError> {
+            self.0.column(column, spelling)
+        }
+        fn role(&self, name: &RoleName, spelling: Spelling) -> Result<Uid, OwnerError> {
+            self.0.role(name, spelling)
+        }
+    }
+
+    let mut s = scene(false);
+    let name = TableName::new("app", "unreadable");
+    s.before.tables.insert(name.clone(), Table::default());
+    let planned = [
+        PlannedChange::new(Change::Column(ColumnChange::AlterColumnDefault {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: "app.p.d".parse().unwrap(),
+            from: Some("1".into()),
+            to: Some("7".into()),
+        })),
+        PlannedChange::new(attach(&s)),
+    ];
+    let ops = Operations::of_plan(&planned, ModuleEdits::Rebuilt);
+    let normal = PlanOwners::new(
+        PlanNames::of(&planned, &s.ids).unwrap(),
+        &s.base_ids,
+        &s.ids,
+    );
+    let before = Snapshot {
+        schema: &s.before,
+        ids: &s.base_ids,
+    };
+    let after = Snapshot {
+        schema: &s.after,
+        ids: &s.ids,
+    };
+    let pg = Postgres::new().with_server_version(180000);
+    let analyse = |owners: &dyn Owners| {
+        pbps_diff::order::analyse_with_membership(&ops, owners, before, after, &pg, None, None)
+    };
+    let readable = analyse(&normal).expect("read the membership baseline");
+    assert!(!readable.effects[0].symbolic.is_empty());
+    assert_eq!(
+        analyse(&Unreadable(normal, name.clone())).err(),
+        Some(OwnerError::Names {
+            name: name.shown().to_string(),
+            spelling: Spelling::Base,
+            why: "two holders".to_string(),
+        })
+    );
+}
+
+#[test]
 fn a_rebuilt_routines_binding_is_final_on_the_restored_parent_default() {
     use pbps_model::operation::{BoundInput, Incarnation, ObjectKey, symbolic::*};
     let mut s = scene(false);
@@ -298,7 +368,8 @@ fn a_rebuilt_routines_binding_is_final_on_the_restored_parent_default() {
         &pg,
         None,
         Some(&catalog),
-    );
+    )
+    .expect("read the analysis baseline");
     assert!(fx.unowned.is_empty(), "{:?}", fx.unowned);
     let write = fx.effects[1]
         .symbolic
@@ -381,7 +452,8 @@ fn unrelated_membership_trees_do_not_enter_an_active_familys_facts() {
             ids: &s.ids,
         },
         &Postgres::new().with_server_version(180000),
-    );
+    )
+    .expect("read the analysis baseline");
     assert_eq!(fx.symbolic.tables.len(), 2);
     assert!(fx.symbolic.members.is_empty());
     assert!(
@@ -538,6 +610,7 @@ fn a_partition_restoration_never_invents_a_goal_or_its_bindings() {
             },
             &Postgres::new().with_server_version(180000),
         )
+        .expect("read the analysis baseline")
         .effects
         .pop()
         .unwrap()
@@ -609,7 +682,8 @@ fn a_new_parent_keeps_its_existing_birth_and_attachment_contract() {
                 ids: &s.ids,
             },
             &pg,
-        );
+        )
+        .expect("read the analysis baseline");
         assert!(fx.unowned.is_empty());
         assert!(fx.effects.iter().all(|e| e.symbolic.is_empty()));
         assert_eq!(fx.symbolic, Default::default());
@@ -622,7 +696,8 @@ fn a_new_parent_keeps_its_existing_birth_and_attachment_contract() {
                     ids: &s.base_ids,
                 },
                 &owners,
-            ),
+            )
+            .expect("read the test baseline"),
             &Default::default(),
             Checks::ALL,
         );
@@ -721,6 +796,7 @@ fn ordinary_analysis_does_not_invent_membership_catalog_reads() {
             None,
             stored,
         )
+        .expect("read the analysis baseline")
     };
     let ordinary = pbps_diff::order::analyse_with_catalog(
         &ops,
@@ -735,7 +811,8 @@ fn ordinary_analysis_does_not_invent_membership_catalog_reads() {
         },
         &Postgres::new().with_server_version(180000),
         None,
-    );
+    )
+    .expect("read the analysis baseline");
     assert!(ordinary.unowned.is_empty());
     assert!(ordinary.effects.iter().all(|e| e.symbolic.is_empty()));
     assert_eq!(ordinary.symbolic, Default::default());

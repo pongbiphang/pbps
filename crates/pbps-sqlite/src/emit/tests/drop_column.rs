@@ -894,8 +894,9 @@ fn the_last_columns_drop_requires_its_replacement_to_exist_first() {
                 ids: &di,
             },
         );
-        let baseline = Baseline::of(before, &owners);
-        let shadowed = analyse(&ops, &owners, before, after, &Sqlite::default());
+        let baseline = Baseline::of(before, &owners).expect("read the test baseline");
+        let shadowed = analyse(&ops, &owners, before, after, &Sqlite::default())
+            .expect("read the analysis baseline");
         assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
         let ordered = reordered_operations(&ops, order);
         let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();

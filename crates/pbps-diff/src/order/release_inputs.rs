@@ -88,14 +88,17 @@ pub fn carry_inserts<S>(
         None,
         plan,
         &plan.annotation_edges()?,
-    );
+    )
+    .map_err(|e| e.to_string())?;
     if let Some((_, error)) = effects.unowned.first() {
         return Err(error.to_string());
     }
     let mut graph = graph(
         operations.as_slice(),
         &effects.effects,
-        &Baseline::of(base, &owners).with_symbolic(effects.symbolic.clone()),
+        &Baseline::of(base, &owners)
+            .map_err(|e| e.to_string())?
+            .with_symbolic(effects.symbolic.clone()),
         declared,
         Checks::ALL,
     );
@@ -385,9 +388,10 @@ mod tests {
                 end,
                 &pbps_dialect::MinimalDialect,
             )
+            .expect("read the analysis baseline")
             .report(
                 &operations,
-                &Baseline::of(base, &owners),
+                &Baseline::of(base, &owners).expect("read the test baseline"),
                 &ModuleDeps::new(),
             );
             let (lines, fails) = super::super::shadow::judge(
@@ -407,7 +411,12 @@ mod tests {
             );
             let wrong = super::super::reordered_operations(&operations, &[2, 3, 0, 1]);
             let wrong_report = analyse(&wrong, &owners, base, end, &pbps_dialect::MinimalDialect)
-                .report(&wrong, &Baseline::of(base, &owners), &ModuleDeps::new());
+                .expect("read the analysis baseline")
+                .report(
+                    &wrong,
+                    &Baseline::of(base, &owners).expect("read the test baseline"),
+                    &ModuleDeps::new(),
+                );
             assert!(
                 super::super::shadow::judge(
                     wrong.as_slice(),
@@ -533,7 +542,8 @@ mod tests {
                 ids: &ids,
             },
             &owners,
-        );
+        )
+        .expect("read the test baseline");
         let operations = Operations::of_plan(&plan.changes, ModuleEdits::InPlace);
         let ObjectKey::Column(a) = pbps_model::operation::column_key(&a) else {
             panic!("a column key was expected");

@@ -93,7 +93,8 @@ fn settle_requirements<S: Clone>(
         stored,
         &changes,
         &changes.annotation_edges()?,
-    );
+    )
+    .map_err(|e| e.to_string())?;
     if !effects.effects.iter().any(|fx| {
         fx.requires.iter().any(|r| {
             matches!(r, Requirement::BeforeRewrite(_))
@@ -110,7 +111,9 @@ fn settle_requirements<S: Clone>(
     let mut graph = graph(
         operations.as_slice(),
         &effects.effects,
-        &Baseline::of(base, &owners).with_symbolic(effects.symbolic.clone()),
+        &Baseline::of(base, &owners)
+            .map_err(|e| e.to_string())?
+            .with_symbolic(effects.symbolic.clone()),
         declared,
         Checks::ALL,
     );

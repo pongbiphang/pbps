@@ -129,11 +129,14 @@ fn a_partition_fallback_models_the_emitted_value_and_refuses_the_wrong_goal() {
         before,
         after,
         &Postgres::new().with_server_version(180000),
-    );
+    )
+    .expect("read the analysis baseline");
     let g = graph(
         ops.as_slice(),
         &fx.effects,
-        &Baseline::of(before, &owners).with_symbolic(fx.symbolic),
+        &Baseline::of(before, &owners)
+            .expect("read the test baseline")
+            .with_symbolic(fx.symbolic),
         &Default::default(),
         Checks::ALL,
     );

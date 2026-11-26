@@ -5,12 +5,59 @@ use pbps_model::PartitionChange;
 use pbps_model::TableChange;
 use pbps_model::TablePropertyChange;
 use pbps_model::operation::{
-    ModuleEdits, Operations, Origin, PlanOwners, Snapshot, Source as OriginSource, effects,
+    ModuleEdits, Operations, Origin, OwnerError, PlanOwners, Snapshot, Source as OriginSource,
+    Spelling, effects,
 };
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{Change, ChangeSet, Column, ModuleDeps, PlannedChange, Schema, Table};
 #[path = "../../../pbps-model/tests/support/rebuild.rs"]
 pub(super) mod fixture;
+
+pub(crate) fn with_vacant_baseline(check: impl FnOnce(Snapshot<'_>, &PlanOwners<'_>, OwnerError)) {
+    let (root, base, desired, addresses) = fixture::approval();
+    let owners = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
+        .with_rebuild_addresses(&root, &desired, &addresses)
+        .unwrap();
+    let name = &addresses[0].address;
+    let mut schema = Schema::default();
+    schema.tables.insert(name.clone(), Table::default());
+    check(
+        Snapshot {
+            schema: &schema,
+            ids: &base,
+        },
+        &owners,
+        OwnerError::Vacant {
+            name: name.shown().to_string(),
+            spelling: Spelling::Base,
+        },
+    );
+}
+
+#[test]
+fn baseline_construction_refuses_a_vacant_name() {
+    with_vacant_baseline(|before, owners, why| {
+        assert_eq!(Baseline::of(before, owners).err(), Some(why));
+    });
+}
+
+#[test]
+fn captured_observation_refuses_a_vacant_baseline_name() {
+    with_vacant_baseline(|before, owners, why| {
+        let refused = shadow::observe_with_owners(
+            &Operations::of_plan(&[], ModuleEdits::InPlace),
+            owners,
+            before,
+            before,
+            &MinimalDialect,
+            &ModuleDeps::new(),
+            shadow::Stage::Differ,
+            None,
+            &Default::default(),
+        );
+        assert_eq!(refused, Err(why));
+    });
+}
 
 #[test]
 fn rebuild_copy_precedes_analyze_by_effects_in_adversarial_input_order() {

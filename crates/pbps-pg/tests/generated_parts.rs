@@ -120,8 +120,8 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
             schema: &schema,
             ids: &ids,
         };
-        let baseline = Baseline::of(before, &owners);
-        let facts = analyse(&ops, &owners, before, after, &pg);
+        let baseline = Baseline::of(before, &owners).expect("read the test baseline");
+        let facts = analyse(&ops, &owners, before, after, &pg).expect("read the analysis baseline");
         assert!(facts.unowned.is_empty(), "{:?}", facts.unowned);
         let violations = verify(
             ops.as_slice(),

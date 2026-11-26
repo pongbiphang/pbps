@@ -614,7 +614,8 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         crate::order::shadow::Stage::Differ,
         None,
         cs.captured(),
-    );
+    )
+    .map_err(|e| Refusal(e.to_string()))?;
     crate::order::boundaries::replay(
         &mut cs,
         declared.sources.before,
@@ -733,14 +734,17 @@ fn keep_handover_dependents(
         ids: declared.sources.after,
     };
     let effects =
-        shadow::analyse_captured(&operations, &owners, before, after, dialect, None, captured);
+        shadow::analyse_captured(&operations, &owners, before, after, dialect, None, captured)
+            .map_err(|e| Refusal(e.to_string()))?;
     if let Some((_, error)) = effects.unowned.first() {
         return Err(Refusal(error.to_string()));
     }
     let graph = edges::graph(
         operations.as_slice(),
         &effects.effects,
-        &edges::Baseline::of(before, &owners).with_symbolic(effects.symbolic.clone()),
+        &edges::Baseline::of(before, &owners)
+            .map_err(|e| Refusal(e.to_string()))?
+            .with_symbolic(effects.symbolic.clone()),
         &declared.module_deps(),
         edges::Checks::ALL,
     );

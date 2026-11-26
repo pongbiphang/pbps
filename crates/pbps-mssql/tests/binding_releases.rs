@@ -72,9 +72,14 @@ fn analysed(
         schema: after,
         ids: &ids,
     };
-    let analysed = order::analyse(&ops, &owners, base, end, &Mssql);
+    let analysed =
+        order::analyse(&ops, &owners, base, end, &Mssql).expect("read the analysis baseline");
     assert!(analysed.unowned.is_empty(), "{:?}", analysed.unowned);
-    (ops, analysed.effects, Baseline::of(base, &owners))
+    (
+        ops,
+        analysed.effects,
+        Baseline::of(base, &owners).expect("read the test baseline"),
+    )
 }
 fn settle(before: &Schema, after: &Schema, plan: ChangeSet) -> Result<ChangeSet, String> {
     let ids = IdsFile::default();

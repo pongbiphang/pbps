@@ -175,7 +175,7 @@ fn independent_replay_rejects_premature_analysis_and_final_name_claims() {
         ids: prepared.target(),
     };
     let done = expand(&input, f.prepare().unwrap(), &pg).unwrap();
-    let baseline = order::Baseline::of(before, &owners);
+    let baseline = order::Baseline::of(before, &owners).expect("read the test baseline");
     let canonical = prepared.operations();
     let mut ops = done.operations.as_slice().to_vec();
     let copy = ops

@@ -736,7 +736,7 @@ impl NameFacts {
             (plan.base, plan.desired),
             plan.dialect,
             &slots,
-        );
+        )?;
         crate::deploy::refuse_uninventoried_occupants(
             cs,
             &self.occupants,
@@ -2367,11 +2367,12 @@ mod tests {
                     base,
                     end,
                     &pbps_pg::Postgres::new(),
-                );
+                )
+                .expect("read the analysis baseline");
                 pbps_diff::order::verify(
                     operations.as_slice(),
                     &effects.effects,
-                    &pbps_diff::order::Baseline::of(base, &owners),
+                    &pbps_diff::order::Baseline::of(base, &owners).expect("read the test baseline"),
                     &pbps_model::ModuleDeps::new(),
                 )
             };

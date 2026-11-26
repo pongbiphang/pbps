@@ -66,12 +66,13 @@ fn violations_ending_in(after: &Schema, logical: Vec<Change>, order: &[usize]) -
         schema: &schema,
         ids: &ids,
     };
-    let baseline = Baseline::of(snapshot, &owners);
+    let baseline = Baseline::of(snapshot, &owners).expect("read the test baseline");
     let ending = Snapshot {
         schema: after,
         ids: &ids,
     };
-    let shadowed = analyse(&ops, &owners, snapshot, ending, &Mssql);
+    let shadowed =
+        analyse(&ops, &owners, snapshot, ending, &Mssql).expect("read the analysis baseline");
     assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
     let ordered = pbps_diff::order::reordered_operations(&ops, order);
     let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
@@ -208,8 +209,9 @@ fn rows_written_while_a_foreign_key_is_rebuilt_do_not_wait_for_it() {
             schema: &schema,
             ids: &ids,
         };
-        let baseline = Baseline::of(snapshot, &owners);
-        let shadowed = analyse(&ops, &owners, snapshot, snapshot, &Mssql);
+        let baseline = Baseline::of(snapshot, &owners).expect("read the test baseline");
+        let shadowed =
+            analyse(&ops, &owners, snapshot, snapshot, &Mssql).expect("read the analysis baseline");
         pbps_diff::order::verify(
             ops.as_slice(),
             &shadowed.effects,
@@ -341,8 +343,10 @@ impl Diffed {
                 ids: &ids,
             },
         );
-        let baseline = Baseline::of(before, &owners);
-        let effects = analyse(&ops, &owners, before, after, &Mssql).effects;
+        let baseline = Baseline::of(before, &owners).expect("read the test baseline");
+        let effects = analyse(&ops, &owners, before, after, &Mssql)
+            .expect("read the analysis baseline")
+            .effects;
         Diffed {
             changes,
             ops,
@@ -603,8 +607,8 @@ fn violations_from(
             ids: &ids,
         },
     );
-    let baseline = Baseline::of(b, &owners);
-    let shadowed = analyse(&ops, &owners, b, a, &Mssql);
+    let baseline = Baseline::of(b, &owners).expect("read the test baseline");
+    let shadowed = analyse(&ops, &owners, b, a, &Mssql).expect("read the analysis baseline");
     let ordered = pbps_diff::order::reordered_operations(&ops, order);
     let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
     pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
@@ -842,7 +846,8 @@ fn a_callers_binding_requirement_reads_its_own_payload() {
                 ids: &ids,
             },
             &Mssql,
-        );
+        )
+        .expect("read the analysis baseline");
         assert!(fx.unowned.is_empty());
         assert_eq!(
             fx.effects[0].requires.contains(&Requirement::Is(
@@ -1679,7 +1684,8 @@ fn connected_callee_answers_override_folding_only_for_compared_names() {
             },
             &Mssql,
             facts.as_ref(),
-        );
+        )
+        .expect("read the analysis baseline");
         assert!(effects.unowned.is_empty());
         assert_eq!(
             effects.effects[0].requires.contains(&Requirement::Is(
@@ -1819,8 +1825,9 @@ fn replacement_violations(order: &[usize], keeps: bool) -> Vec<Violation> {
         schema: &declared,
         ids: &declared_ids,
     };
-    let baseline = Baseline::of(before, &owners);
-    let shadowed = analyse(&ops, &owners, before, after, &Mssql);
+    let baseline = Baseline::of(before, &owners).expect("read the test baseline");
+    let shadowed =
+        analyse(&ops, &owners, before, after, &Mssql).expect("read the analysis baseline");
     assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
     let ordered = pbps_diff::order::reordered_operations(&ops, order);
     let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
@@ -1898,8 +1905,9 @@ fn identity_replacement_violations(order: &[usize]) -> Vec<Violation> {
         schema: &declared,
         ids: &declared_ids,
     };
-    let baseline = Baseline::of(before, &owners);
-    let shadowed = analyse(&ops, &owners, before, after, &Mssql);
+    let baseline = Baseline::of(before, &owners).expect("read the test baseline");
+    let shadowed =
+        analyse(&ops, &owners, before, after, &Mssql).expect("read the analysis baseline");
     assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
     let ordered = pbps_diff::order::reordered_operations(&ops, order);
     let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();

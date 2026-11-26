@@ -157,7 +157,7 @@ fn one_split_origin_orders_source_temp_and_backup_reads_through_shared_slots() {
         schema: &desired,
         ids: &target,
     };
-    let baseline = Baseline::of(before, &owners);
+    let baseline = Baseline::of(before, &owners).expect("read the test baseline");
     let parts = vec![
         create_parent,
         create_leaf,

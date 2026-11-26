@@ -162,9 +162,10 @@ fn sql_server_default_holders_have_catalog_proof_and_a_retype_release_gap() {
             schema: &after,
             ids: &ids,
         };
-        let analysis = order::analyse(&ops, &owners, base, end, &Mssql);
+        let analysis =
+            order::analyse(&ops, &owners, base, end, &Mssql).expect("read the analysis baseline");
         assert!(analysis.unowned.is_empty(), "{:?}", analysis.unowned);
-        let baseline = order::Baseline::of(base, &owners);
+        let baseline = order::Baseline::of(base, &owners).expect("read the test baseline");
         assert_eq!(
             order::verify(
                 ops.as_slice(),
@@ -190,12 +191,13 @@ fn sql_server_default_holders_have_catalog_proof_and_a_retype_release_gap() {
             let names = PlanNames::of(&reversed.changes, &ids).unwrap();
             let owners = PlanOwners::new(names, &ids, &ids);
             let ops = Operations::of_plan(&reversed.changes, ModuleEdits::InPlace);
-            let a = order::analyse(&ops, &owners, base, end, &Mssql);
+            let a = order::analyse(&ops, &owners, base, end, &Mssql)
+                .expect("read the analysis baseline");
             assert!(
                 !order::verify(
                     ops.as_slice(),
                     &a.effects,
-                    &order::Baseline::of(base, &owners),
+                    &order::Baseline::of(base, &owners).expect("read the test baseline"),
                     &Default::default()
                 )
                 .is_empty()

@@ -203,7 +203,7 @@ fn fragment() -> (Operations, Vec<Effects>, Baseline, ChangeSet) {
         .iter()
         .map(|op| operation::effects(op, &owners, base, end).unwrap())
         .collect::<Vec<_>>();
-    let baseline = Baseline::of(base, &owners);
+    let baseline = Baseline::of(base, &owners).expect("read the test baseline");
     (ops, effects, baseline, ChangeSet { changes })
 }
 
