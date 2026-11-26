@@ -631,9 +631,12 @@ fn creation_sources<'a>(
 /// Column DDL before an empty root's first write has no values to rewrite.
 /// Object existence and generation input boundaries remain independently required.
 pub(super) fn empty_columns(cs: &ChangeSet, ids: &IdsFile) -> BTreeSet<usize> {
-    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids).ok();
-    let writes = first_writes(cs, names.as_ref());
-    creation_sources(cs, names.as_ref(), &writes)
+    let Ok(names) = pbps_model::plan_names::PlanNames::of(&cs.changes, ids) else {
+        // An unreadable history gives no proof of emptiness (DEC-2993.5).
+        return BTreeSet::new();
+    };
+    let writes = first_writes(cs, Some(&names));
+    creation_sources(cs, Some(&names), &writes)
         .into_iter()
         .enumerate()
         .filter_map(|(at, source)| {
@@ -658,7 +661,7 @@ pub fn risks(
 ) -> Vec<BTreeSet<RiskClass>> {
     use pbps_model::plan_names::{At, Holder, PlanNames};
 
-    let names = cs
+    let history = cs
         .changes
         .iter()
         .any(|p| {
@@ -669,14 +672,19 @@ pub fn risks(
                     | Change::Policy(PolicyChange::CreatePolicy { .. })
             )
         })
-        .then(|| PlanNames::of(&cs.changes, ids).ok())
-        .flatten();
+        .then(|| PlanNames::of(&cs.changes, ids));
+    let (names, unreadable_history) = match history {
+        Some(Ok(names)) => (Some(names), false),
+        Some(Err(_)) => (None, true),
+        None => (None, false),
+    };
     // Every replacement is unknown in both directions, even a mode flip
     // whose two intrinsic risks happen to agree. Table identity, not spelling,
     // keeps this pairing correct across renames and reused names (DEC-1173.1).
     let mut dropped = BTreeSet::new();
     let mut installed = BTreeSet::new();
     let mut policy_keys = BTreeMap::new();
+    let mut possible_replacements = BTreeSet::new();
     for (at, p) in cs.changes.iter().enumerate() {
         let (Change::Policy(PolicyChange::DropPolicy { table, name, .. })
         | Change::Policy(PolicyChange::CreatePolicy {
@@ -689,7 +697,10 @@ pub fn risks(
             continue;
         };
         let is_drop = matches!(&p.change, Change::Policy(PolicyChange::DropPolicy { .. }));
-        if let Some(names) = &names
+        if unreadable_history {
+            // The history cannot rule out a replacement (DEC-2993.5).
+            possible_replacements.insert(at);
+        } else if let Some(names) = &names
             && let Holder::Tracked(uid) = names.holder(table, At::Before(at))
         {
             let key = (uid.clone(), name.clone());
@@ -832,9 +843,10 @@ pub fn risks(
             {
                 risks.remove(&RiskClass::Constraint);
             }
-            if policy_keys
-                .get(&at)
-                .is_some_and(|key| replacements.contains(key))
+            if possible_replacements.contains(&at)
+                || policy_keys
+                    .get(&at)
+                    .is_some_and(|key| replacements.contains(key))
             {
                 risks.extend([RiskClass::Revoke, RiskClass::RowSecurity]);
             }

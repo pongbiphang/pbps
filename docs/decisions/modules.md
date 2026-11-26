@@ -2374,3 +2374,13 @@ Rejected:
 - Refusing the two history builds in `order/generated.rs` here. They are not owner lookups, and a refusal would refuse plans accepted today. That is a later slice.
 
 Pinned by the catalog movement and collision tests in `slot_tests.rs`, the missing-surface test in `rebuild/run/tests.rs`, the four answers at each lookup and the shared trigger read in the dialect's slot tests, and the SQL Server plan in `engine_effects.rs` that edits a trigger after a view replaces its table.
+
+<a id="dec-2993-5"></a>
+
+**DEC-2993.5. An unreadable name history gives no empty-column exemptions and keeps both policy replacement risks (#2993).** `empty_columns` returns an empty set when history construction fails. The failure gives no proof of emptiness. `risks` skips the build when the list needs no history. If the build fails, each policy drop and standing policy create carries `Revoke` and `RowSecurity`. The unreadable history cannot rule out a replacement. A readable history still pairs replacements by table identity and policy name.
+
+The live measurement counted 65,519 history builds in `empty_columns`. Of the 59 failures, 58 were in accepted plans. It counted 19,922 builds in `risks`. All 17 failures were in inputs refused elsewhere. [Issue measurement](https://github.com/pongbiphang/pbps/issues/2993#issuecomment-7185354652)
+
+`risks` has five release callers. Resolver preparation reads a provisional list. The failures in `empty_columns` show that a transient list can fail before an accepted plan settles. Returning an error could refuse a valid plan. `schema_diff/sort/finish.rs` derives risks for the partial report of a plan that already has an error. Passing owners from the callers would still require a fallback for that report.
+
+Pinned in `generated_tests.rs` by `unreadable_history_gives_no_empty_columns` and `unreadable_history_gives_paired_and_lone_standing_policies_both_risks`.

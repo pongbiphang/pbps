@@ -1,6 +1,8 @@
 //! Every Change kind has an independently stated structural-use pin (DEC-1503.6).
 use super::{TableUse, table_use};
 use pbps_model::change::DeleteCause;
+use pbps_model::ids::IdsError;
+use pbps_model::plan_names::{PlanNames, PlanNamesError};
 use pbps_model::*;
 
 #[test]
@@ -1183,8 +1185,174 @@ fn policy_replacement_follows_table_uid_across_rename_but_not_name_reuse() {
     }
 }
 
+fn with_retired_column_conversion(mut ids: IdsFile) -> IdsFile {
+    let retired: Uid = "c_299301".parse().unwrap();
+    ids.tombstones.insert(
+        retired.clone(),
+        Tombstone {
+            was: "app.a.old".into(),
+            dropped_at: "2026-10-25".into(),
+            reason: "unused".into(),
+            operator: "tester".into(),
+            require: None,
+        },
+    );
+    ids.conversions.insert(
+        retired,
+        Conversion {
+            from: "text".into(),
+            to: "integer".into(),
+            using: "old::integer".into(),
+            allowed_at: "2026-10-24".into(),
+            operator: "tester".into(),
+        },
+    );
+    ids
+}
+
+#[test]
+fn unreadable_history_gives_paired_and_lone_standing_policies_both_risks() {
+    let a = TableName::new("app", "a");
+    let b = TableName::new("app", "b");
+    let first: Uid = "t_299301".parse().unwrap();
+    let second: Uid = "t_299302".parse().unwrap();
+    let ids = IdsFile {
+        tables: [(first.clone(), a.clone()), (second.clone(), b.clone())].into(),
+        ..Default::default()
+    };
+    let swapped = IdsFile {
+        tables: [(first.clone(), b.clone()), (second.clone(), a.clone())].into(),
+        ..Default::default()
+    };
+    let retired = with_retired_column_conversion(ids.clone());
+    let rename = |uid, from, to| {
+        PlannedChange::new(Change::Table(TableChange::RenameTable {
+            uid,
+            from,
+            to,
+            defaults: vec![],
+        }))
+    };
+    let cycle = [
+        rename(first, a.clone(), b.clone()),
+        rename(second, b, a.clone()),
+    ];
+    let drop = PlannedChange::new(Change::Policy(PolicyChange::DropPolicy {
+        table: a.clone(),
+        name: "p".into(),
+        policy: RowPolicy::default(),
+    }));
+    let create = |name: &str, origin| {
+        PlannedChange::new(Change::Policy(PolicyChange::CreatePolicy {
+            table: a.clone(),
+            name: name.into(),
+            policy: RowPolicy {
+                restrictive: true,
+                ..Default::default()
+            },
+            origin,
+        }))
+    };
+    let created = create("fresh", RowSecurityOrigin::Created);
+    let standing = create("p", RowSecurityOrigin::Standing);
+    let delete_row = PlannedChange::new(Change::Row(RowChange::DeleteRow {
+        table: a.clone(),
+        key_column: "id".into(),
+        key: "1".into(),
+        cause: DeleteCause::Undeclared,
+        row: Default::default(),
+        dropped: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: None,
+    }));
+    let dialect = pbps_dialect::MinimalDialect;
+    for policy in [&drop, &standing] {
+        let cs = ChangeSet {
+            changes: vec![policy.clone()],
+        };
+        assert!(PlanNames::of(&cs.changes, &ids).is_ok());
+        assert_eq!(
+            super::risks(&cs, &ids, &dialect),
+            vec![[RiskClass::Revoke].into()]
+        );
+    }
+    let without_policy = ChangeSet {
+        changes: vec![delete_row.clone()],
+    };
+    assert_eq!(
+        super::risks(&without_policy, &retired, &dialect),
+        vec![[RiskClass::DataDelete].into()]
+    );
+
+    for policies in [vec![&drop, &standing], vec![&drop], vec![&standing]] {
+        let changes = |prefix: &[PlannedChange]| ChangeSet {
+            changes: prefix
+                .iter()
+                .chain(policies.iter().copied())
+                .chain([&created, &delete_row])
+                .cloned()
+                .collect(),
+        };
+        let collided = changes(&cycle);
+        assert!(matches!(
+            PlanNames::of(&collided.changes, &swapped),
+            Err(PlanNamesError::Collision { .. })
+        ));
+        let invalid_ids = changes(&[]);
+        assert!(matches!(
+            PlanNames::of(&invalid_ids.changes, &retired),
+            Err(PlanNamesError::Ids(IdsError::OrphanConversion { .. }))
+        ));
+        let both = [RiskClass::Revoke, RiskClass::RowSecurity].into();
+        let mut expected = vec![both; policies.len()];
+        expected.extend([Default::default(), [RiskClass::DataDelete].into()]);
+        assert_eq!(
+            super::risks(&collided, &swapped, &dialect)[cycle.len()..],
+            expected
+        );
+        assert_eq!(super::risks(&invalid_ids, &retired, &dialect), expected);
+    }
+}
+
 #[path = "generated_tests/dependency_index_tests.rs"]
 mod dependency_index;
+
+#[test]
+fn unreadable_history_gives_no_empty_columns() {
+    let table = TableName::new("app", "a");
+    let table_uid: Uid = "t_299301".parse().unwrap();
+    let column_uid: Uid = "c_299302".parse().unwrap();
+    let ids = IdsFile {
+        tables: [(table_uid.clone(), table.clone())].into(),
+        columns: [(column_uid.clone(), table.column("id"))].into(),
+        ..Default::default()
+    };
+    let cs = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
+                uid: table_uid,
+                name: table.clone(),
+                table: Box::default(),
+                beside_default: None,
+                moves_at_most: None,
+            })),
+            PlannedChange::new(Change::Column(ColumnChange::AddColumn {
+                uid: column_uid,
+                table,
+                name: "id".into(),
+                column: Box::new(Column::new("integer".parse().unwrap())),
+            })),
+        ],
+    };
+    assert_eq!(super::empty_columns(&cs, &ids), [1].into());
+    let retired = with_retired_column_conversion(ids);
+    assert!(matches!(
+        PlanNames::of(&cs.changes, &retired),
+        Err(PlanNamesError::Ids(IdsError::OrphanConversion { .. }))
+    ));
+    assert!(super::empty_columns(&cs, &retired).is_empty());
+}
 
 #[test]
 fn empty_column_effects_end_at_the_first_write_even_across_a_rename() {
