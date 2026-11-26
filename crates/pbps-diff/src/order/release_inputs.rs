@@ -394,21 +394,14 @@ mod tests {
                 &Baseline::of(base, &owners).expect("read the test baseline"),
                 &ModuleDeps::new(),
             );
-            let (lines, fails) = super::super::shadow::judge(
-                operations.as_slice(),
-                &report,
-                super::super::shadow::Stage::Differ,
-            );
-            assert!(!fails, "{lines:?}");
-            assert!(lines.iter().any(|line| line.starts_with("connected ")));
-            assert!(
-                super::super::shadow::judge(
-                    operations.as_slice(),
-                    &report,
-                    super::super::shadow::Stage::Final
-                )
-                .1
-            );
+            use super::super::shadow::{Stage, Verdict, Waiver, judge};
+            let findings = judge(operations.as_slice(), &report, Stage::Differ);
+            assert!(!findings.fails(), "{findings:?}");
+            assert!(findings.0.iter().any(|f| f.line.starts_with("connected ")
+                && f.verdict == Verdict::Waived(Waiver::Connected)));
+            let final_findings = judge(operations.as_slice(), &report, Stage::Final);
+            assert!(final_findings.fails(), "{final_findings:?}");
+            assert!(final_findings.0.iter().any(|f| f.verdict == Verdict::Fail));
             let wrong = super::super::reordered_operations(&operations, &[2, 3, 0, 1]);
             let wrong_report = analyse(&wrong, &owners, base, end, &pbps_dialect::MinimalDialect)
                 .expect("read the analysis baseline")
@@ -417,14 +410,9 @@ mod tests {
                     &Baseline::of(base, &owners).expect("read the test baseline"),
                     &ModuleDeps::new(),
                 );
-            assert!(
-                super::super::shadow::judge(
-                    wrong.as_slice(),
-                    &wrong_report,
-                    super::super::shadow::Stage::Differ
-                )
-                .1
-            );
+            let wrong_findings = judge(wrong.as_slice(), &wrong_report, Stage::Differ);
+            assert!(wrong_findings.fails(), "{wrong_findings:?}");
+            assert!(wrong_findings.0.iter().any(|f| f.verdict == Verdict::Fail));
             let mut catalog_only = report.clone();
             catalog_only.graph.edges.retain(|edge| {
                 !matches!(
@@ -434,14 +422,7 @@ mod tests {
             });
             // A standing declaration can hide the required-input effect
             // while an earlier trigger rebuild makes the catalog require it.
-            assert!(
-                !super::super::shadow::judge(
-                    operations.as_slice(),
-                    &catalog_only,
-                    super::super::shadow::Stage::Differ
-                )
-                .1
-            );
+            assert!(!judge(operations.as_slice(), &catalog_only, Stage::Differ).fails());
         }
         let schedule = carry_inserts(
             &plan,

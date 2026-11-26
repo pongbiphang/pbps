@@ -316,6 +316,84 @@ impl Shadowed {
     }
 }
 
+/// Why a finding that would fail the order check is set aside.
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Waiver {
+    /// No order can provide the missing prerequisite (DEC-1954.6).
+    Unprovided,
+    /// A later catalog pass owns computed-column or generated-input ordering
+    /// (DEC-1431.1, DEC-2228.1, DEC-2174.1, DEC-2291.1).
+    Connected,
+    /// The shared schedule owns rewrite edges and type or trigger handovers
+    /// (DEC-2228.1, DEC-1635.3, DEC-2100.1).
+    Scheduled,
+    /// A lasting name collision cannot be repaired by reordering (DEC-1964.2).
+    Contested,
+}
+
+/// What the order check does with a finding. It is decided where the finding
+/// is produced, from the typed condition there; the printed line only renders
+/// it, so a spelling can never change whether the run fails (DEC-2993.6).
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Verdict {
+    /// The order could be wrong: the run fails.
+    Fail,
+    /// Set aside for the named reason: recorded, and fails nothing.
+    Waived(Waiver),
+    /// Evidence for the recorder: it never fails the run.
+    Note,
+}
+
+/// One finding of the order check: its verdict and the line that shows it.
+#[cfg(any(test, debug_assertions))]
+#[derive(Debug)]
+pub(super) struct Finding {
+    pub(super) verdict: Verdict,
+    pub(super) line: String,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Finding {
+    fn fail(line: String) -> Self {
+        let verdict = Verdict::Fail;
+        Self { verdict, line }
+    }
+
+    fn waived(waiver: Waiver, detail: String) -> Self {
+        let label = match waiver {
+            Waiver::Unprovided => "unprovided",
+            Waiver::Connected => "connected",
+            Waiver::Scheduled => "scheduled",
+            Waiver::Contested => "slot contested",
+        };
+        Self {
+            verdict: Verdict::Waived(waiver),
+            line: format!("{label} {detail}"),
+        }
+    }
+
+    fn note(line: String) -> Self {
+        let verdict = Verdict::Note;
+        Self { verdict, line }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+#[derive(Debug)]
+pub(super) struct Findings(pub(super) Vec<Finding>);
+
+#[cfg(any(test, debug_assertions))]
+impl Findings {
+    pub(super) fn fails(&self) -> bool {
+        self.0.iter().any(|finding| match finding.verdict {
+            Verdict::Fail => true,
+            Verdict::Waived(_) | Verdict::Note => false,
+        })
+    }
+}
+
 /// Runs the effects and the verifier on the order the differ produced, in
 /// tests and debug builds only (DEC-1954.6).
 ///
@@ -351,7 +429,10 @@ pub(crate) fn observe_plan(
         // Reported, not failed: the plan's own ordering reads the same
         // baseline next and returns this as its refusal. A panic here would
         // replace that named refusal in every debug build.
-        sink(&operations, &[format!("names refused: {error}")], false);
+        sink(
+            &operations,
+            &Findings(vec![Finding::note(format!("names refused: {error}"))]),
+        );
     }
 }
 
@@ -457,7 +538,10 @@ pub(crate) fn observe_captured(
     let names = match PlanNames::of(&logical.changes, desired.ids) {
         Ok(names) => names,
         Err(error) => {
-            sink(&operations, &[format!("names refused: {error}")], false);
+            sink(
+                &operations,
+                &Findings(vec![Finding::note(format!("names refused: {error}"))]),
+            );
             return Ok(());
         }
     };
@@ -501,17 +585,14 @@ pub(super) fn observe_with_owners(
     let baseline = Baseline::of(before, owners)?;
     let shadowed = analyse_captured(operations, owners, before, after, dialect, facts, captured)?;
     let report = shadowed.report(operations, &baseline, declared);
-    let mut lines: Vec<String> = report
+    let mut findings: Vec<Finding> = report
         .unowned
         .iter()
-        .map(|(id, error)| format!("unowned {id}: {error}"))
+        .map(|(id, error)| Finding::note(format!("unowned {id}: {error}")))
         .collect();
     let ops = operations.as_slice();
-    let (violations, any) = judge(ops, &report, stage);
-    lines.extend(violations);
-    let (slot_lines, slot_fail) = judge_slots(ops, owners, before, dialect, facts, stage);
-    lines.extend(slot_lines);
-    let any = any || slot_fail;
+    findings.extend(judge(ops, &report, stage).0);
+    findings.extend(judge_slots(ops, owners, before, dialect, facts, stage).0);
     if std::env::var_os("PBPS_ORDER_SHADOW").is_some() {
         let kind = |i: usize| {
             format!("{:?}", ops[i].change())
@@ -521,20 +602,24 @@ pub(super) fn observe_with_owners(
                 .to_owned()
         };
         if report.graph.has_cycle(ops.len()) {
-            lines.push("cycle in the effect graph".to_owned());
+            findings.push(Finding::note("cycle in the effect graph".to_owned()));
         }
         for e in &report.graph.edges {
             if matches!(e.because, super::edges::Because::WriteWrite(_)) {
-                lines.push(format!("ww {} {}", kind(e.before), kind(e.after)));
+                findings.push(Finding::note(format!(
+                    "ww {} {}",
+                    kind(e.before),
+                    kind(e.after)
+                )));
             }
         }
-        lines.push(format!(
+        findings.push(Finding::note(format!(
             "ambiguous {} unmet {}",
             report.graph.ambiguous.len(),
             report.graph.unmet.len()
-        ));
+        )));
     }
-    sink(operations, &lines, any);
+    sink(operations, &Findings(findings));
     Ok(())
 }
 
@@ -550,9 +635,9 @@ pub(crate) fn clip(text: &mut String, max: usize) {
     text.truncate(end);
 }
 
-/// The verifier's findings as lines, and whether any of them fails the run.
+/// The effect verifier's findings and their verdicts.
 #[cfg(any(test, debug_assertions))]
-pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<String>, bool) {
+pub(super) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> Findings {
     let find = |id: OperationId| ops.iter().find(|o| o.id() == id);
     let name = |id: OperationId| {
         find(id).map_or_else(
@@ -605,117 +690,96 @@ pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<St
     } else {
         super::release_inputs::pending_consumers(&report.graph, ops)
     };
-    let violations: Vec<String> = report
+    let findings = report
         .violations
         .iter()
         .map(|v| match v {
-            Violation::Symbolic(problem) => format!("symbolic {problem}"),
+            Violation::Symbolic(problem) => Finding::fail(format!("symbolic {problem}")),
             Violation::Unmet {
                 operation,
                 requirement,
-            } if unprovided(*operation, requirement) => {
-                format!("unprovided {} needs {requirement:?}", name(*operation))
-            }
+            } if unprovided(*operation, requirement) => Finding::waived(
+                Waiver::Unprovided,
+                format!("{} needs {requirement:?}", name(*operation)),
+            ),
             Violation::Unmet {
                 operation,
                 requirement,
-            } => format!("unmet {} needs {requirement:?}", name(*operation)),
+            } => Finding::fail(format!("unmet {} needs {requirement:?}", name(*operation))),
             Violation::StillPresent { operation, key }
                 if unprovided(*operation, &Requirement::Absent(key.clone())) =>
             {
-                format!("unprovided {} needs {key:?} gone", name(*operation))
+                Finding::waived(
+                    Waiver::Unprovided,
+                    format!("{} needs {key:?} gone", name(*operation)),
+                )
             }
             Violation::StillPresent { operation, key }
                 if module_op(*operation) && computed(key) =>
             {
-                format!("connected {} needs {key:?} gone", name(*operation))
+                Finding::waived(
+                    Waiver::Connected,
+                    format!("{} needs {key:?} gone", name(*operation)),
+                )
             }
             Violation::StillPresent { operation, key } => {
-                format!("present {} needs {key:?} gone", name(*operation))
+                Finding::fail(format!("present {} needs {key:?} gone", name(*operation)))
             }
             Violation::Edge {
                 before,
                 after,
                 edge,
-            } if stage != Stage::Final && super::edges::connected_module_release(edge, ops) => {
-                format!(
-                    "connected {} must precede {} because {:?}",
+            } => {
+                let detail = format!(
+                    "{} must precede {} because {:?}",
                     name(*before),
                     name(*after),
                     edge.because
-                )
+                );
+                if (stage != Stage::Final && super::edges::connected_module_release(edge, ops))
+                    || pending_release[edge.before]
+                    || pending_release[edge.after]
+                {
+                    Finding::waived(Waiver::Connected, detail)
+                // The shared schedule owns rewrite edges and repairs the class order.
+                } else if stage == Stage::BeforeSchedule
+                    && matches!(edge.because, Because::BeforeRewrite(_))
+                {
+                    Finding::waived(Waiver::Scheduled, detail)
+                } else {
+                    Finding::fail(format!("edge {detail}"))
+                }
             }
-            Violation::Edge {
-                before,
-                after,
-                edge,
-            } if pending_release[edge.before] || pending_release[edge.after] => {
-                format!(
-                    "connected {} must precede {} because {:?}",
-                    name(*before),
-                    name(*after),
-                    edge.because
-                )
-            }
-            // The shared schedule owns this edge. Before it runs, record
-            // it rather than rejecting the class order it will repair.
-            Violation::Edge {
-                before,
-                after,
-                edge,
-            } if stage == Stage::BeforeSchedule
-                && matches!(edge.because, Because::BeforeRewrite(_)) =>
-            {
-                format!(
-                    "scheduled {} must precede {} because {:?}",
-                    name(*before),
-                    name(*after),
-                    edge.because
-                )
-            }
-            Violation::Edge {
-                before,
-                after,
-                edge,
-            } => format!(
-                "edge {} must precede {} because {:?}",
+            Violation::BrokenDeclared { before, after } => Finding::fail(format!(
+                "declared {} must precede {}",
                 name(*before),
-                name(*after),
-                edge.because
-            ),
-            Violation::BrokenDeclared { before, after } => {
-                format!("declared {} must precede {}", name(*before), name(*after))
-            }
+                name(*after)
+            )),
         })
         .collect();
-    let any = violations.iter().any(|v| {
-        !v.starts_with("unprovided ")
-            && !v.starts_with("connected ")
-            && !v.starts_with("scheduled ")
-    });
-    (violations, any)
+    Findings(findings)
 }
 
-/// The name slots' findings as lines, and whether any fails the run
+/// The name slots' findings and their verdicts
 /// (#1964, DEC-1964.2). A claim on a held name and a broken handover fail it;
 /// a comparison no fact answers is recorded as skipped, with the engine and
 /// whether the plan had the catalog's facts, and fails nothing.
 #[cfg(any(test, debug_assertions))]
-pub(crate) fn judge_slots(
+pub(super) fn judge_slots(
     ops: &[Operation],
     owners: &dyn Owners,
     before: Snapshot<'_>,
     dialect: &(impl Dialect + ?Sized),
     facts: Option<&pbps_dialect::slots::CatalogFacts>,
     stage: Stage,
-) -> (Vec<String>, bool) {
+) -> Findings {
     use super::slots::{SlotViolation, analyse, verify};
     let slots = analyse(ops, owners, before, dialect);
     // A name the models cannot read fails the run with its own text: the
-    // judge has lines to report and no other way to refuse.
+    // judge has no other way to refuse.
     let (violations, skipped) = match verify(ops, &slots, dialect, facts, owners, before) {
         Ok(found) => found,
-        Err(why) => return (vec![format!("slot replay: {why}")], true),
+        Err(why) => return Findings(vec![Finding::fail(format!("slot replay: {why}"))]),
     };
     // The class order has not visited after_the_rebuilds yet. Type and
     // constraint-trigger handovers join that existing slot settlement;
@@ -790,73 +854,90 @@ pub(crate) fn judge_slots(
     } else {
         "offline"
     };
-    let mut lines: Vec<String> = violations
+    // A handover the shared schedule still owns is set aside until that
+    // schedule has run. A lasting collision is never pending: no order
+    // repairs it, so it carries its own waiver.
+    let unless_pending = |violation: &SlotViolation, line: String| {
+        if is_pending(violation) {
+            Finding::waived(Waiver::Scheduled, line)
+        } else {
+            Finding::fail(line)
+        }
+    };
+    let mut findings: Vec<Finding> = violations
         .iter()
         .map(|v| match v {
             SlotViolation::MissingInput {
                 operation,
                 slot,
                 holder,
-            } => format!("slot input {} needs {holder:?} at {slot}", name(*operation)),
+            } => unless_pending(
+                v,
+                format!("slot input {} needs {holder:?} at {slot}", name(*operation)),
+            ),
             SlotViolation::Held {
                 operation,
                 slot,
                 holder,
-            } => format!(
-                "slot held {} claims {slot} held by {holder}",
-                name(*operation)
+            } => unless_pending(
+                v,
+                format!(
+                    "slot held {} claims {slot} held by {holder}",
+                    name(*operation)
+                ),
             ),
             SlotViolation::Contested {
                 operation,
                 slot,
                 holder,
-            } => format!(
-                "slot contested {} claims {slot} held by {holder}",
-                name(*operation)
+            } => Finding::waived(
+                Waiver::Contested,
+                format!("{} claims {slot} held by {holder}", name(*operation)),
             ),
             SlotViolation::IntermediateHeld {
                 operation,
                 slot,
                 holder,
-            } => format!(
-                "slot intermediate {} passes through {slot} held by {holder}",
-                name(*operation)
+            } => unless_pending(
+                v,
+                format!(
+                    "slot intermediate {} passes through {slot} held by {holder}",
+                    name(*operation)
+                ),
             ),
             SlotViolation::Edge {
                 before,
                 after,
                 slot,
-            } => format!(
-                "slot edge {} must precede {} because it frees {slot}",
-                name(*before),
-                name(*after)
+            } => unless_pending(
+                v,
+                format!(
+                    "slot edge {} must precede {} because it frees {slot}",
+                    name(*before),
+                    name(*after)
+                ),
             ),
         })
         .collect();
-    for (line, violation) in lines.iter_mut().zip(&violations) {
-        if is_pending(violation) {
-            *line = format!("scheduled {line}");
-        }
-    }
-    let fail = lines
-        .iter()
-        .any(|l| !l.starts_with("slot contested ") && !l.starts_with("scheduled "));
     for s in &skipped {
-        lines.push(format!(
+        findings.push(Finding::note(format!(
             "slot skipped {} {mode} {} claims {} beside {}",
             dialect.name(),
             s.operation,
             s.claimed,
             s.held
-        ));
+        )));
     }
     for (id, error) in &slots.unowned {
-        lines.push(format!("slot unowned {id}: {error}"));
+        findings.push(Finding::note(format!("slot unowned {id}: {error}")));
     }
     for id in &slots.unlowered {
-        lines.push(format!("slot unlowered {} {id}", dialect.name()));
+        findings.push(Finding::note(format!(
+            "slot unlowered {} {id}",
+            dialect.name()
+        )));
     }
-    (lines, fail)
+    Findings(findings)
 }
 
 /// Appends `text` to the report file, creating it.
@@ -871,8 +952,8 @@ pub(crate) fn write_report(path: &std::path::Path, text: &str) -> std::io::Resul
 }
 
 #[cfg(any(test, debug_assertions))]
-fn sink(operations: &Operations, lines: &[String], fail: bool) {
-    if lines.is_empty() {
+fn sink(operations: &Operations, findings: &Findings) {
+    if findings.0.is_empty() {
         return;
     }
     let who = std::thread::current()
@@ -882,10 +963,11 @@ fn sink(operations: &Operations, lines: &[String], fail: bool) {
     match std::env::var_os("PBPS_ORDER_SHADOW") {
         Some(path) => {
             // One write per call, so that threads do not interleave lines.
-            let text: String = lines
+            let text: String = findings
+                .0
                 .iter()
-                .map(|line| {
-                    let line = line.replace(['\n', '\t'], " ");
+                .map(|finding| {
+                    let line = finding.line.replace(['\n', '\t'], " ");
                     format!("{who}\t{}\t{line}\n", operations.len())
                 })
                 .collect();
@@ -899,7 +981,7 @@ fn sink(operations: &Operations, lines: &[String], fail: bool) {
                 panic!("the order report is incomplete: {error}");
             }
         }
-        None if fail => {
+        None if findings.fails() => {
             // The order itself, so the finding can be read without a rerun.
             let order: Vec<String> = operations
                 .as_slice()
@@ -912,7 +994,12 @@ fn sink(operations: &Operations, lines: &[String], fail: bool) {
                 .collect();
             panic!(
                 "the effects contradict this order:\n{}\nthe order:\n{}",
-                lines.join("\n"),
+                findings
+                    .0
+                    .iter()
+                    .map(|finding| finding.line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 order.join("\n")
             )
         }

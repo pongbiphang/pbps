@@ -2384,3 +2384,16 @@ The live measurement counted 65,519 history builds in `empty_columns`. Of the 59
 `risks` has five release callers. Resolver preparation reads a provisional list. The failures in `empty_columns` show that a transient list can fail before an accepted plan settles. Returning an error could refuse a valid plan. `schema_diff/sort/finish.rs` derives risks for the partial report of a plan that already has an error. Passing owners from the callers would still require a fallback for that report.
 
 Pinned in `generated_tests.rs` by `unreadable_history_gives_no_empty_columns` and `unreadable_history_gives_paired_and_lone_standing_policies_both_risks`.
+
+<a id="dec-2993-6"></a>
+
+**DEC-2993.6. The debug order check decides from a typed verdict on each finding (#2993).** Each finding fails, carries a named waiver, or is a note. The text only renders the finding. Reading the failure bit from a prefix lets a spelling change alter the result without a compile error.
+
+The same findings fail and the same lines appear in the same order. The recorder label counts and existing text assertions pin the output. Tests pair each waiver with a failing case and check that a note passes and a waiver prefix cannot disguise a failure.
+
+Rejected:
+
+- Calling the check as a refuser in release builds now. The design repairs a broken stated fact. The cost of the check in a release build is unmeasured.
+- Skipping typed waivers and writing the release settlement directly. The debug check and the settlement would each keep a waiver list, and the two would drift.
+
+Unread steps and release settlement belong to later pull requests for this issue.

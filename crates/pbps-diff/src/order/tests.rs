@@ -579,7 +579,7 @@ fn a_clean_order_verifies_clean() {
 
 #[test]
 fn an_obligation_nothing_can_provide_is_recorded_and_does_not_fail_the_run() {
-    use super::shadow::{Shadowed, Stage, judge};
+    use super::shadow::{Shadowed, Stage, Verdict, Waiver, judge};
     // The column is added to a table the baseline lacks and no operation
     // creates: the input disagrees with itself, and no order could meet it.
     let mut plan = create_then_add_column();
@@ -592,17 +592,19 @@ fn an_obligation_nothing_can_provide_is_recorded_and_does_not_fail_the_run() {
     }
     .report(&alone, &baseline, &ModuleDeps::new());
     assert!(!report.violations.is_empty(), "the replay still sees it");
-    let (lines, fails) = judge(alone.as_slice(), &report, Stage::Differ);
-    assert!(!fails, "{lines:?}");
+    let findings = judge(alone.as_slice(), &report, Stage::Differ);
+    assert!(!findings.fails(), "{findings:?}");
+    assert!(!findings.0.is_empty());
     assert!(
-        lines.iter().all(|l| l.starts_with("unprovided ")),
-        "{lines:?}"
+        findings.0.iter().all(|f| f.line.starts_with("unprovided ")
+            && f.verdict == Verdict::Waived(Waiver::Unprovided)),
+        "{findings:?}"
     );
 }
 
 #[test]
 fn an_obligation_some_order_could_meet_but_this_one_meets_too_late_fails_the_run() {
-    use super::shadow::{Shadowed, Stage, judge};
+    use super::shadow::{Shadowed, Stage, Verdict, judge};
     let plan = create_then_add_column();
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     let swapped = crate::order::reordered_operations(&ops, &[1, 0]);
@@ -612,14 +614,20 @@ fn an_obligation_some_order_could_meet_but_this_one_meets_too_late_fails_the_run
         unowned: Vec::new(),
     }
     .report(&swapped, &baseline, &ModuleDeps::new());
-    let (lines, fails) = judge(swapped.as_slice(), &report, Stage::Differ);
-    assert!(fails, "{lines:?}");
-    assert!(lines.iter().any(|l| l.starts_with("unmet ")), "{lines:?}");
+    let findings = judge(swapped.as_slice(), &report, Stage::Differ);
+    assert!(findings.fails(), "{findings:?}");
+    assert!(
+        findings
+            .0
+            .iter()
+            .any(|f| f.line.starts_with("unmet ") && f.verdict == Verdict::Fail),
+        "{findings:?}"
+    );
 }
 
 #[test]
 fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_fails() {
-    use super::shadow::{Shadowed, Stage, judge};
+    use super::shadow::{Shadowed, Stage, Verdict, Waiver, judge};
     // Only the parent is dropped: the child's key into it stands in the
     // baseline and nothing removes it, so no order could satisfy the drop.
     let mut standing = two_dropped_tables();
@@ -632,11 +640,13 @@ fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_
     }
     .report(&ops, &baseline, &ModuleDeps::new());
     assert!(!report.violations.is_empty(), "the replay still sees it");
-    let (lines, fails) = judge(ops.as_slice(), &report, Stage::Differ);
-    assert!(!fails, "{lines:?}");
+    let findings = judge(ops.as_slice(), &report, Stage::Differ);
+    assert!(!findings.fails(), "{findings:?}");
+    assert!(!findings.0.is_empty());
     assert!(
-        lines.iter().all(|l| l.starts_with("unprovided ")),
-        "{lines:?}"
+        findings.0.iter().all(|f| f.line.starts_with("unprovided ")
+            && f.verdict == Verdict::Waived(Waiver::Unprovided)),
+        "{findings:?}"
     );
     // The same drop with the child's own drop after it is an order that could
     // have been right.
@@ -649,9 +659,35 @@ fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_
         unowned: Vec::new(),
     }
     .report(&swapped, &baseline, &ModuleDeps::new());
-    let (lines, fails) = judge(swapped.as_slice(), &report, Stage::Differ);
-    assert!(fails, "{lines:?}");
-    assert!(lines.iter().any(|l| l.starts_with("present ")), "{lines:?}");
+    let findings = judge(swapped.as_slice(), &report, Stage::Differ);
+    assert!(findings.fails(), "{findings:?}");
+    assert!(
+        findings
+            .0
+            .iter()
+            .any(|f| f.line.starts_with("present ") && f.verdict == Verdict::Fail),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn a_note_never_fails_the_order_check() {
+    use super::shadow::{Finding, Findings, Verdict};
+    let findings = Findings(vec![Finding {
+        verdict: Verdict::Note,
+        line: "unowned step".into(),
+    }]);
+    assert!(!findings.fails());
+}
+
+#[test]
+fn a_failing_finding_fails_even_with_a_waiver_prefix() {
+    use super::shadow::{Finding, Findings, Verdict};
+    let findings = Findings(vec![Finding {
+        verdict: Verdict::Fail,
+        line: "unprovided prerequisite".into(),
+    }]);
+    assert!(findings.fails());
 }
 
 /// `t` with `id` and one more column, the plan renaming it from `a` to `b`;
@@ -1533,7 +1569,7 @@ fn computed_then(second: Change, id: Option<ModuleId>) -> (Operations, Vec<Effec
 
 #[test]
 fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change_is_not() {
-    use super::shadow::{Shadowed, Stage, judge};
+    use super::shadow::{Shadowed, Stage, Verdict, Waiver, judge};
     let judged_at =
         |stage: Stage, ops: &Operations, fx: &[Effects], baseline: &Baseline, order: &[usize]| {
             let reordered = crate::order::reordered_operations(ops, order);
@@ -1559,19 +1595,26 @@ fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change
         }),
         Some(id),
     );
-    let (lines, fails) = judged(&ops, &fx, &baseline, &[1, 0]);
-    assert!(!fails, "{lines:?}");
+    let findings = judged(&ops, &fx, &baseline, &[1, 0]);
+    assert!(!findings.fails(), "{findings:?}");
     assert!(
-        lines.iter().any(|l| l.starts_with("connected ")),
-        "{lines:?}"
+        findings
+            .0
+            .iter()
+            .any(|f| f.line.starts_with("connected ")
+                && f.verdict == Verdict::Waived(Waiver::Connected)),
+        "{findings:?}"
     );
     // Negative: on the order that runs nothing moves it afterwards, so the
     // same order fails there.
-    let (lines, fails) = judged_at(Stage::Final, &ops, &fx, &baseline, &[1, 0]);
-    assert!(fails, "{lines:?}");
+    let findings = judged_at(Stage::Final, &ops, &fx, &baseline, &[1, 0]);
+    assert!(findings.fails(), "{findings:?}");
     assert!(
-        lines.iter().all(|l| !l.starts_with("connected ")),
-        "{lines:?}"
+        findings
+            .0
+            .iter()
+            .all(|f| !f.line.starts_with("connected ") && f.verdict == Verdict::Fail),
+        "{findings:?}"
     );
     // Negative: the same requirement on a column drop is an order the
     // differ itself makes, and fails.
@@ -1582,9 +1625,15 @@ fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change
         }),
         None,
     );
-    let (lines, fails) = judged(&ops, &fx, &baseline, &[1, 0]);
-    assert!(fails, "{lines:?}");
-    assert!(lines.iter().any(|l| l.starts_with("present ")), "{lines:?}");
+    let findings = judged(&ops, &fx, &baseline, &[1, 0]);
+    assert!(findings.fails(), "{findings:?}");
+    assert!(
+        findings
+            .0
+            .iter()
+            .any(|f| f.line.starts_with("present ") && f.verdict == Verdict::Fail),
+        "{findings:?}"
+    );
 }
 
 fn update_pid(id: i64, parent: i64) -> PlannedChange {
@@ -5167,18 +5216,19 @@ fn a_before_rewrite_requirement_orders_every_other_rewrite_without_requiring_pre
         unowned: vec![],
     }
     .report(&ops, &base, &declared);
-    for stage in [
-        super::shadow::Stage::BeforeSchedule,
-        super::shadow::Stage::Differ,
-        super::shadow::Stage::Final,
-    ] {
-        let (lines, fails) = super::shadow::judge(ops.as_slice(), &report, stage);
-        assert!(!lines.is_empty());
-        assert_eq!(
-            fails,
-            stage != super::shadow::Stage::BeforeSchedule,
-            "{lines:?}"
-        );
+    use super::shadow::{Stage, Verdict, Waiver, judge};
+    let pending = judge(ops.as_slice(), &report, Stage::BeforeSchedule);
+    assert!(!pending.fails(), "{pending:?}");
+    assert!(
+        pending
+            .0
+            .iter()
+            .any(|f| f.verdict == Verdict::Waived(Waiver::Scheduled))
+    );
+    for stage in [Stage::Differ, Stage::Final] {
+        let findings = judge(ops.as_slice(), &report, stage);
+        assert!(findings.fails(), "{findings:?}");
+        assert!(findings.0.iter().any(|f| f.verdict == Verdict::Fail));
     }
     // An ordinary baseline-instance requirement intentionally does not order
     // an in-place rewrite (DEC-1954.4); releasing a binding needs its own term.
