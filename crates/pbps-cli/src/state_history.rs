@@ -130,19 +130,21 @@ async fn read_entry(
         });
     };
     let id = stored.id;
-    let entry = stored.read().map_err(|error| {
-        let finding = match &error {
-            Unreadable::UnsupportedVersion(_) => "state.entry-unsupported-version",
-            Unreadable::Malformed(_) | Unreadable::Denied(_) => "state.unreadable",
-        };
-        Refusal::new(
-            finding,
-            format!(
-                "{shown_label}: entry #{id}'s snapshot is unreadable: {}",
-                Text::new(error.to_string()).shown()
-            ),
-        )
-    })?;
+    let entry = stored
+        .read_for(engine::of(conn.driver()).dialect())
+        .map_err(|error| {
+            let finding = match &error {
+                Unreadable::UnsupportedVersion(_) => "state.entry-unsupported-version",
+                Unreadable::Malformed(_) | Unreadable::Denied(_) => "state.unreadable",
+            };
+            Refusal::new(
+                finding,
+                format!(
+                    "{shown_label}: entry #{id}'s snapshot is unreadable: {}",
+                    Text::new(error.to_string()).shown()
+                ),
+            )
+        })?;
     entry.snapshot.ids.clone().validated().map_err(|error| {
         let message = format!(
             "{shown_label}: entry #{id}'s snapshot has an inconsistent identity mapping: {error}"
@@ -656,6 +658,7 @@ mod tests {
             applied_at: "2026-10-23T00:00:00".into(),
             snapshot: StateSnapshot::new(
                 pbps_model::StateKind::Baseline,
+                "postgres",
                 schema,
                 Default::default(),
                 "operator",

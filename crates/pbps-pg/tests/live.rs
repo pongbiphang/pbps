@@ -12305,7 +12305,13 @@ async fn least_privilege_role(db: &mut TestDb, tag: &str) -> String {
 }
 
 fn snapshot(kind: StateKind) -> StateSnapshot {
-    StateSnapshot::new(kind, Schema::default(), IdsFile::default(), "live-test")
+    StateSnapshot::new(
+        kind,
+        "postgres",
+        Schema::default(),
+        IdsFile::default(),
+        "live-test",
+    )
 }
 
 /// SPEC §8.1: the whole state goes in and comes back out unchanged. Everything
@@ -35409,7 +35415,13 @@ async fn a_pre_issue_103_ledger_is_migrated_in_place_and_legacy_rows_still_list_
 
     let schema = schema_103(2, 1);
     let ids = mint_ids(&schema, &IdsFile::default(), &[]);
-    let legacy = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "pre-103-operator");
+    let legacy = StateSnapshot::new(
+        StateKind::Apply,
+        "postgres",
+        schema.clone(),
+        ids,
+        "pre-103-operator",
+    );
     let legacy_json = serde_json::to_string(&legacy).expect("serialize");
     db.conn
         .execute_with(
@@ -35494,7 +35506,13 @@ async fn a_fully_migrated_ledger_answers_the_timeline_without_reading_state_json
     let mut db = TestDb::create("denied103").await;
     let schema = schema_103(2, 1);
     let ids = mint_ids(&schema, &IdsFile::default(), &[]);
-    let snap = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "live-test");
+    let snap = StateSnapshot::new(
+        StateKind::Apply,
+        "postgres",
+        schema.clone(),
+        ids,
+        "live-test",
+    );
     state::record(&mut db.conn, &snap).await.expect("record");
 
     let role = format!("pbps_denied103_{}", std::process::id());
@@ -35699,7 +35717,13 @@ async fn timeline_answers_a_never_migrated_ledger_without_ever_calling_ensure_ta
 
     let schema = schema_103(2, 1);
     let ids = mint_ids(&schema, &IdsFile::default(), &[]);
-    let legacy = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "pre-103-operator");
+    let legacy = StateSnapshot::new(
+        StateKind::Apply,
+        "postgres",
+        schema.clone(),
+        ids,
+        "pre-103-operator",
+    );
     let legacy_json = serde_json::to_string(&legacy).expect("serialize");
     db.conn
         .execute_with(
@@ -35747,12 +35771,24 @@ async fn a_projected_row_from_a_newer_pbps_is_unsupported_not_ordinary_data() {
     let schema = schema_103(2, 1);
     let ids = mint_ids(&schema, &IdsFile::default(), &[]);
 
-    let ok = StateSnapshot::new(StateKind::Apply, schema.clone(), ids.clone(), "live-test");
+    let ok = StateSnapshot::new(
+        StateKind::Apply,
+        "postgres",
+        schema.clone(),
+        ids.clone(),
+        "live-test",
+    );
     state::record(&mut db.conn, &ok)
         .await
         .expect("record a row at a version this build reads");
 
-    let mut future = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "live-test");
+    let mut future = StateSnapshot::new(
+        StateKind::Apply,
+        "postgres",
+        schema.clone(),
+        ids,
+        "live-test",
+    );
     future.version = pbps_model::state::CURRENT_VERSION + 1;
     state::record(&mut db.conn, &future)
         .await
@@ -36003,6 +36039,7 @@ async fn the_legacy_fallback_batches_past_postgresqls_parameter_ceiling() {
     let ids = mint_ids(&schema, &IdsFile::default(), &[]);
     let legacy = StateSnapshot::new(
         StateKind::Apply,
+        "postgres",
         schema.clone(),
         ids,
         "bulk-legacy-operator",
@@ -36950,7 +36987,13 @@ async fn doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets(
         .collect();
 
     // Only the recorded identities supply the scope after declarations vanish.
-    let recorded = StateSnapshot::new(StateKind::Baseline, scoped.schema.clone(), ids, "live-test");
+    let recorded = StateSnapshot::new(
+        StateKind::Baseline,
+        "postgres",
+        scoped.schema.clone(),
+        ids,
+        "live-test",
+    );
     state::record(&mut theirs, &recorded).await.unwrap();
     let recorded_only = doctor::missing(&grant_diagnosis(&mut theirs, &Default::default()).await);
     db.conn.execute("ALTER TABLE public.t OWNER TO postgres; ALTER VIEW public.v OWNER TO postgres; ALTER FUNCTION public.f(integer) OWNER TO postgres").await.unwrap();
@@ -37126,7 +37169,13 @@ async fn doctor_record_state(conn: &mut Conn, ids: &IdsFile, tables: &[&str]) {
     }
     state::record(
         conn,
-        &StateSnapshot::new(StateKind::Baseline, schema, ids.clone(), "doctor-live"),
+        &StateSnapshot::new(
+            StateKind::Baseline,
+            "postgres",
+            schema,
+            ids.clone(),
+            "doctor-live",
+        ),
     )
     .await
     .unwrap();
@@ -37137,6 +37186,7 @@ async fn doctor_record_ids(conn: &mut Conn, ids: &IdsFile) {
         conn,
         &StateSnapshot::new(
             StateKind::Baseline,
+            "postgres",
             Schema::default(),
             ids.clone(),
             "doctor-live",
@@ -37591,6 +37641,7 @@ async fn doctor_reports_an_absent_target_of_a_recorded_only_grant() {
         &mut theirs,
         &StateSnapshot::new(
             StateKind::Baseline,
+            "postgres",
             recorded,
             IdsFile::default(),
             "doctor-live",
@@ -37843,7 +37894,13 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
     );
     state::record(
         &mut theirs,
-        &StateSnapshot::new(StateKind::Baseline, schema, recorded.clone(), "doctor-live"),
+        &StateSnapshot::new(
+            StateKind::Baseline,
+            "postgres",
+            schema,
+            recorded.clone(),
+            "doctor-live",
+        ),
     )
     .await
     .unwrap();
@@ -38328,7 +38385,13 @@ async fn a_denied_legacy_row_leaves_the_callers_transaction_usable() {
         .expect("create the pre-#103 ledger");
     let schema = schema_103(1, 0);
     let ids = mint_ids(&schema, &IdsFile::default(), &[]);
-    let legacy = StateSnapshot::new(StateKind::Apply, schema, ids, "pre-103-operator");
+    let legacy = StateSnapshot::new(
+        StateKind::Apply,
+        "postgres",
+        schema,
+        ids,
+        "pre-103-operator",
+    );
     let legacy_json = serde_json::to_string(&legacy).expect("serialize");
     db.conn
         .execute_with(

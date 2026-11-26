@@ -103,7 +103,13 @@ fn artifacts() -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
     // These bytes pin the historical value-source wire layout. A later plan
     // format must not silently change the fixture's version or checksum.
     plan = plan.as_written_at(36);
-    let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids.clone(), "fixture");
+    let mut state = StateSnapshot::new(
+        StateKind::Apply,
+        "postgres",
+        schema.clone(),
+        ids.clone(),
+        "fixture",
+    );
     // Pin this historical envelope as the plan above is pinned. Adding
     // default-omitted table fields must preserve every fixture byte (#1172).
     state = state.as_written_at(25);

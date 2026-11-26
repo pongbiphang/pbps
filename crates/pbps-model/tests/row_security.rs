@@ -89,7 +89,7 @@ fn row_security_state_changes_the_checksum_but_default_fields_keep_old_bytes() {
         .row_policies
         .insert("p".into(), RowPolicy::default());
     assert_ne!(state_checksum(&schema, &ids), checksum);
-    let snap = StateSnapshot::new(StateKind::Apply, schema, ids, "test");
+    let snap = StateSnapshot::new(StateKind::Apply, "postgres", schema, ids, "test");
     assert_eq!(snap.version, pbps_model::state::CURRENT_VERSION);
     let json = serde_json::to_string(&snap).unwrap();
     assert_eq!(StateSnapshot::from_json(&json).unwrap(), snap);
@@ -111,6 +111,7 @@ fn historical(state: &StateSnapshot) -> String {
 fn row_security_absence_in_legacy_states_is_disabled_without_policies() {
     let mut state = StateSnapshot::new(
         StateKind::Apply,
+        "postgres",
         Schema {
             tables: [(TableName::new("app", "t"), Table::default())].into(),
             ..Default::default()

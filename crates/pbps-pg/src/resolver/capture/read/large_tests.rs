@@ -90,6 +90,7 @@ async fn exercise_large_catalog(connection: String) {
     let pulled = crate::catalog::introspect(&mut conn).await.unwrap();
     let snapshot = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Bootstrap,
+        "postgres",
         pulled.schema,
         pbps_model::IdsFile::default(),
         "large-capture-fixture",

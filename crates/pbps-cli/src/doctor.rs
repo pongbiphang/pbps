@@ -1786,6 +1786,7 @@ mod tests {
             applied_at: "2026-10-04T00:00:00.000".into(),
             snapshot: pbps_model::StateSnapshot::new(
                 pbps_model::StateKind::Apply,
+                "postgres",
                 recorded.schema.clone(),
                 ids("src", "p"),
                 "ci-deploy",
@@ -1949,6 +1950,7 @@ mod tests {
             applied_at: "2026-10-04T00:00:00.000".into(),
             snapshot: pbps_model::StateSnapshot::new(
                 pbps_model::StateKind::Apply,
+                "postgres",
                 recorded.schema.clone(),
                 ids.clone(),
                 "ci-deploy",

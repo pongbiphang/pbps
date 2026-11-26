@@ -1376,3 +1376,18 @@ Rejected:
 - **Default ledger methods on the `Engine` trait.** The trait would then own the flow and every engine's spec would have to be reachable through it; a free function that takes the spec leaves the trait as it is.
 - **The flow in `pbps-dialect`.** It has no connection.
 - **A trait with one method per statement.** Plain data can be listed and tested as data; methods cannot be enumerated, so the statement tests would go back to hand-kept lists.
+
+<a id="dec-3073-1"></a>
+
+**DEC-3073.1. A state snapshot records the engine it was recorded on, and a reader refuses another engine's (#3073).** A saved plan has always carried its dialect, and `apply --plan` refuses a plan of another engine by name. A snapshot carried none, so `plan --base` with a snapshot file from another engine was loaded and compared: the user was told that every table had disappeared from the declarations, when the mistake was the file.
+
+- **The field is optional and written by the stamp.** `StateSnapshot::dialect` is the engine's name as the saved plan spells it. `StateSnapshot::new`, `stamp` and `recording_data_work` take it as an argument, so a path that records a snapshot without saying the engine does not compile. A snapshot written before the field has none and is accepted as before.
+- **A snapshot file is checked against the project.** `plan --base` refuses a present, different name with both names, after the version and the build are checked (the order `apply --plan` uses) and before the identities are validated, the identity files are written or anything is compared.
+- **A ledger row is checked against its database.** A row in a database's own ledger that names another engine cannot be written by this tool. It is read as malformed, through the reader that every read which decodes a row already uses, so nothing that compares or plans from a row takes such a one. The SQL Server resolver's capture does not decode the row: it carries the stored text as a seal, to tell whether the ledger moved between two captures, and checks the engine no more than it checks the version or the build. Planning reads the ledger separately, through the reader.
+- **The engine says its name.** `Engine::dialect` and `LedgerSpec::dialect` give the name where only a connection is in hand. One test pins that each equals its `Dialect::name`, and that no two engines share one.
+- **The fingerprint moves and the number does not** (DEC-2412.3). The snapshot is not part of the published schema set, so nothing under `schemas/` changes.
+
+Rejected:
+- **Requiring the field from now on.** A snapshot without it is every snapshot written so far, and the hand-written ones in tests and documents. Refusing them buys nothing the build fingerprint does not already refuse.
+- **Setting the field where each snapshot is recorded.** One forgotten site writes a snapshot that every reader accepts on any engine; an argument cannot be forgotten.
+- **A new kind of unreadable entry for the ledger row.** It would be one more arm in every place that reports an unreadable entry, for a case that is corruption and is already reported as such.

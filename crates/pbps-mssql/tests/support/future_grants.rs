@@ -258,6 +258,7 @@ async fn hidden_denied_recorded_and_undeclared_grant_targets_keep_object_gaps() 
         &mut db.conn,
         &StateSnapshot::new(
             pbps_model::StateKind::Apply,
+            "mssql",
             recorded,
             IdsFile::default(),
             "live-test",
@@ -346,6 +347,7 @@ async fn future_grant_proof_respects_collation_missing_schemas_and_recorded_modu
         &mut db.conn,
         &StateSnapshot::new(
             pbps_model::StateKind::Apply,
+            "mssql",
             recorded,
             IdsFile::default(),
             "live-test",

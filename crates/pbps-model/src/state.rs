@@ -361,6 +361,13 @@ pub struct StateSnapshot {
     /// snapshot before version 52. Set only by [`StateSnapshot::stamp`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format_fingerprint: Option<String>,
+    /// The dialect of the engine that recorded this snapshot, spelt as the
+    /// saved plan spells it (`mssql`, `postgres`, …). Absent in snapshots
+    /// written before this field existed; an absent value is accepted as before.
+    /// Set by [`StateSnapshot::stamp`]. A reader refuses another engine's
+    /// (DEC-3073.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
     /// Absent in versions 6–30: no evidence, so the parent refusal remains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_evidence: Option<crate::baseline_evidence::BaselineEvidence>,
@@ -463,10 +470,17 @@ impl StagedProgress {
 }
 
 impl StateSnapshot {
-    pub fn new(kind: StateKind, schema: Schema, ids: IdsFile, operator: impl Into<String>) -> Self {
+    pub fn new(
+        kind: StateKind,
+        dialect: impl Into<String>,
+        schema: Schema,
+        ids: IdsFile,
+        operator: impl Into<String>,
+    ) -> Self {
         let mut snapshot = Self {
             version: 0,
             format_fingerprint: None,
+            dialect: None,
             baseline_evidence: None,
             kind,
             data_work: None,
@@ -481,25 +495,28 @@ impl StateSnapshot {
             staged: None,
             declared: Declared::default(),
         };
-        snapshot.stamp();
+        snapshot.stamp(dialect);
         snapshot
     }
 
-    /// Records this build's format number and fingerprint together.
+    /// Records this build's format number, fingerprint and engine dialect together.
     ///
-    /// The one place either is written, so a row re-stamped by a later write
-    /// cannot take the number and keep another build's fingerprint (DEC-2412.2).
-    pub fn stamp(&mut self) {
+    /// The one place any of them is written, so a row re-stamped by a later write
+    /// cannot take the number and keep another build's fingerprint (DEC-2412.2) or
+    /// drop the engine that recorded it.
+    pub fn stamp(&mut self, dialect: impl Into<String>) {
         self.version = CURRENT_VERSION;
         self.format_fingerprint = Some(format_identity().to_owned());
+        self.dialect = Some(dialect.into());
     }
 
     /// A snapshot as a build at `version` wrote it, for a test that compares it
-    /// with bytes captured then. Such a build recorded no fingerprint.
+    /// with bytes captured then. Such a build recorded no fingerprint or dialect.
     #[doc(hidden)]
     pub fn as_written_at(mut self, version: u32) -> Self {
         self.version = version;
         self.format_fingerprint = None;
+        self.dialect = None;
         self
     }
 
@@ -507,6 +524,7 @@ impl StateSnapshot {
     /// reporting checkout, which may be on another branch (DEC-2402.1).
     pub fn recording_data_work(
         &self,
+        dialect: impl Into<String>,
         work: crate::DataWorkRecord,
         operator: String,
         reason: crate::Reason,
@@ -519,7 +537,7 @@ impl StateSnapshot {
             ));
         }
         let mut next = self.clone();
-        next.stamp();
+        next.stamp(dialect);
         next.kind = StateKind::DataWork;
         next.data_work = Some(work);
         // The copied row's assertions belong to the apply that wrote it, not
@@ -573,6 +591,35 @@ impl StateSnapshot {
     /// `check_version_number` carries the reason.
     pub fn check_version(&self) -> Result<(), String> {
         check_version_number(self.version)
+    }
+
+    /// Refuses a snapshot whose recorded `dialect` is present and differs from
+    /// `expected`, naming both. An absent `dialect` (from before this field
+    /// existed) is accepted as before.
+    ///
+    /// `subject` names what `expected` belongs to (`"project"` for a snapshot
+    /// file, `"database"` for a ledger row).
+    pub fn check_dialect(&self, expected: &str, subject: &str) -> Result<(), String> {
+        if let Some(found) = self.dialect.as_deref()
+            && found != expected
+        {
+            return Err(format!(
+                "was recorded for {} and this {subject} is {expected}",
+                crate::escape::Escaped(found),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads a snapshot from a database's own ledger, refusing a present
+    /// `dialect` that names another engine as a malformed (corrupted) row.
+    /// An absent `dialect` is accepted as before.
+    pub fn read_json_for_dialect(json: &str, expected: &str) -> Result<Self, Unreadable> {
+        let snapshot = Self::read_json(json)?;
+        snapshot
+            .check_dialect(expected, "database")
+            .map_err(Unreadable::Malformed)?;
+        Ok(snapshot)
     }
 
     /// Reads a snapshot from its JSON form, checking the version **before** the
@@ -882,6 +929,7 @@ mod tests {
     fn a_state_from_another_format_version_is_refused() {
         let mut snap = StateSnapshot::new(
             StateKind::Baseline,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "leon",
@@ -914,6 +962,7 @@ mod tests {
     fn a_snapshot_from_before_module_dependencies_is_refused() {
         let mut snap = StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "leon",
@@ -939,6 +988,7 @@ mod tests {
         for version in 1..OLDEST_READABLE_VERSION {
             let mut snap = StateSnapshot::new(
                 StateKind::Apply,
+                "postgres",
                 Schema::default(),
                 IdsFile::default(),
                 "leon",
@@ -977,6 +1027,7 @@ mod tests {
     fn versions_6_through_30_read_without_catalog_evidence() {
         let snapshot = StateSnapshot::new(
             StateKind::Baseline,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "o",
@@ -995,6 +1046,7 @@ mod tests {
     fn identical_schema_is_not_drift() {
         let snap = StateSnapshot::new(
             StateKind::Apply,
+            "mssql",
             schema_with("nvarchar(255)"),
             IdsFile::default(),
             "leon",
@@ -1017,7 +1069,15 @@ mod tests {
             );
             s
         };
-        let snap = |schema| StateSnapshot::new(StateKind::Apply, schema, IdsFile::default(), "o");
+        let snap = |schema| {
+            StateSnapshot::new(
+                StateKind::Apply,
+                "postgres",
+                schema,
+                IdsFile::default(),
+                "o",
+            )
+        };
         assert!(snap(schema_with("nvarchar(255)")).matches(&object("pg_catalog.simple")));
         assert!(snap(object("pg_catalog.simple")).matches(&object("pg_catalog.simple")));
         // Negative: gone and altered are drift.
@@ -1029,6 +1089,7 @@ mod tests {
     fn any_difference_is_drift() {
         let snap = StateSnapshot::new(
             StateKind::Apply,
+            "mssql",
             schema_with("nvarchar(255)"),
             IdsFile::default(),
             "leon",
@@ -1058,6 +1119,7 @@ mod tests {
         // A version 43 snapshot, as it is read: no `sequences` key at all.
         let recorded = StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             schema_with("nvarchar(255)"),
             IdsFile::default(),
             "leon",
@@ -1101,6 +1163,7 @@ mod tests {
     fn type_case_is_not_drift() {
         let snap = StateSnapshot::new(
             StateKind::Apply,
+            "mssql",
             schema_with("NVARCHAR(255)"),
             IdsFile::default(),
             "leon",
@@ -1117,6 +1180,7 @@ mod tests {
     fn version_is_recorded() {
         let snap = StateSnapshot::new(
             StateKind::Baseline,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "leon",
@@ -1155,7 +1219,13 @@ mod tests {
         schema
             .roles
             .insert("app_reader".into(), crate::Role::default());
-        let snapshot = StateSnapshot::new(StateKind::Apply, schema, IdsFile::default(), "tester");
+        let snapshot = StateSnapshot::new(
+            StateKind::Apply,
+            "postgres",
+            schema,
+            IdsFile::default(),
+            "tester",
+        );
         let mut json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(
             StateSnapshot::from_json(&json.to_string()).unwrap(),
@@ -1176,6 +1246,7 @@ mod tests {
     fn round_trips_through_json() {
         let mut snap = StateSnapshot::new(
             StateKind::Apply,
+            "mssql",
             schema_with("bigint"),
             IdsFile::default(),
             "leon",
@@ -1198,6 +1269,7 @@ mod tests {
     fn the_declared_record_round_trips_through_json_and_is_absent_when_empty() {
         let mut snap = StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "leon",
@@ -1311,6 +1383,7 @@ mod tests {
     fn from_json_reads_a_current_snapshot_and_refuses_bytes_that_are_not_one() {
         let snap = StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "leon",
@@ -1381,6 +1454,7 @@ mod tests {
         };
         let mut snapshot = StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             schema.clone(),
             IdsFile::default(),
             "tester",
@@ -1400,7 +1474,7 @@ mod tests {
         assert_eq!(read.declared.overlay(&read.schema), schema);
         assert_eq!(read, snapshot);
 
-        snapshot.stamp();
+        snapshot.stamp("postgres");
         snapshot.declared = Declared::from_schema(&schema);
         let round_trip =
             StateSnapshot::read_json(&serde_json::to_string(&snapshot).unwrap()).unwrap();
@@ -1412,6 +1486,7 @@ mod tests {
     fn a_staged_checkpoint_carries_its_progress_through_json() {
         let mut snap = StateSnapshot::new(
             StateKind::Staged,
+            "mssql",
             schema_with("bigint"),
             IdsFile::default(),
             "leon",
@@ -1435,6 +1510,7 @@ mod tests {
     fn an_ordinary_state_carries_no_staged_marker() {
         let snap = StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "leon",
@@ -1450,6 +1526,7 @@ mod tests {
     fn target_assertions_round_trip_and_are_absent_when_empty() {
         let mut snap = StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "leon",
@@ -1476,6 +1553,7 @@ mod tests {
     fn data_work_does_not_inherit_the_copied_rows_target_assertions() {
         let mut before = StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "leon",
@@ -1495,6 +1573,7 @@ mod tests {
         };
         let next = before
             .recording_data_work(
+                "postgres",
                 work,
                 "reporter".into(),
                 crate::Reason::new("backfill").unwrap(),
@@ -1508,10 +1587,15 @@ mod tests {
     /// A row as the build before `object_deps` wrote it: no new field, edges
     /// as `module_deps`.
     fn old_row(version: u32, module_deps: Option<serde_json::Value>) -> serde_json::Value {
-        let mut row = serde_json::from_str::<serde_json::Value>(&historical_row(
-            &StateSnapshot::new(StateKind::Apply, Schema::default(), IdsFile::default(), "o"),
-        ))
-        .unwrap();
+        let mut row =
+            serde_json::from_str::<serde_json::Value>(&historical_row(&StateSnapshot::new(
+                StateKind::Apply,
+                "postgres",
+                Schema::default(),
+                IdsFile::default(),
+                "o",
+            )))
+            .unwrap();
         row["version"] = version.into();
         if let Some(deps) = module_deps {
             row["module_deps"] = deps;
@@ -1666,8 +1750,13 @@ mod tests {
 
     #[test]
     fn a_snapshot_always_writes_object_deps_and_reads_back_equal() {
-        let mut snapshot =
-            StateSnapshot::new(StateKind::Apply, Schema::default(), IdsFile::default(), "o");
+        let mut snapshot = StateSnapshot::new(
+            StateKind::Apply,
+            "postgres",
+            Schema::default(),
+            IdsFile::default(),
+            "o",
+        );
         let none = serde_json::to_string(&snapshot).unwrap();
         assert!(none.contains(r#""object_deps":[]"#), "{none}");
         assert_eq!(StateSnapshot::from_json(&none).unwrap(), snapshot);
@@ -1720,6 +1809,7 @@ mod tests {
     fn fresh() -> StateSnapshot {
         StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "leon",
@@ -1837,6 +1927,7 @@ mod tests {
         };
         let next = old
             .recording_data_work(
+                "postgres",
                 work,
                 "leon".into(),
                 crate::Reason::new("backfill").unwrap(),
@@ -1845,6 +1936,7 @@ mod tests {
             .unwrap();
         assert_eq!(next.version, CURRENT_VERSION);
         assert_eq!(next.format_fingerprint.as_deref(), Some(format_identity()));
+        assert_eq!(next.dialect.as_deref(), Some("postgres"));
     }
 
     #[test]
@@ -1853,6 +1945,85 @@ mod tests {
         assert_eq!(
             crate::format::check_increment("state", CURRENT_VERSION, format_identity(), released),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn a_snapshot_records_its_dialect_and_round_trips() {
+        for dialect in ["mssql", "postgres"] {
+            let snapshot = StateSnapshot::new(
+                StateKind::Apply,
+                dialect,
+                Schema::default(),
+                IdsFile::default(),
+                "leon",
+            );
+            assert_eq!(snapshot.dialect.as_deref(), Some(dialect));
+            let json = as_row(&snapshot);
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["dialect"], serde_json::json!(dialect));
+            let back = StateSnapshot::read_json_for_dialect(&json, dialect).unwrap();
+            assert_eq!(back, snapshot);
+            assert_eq!(back.dialect.as_deref(), Some(dialect));
+        }
+    }
+
+    #[test]
+    fn a_snapshot_without_dialect_reads_as_absent_and_passes_dialect_checks() {
+        // Older-version snapshot written before `dialect` existed.
+        let older = fresh().as_written_at(CURRENT_VERSION - 1);
+        assert_eq!(older.dialect, None);
+        let older_json = as_row(&older);
+        assert!(!older_json.contains("\"dialect\""), "{older_json}");
+        let back = StateSnapshot::read_json_for_dialect(&older_json, "mssql").unwrap();
+        assert_eq!(back, older);
+        assert_eq!(back.check_dialect("mssql", "project"), Ok(()));
+
+        // Current-version snapshot with `dialect` absent (negative case).
+        let mut current = serde_json::to_value(fresh()).unwrap();
+        current.as_object_mut().unwrap().shift_remove("dialect");
+        let parsed = StateSnapshot::read_json_for_dialect(&current.to_string(), "mssql").unwrap();
+        assert_eq!(parsed.dialect, None);
+        assert_eq!(parsed.check_dialect("mssql", "project"), Ok(()));
+        assert!(!as_row(&parsed).contains("\"dialect\""));
+    }
+
+    #[test]
+    fn a_snapshot_dialect_check_refuses_another_engine_and_escapes_hostile_text() {
+        let snapshot = StateSnapshot::new(
+            StateKind::Apply,
+            "mssql",
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        assert_eq!(snapshot.check_dialect("mssql", "project"), Ok(()));
+        let why = snapshot
+            .check_dialect("postgres", "project")
+            .expect_err("another engine must be refused");
+        assert_eq!(why, "was recorded for mssql and this project is postgres");
+
+        let Err(Unreadable::Malformed(why)) =
+            StateSnapshot::read_json_for_dialect(&as_row(&snapshot), "postgres")
+        else {
+            panic!("a ledger row for another engine is malformed");
+        };
+        assert_eq!(why, "was recorded for mssql and this database is postgres");
+
+        // Negative: hostile dialect text is escaped in the refusal.
+        let hostile = StateSnapshot::new(
+            StateKind::Apply,
+            "mssql\n\u{1b}[31m",
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        let why = hostile
+            .check_dialect("postgres", "project")
+            .expect_err("hostile dialect must be refused");
+        assert!(
+            !why.contains('\n') && !why.contains('\u{1b}') && why.contains("postgres"),
+            "{why:?}"
         );
     }
 }

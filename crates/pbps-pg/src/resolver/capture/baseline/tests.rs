@@ -13,6 +13,7 @@ fn empty_scope() -> CaptureScope {
 fn snapshot() -> StateSnapshot {
     StateSnapshot::new(
         StateKind::Baseline,
+        "postgres",
         Schema::default(),
         IdsFile::default(),
         "capture ledger fixture",

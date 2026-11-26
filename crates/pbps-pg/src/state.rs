@@ -413,6 +413,7 @@ fn ledger_is_there() -> String {
 /// the whole transaction**: see [`Recoverable`], which every tolerated failure
 /// here and in the shared flow is handled under.
 static LEDGER: LazyLock<LedgerSpec> = LazyLock::new(|| LedgerSpec {
+    dialect: crate::types::DIALECT,
     probe_state: PROBE_STATE.into(),
     select_latest: select_latest().into(),
     select_by_id: select_by_id().into(),

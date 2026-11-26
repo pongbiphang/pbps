@@ -19,7 +19,13 @@ mod write;
 
 /// A snapshot of an empty schema, as `operator` recorded it.
 pub(super) fn snapshot(kind: StateKind, operator: &str) -> StateSnapshot {
-    StateSnapshot::new(kind, Schema::default(), IdsFile::default(), operator)
+    StateSnapshot::new(
+        kind,
+        crate::types::DIALECT,
+        Schema::default(),
+        IdsFile::default(),
+        operator,
+    )
 }
 
 pub(super) fn number(c: &Connection, sql: &str) -> i64 {

@@ -107,6 +107,29 @@ mod of_tests {
             "error messages name the engine, so two engines sharing a name would blur them"
         );
     }
+
+    #[test]
+    fn engine_dialect_matches_each_dialects_wire_spelling() {
+        use pbps_dialect::Dialect as _;
+        assert_eq!(of(Driver::Mssql).dialect(), pbps_mssql::Mssql.name());
+        assert_eq!(
+            of(Driver::Postgres).dialect(),
+            pbps_pg::Postgres::default().name()
+        );
+        assert_eq!(
+            of(Driver::Sqlite).dialect(),
+            pbps_sqlite::dialect::Sqlite::default().name()
+        );
+        // Negative: no two engines share a name, or the check could not tell them apart.
+        let names = [Driver::Mssql, Driver::Postgres, Driver::Sqlite].map(|d| of(d).dialect());
+        assert_eq!(
+            names
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            names.len()
+        );
+    }
 }
 
 // What each engine is where the answer is a value, not a connected operation:
@@ -4146,6 +4169,7 @@ mod removal_note_tests {
             assert_eq!(note, expected);
             let mut snapshot = pbps_model::StateSnapshot::new(
                 pbps_model::StateKind::Baseline,
+                "postgres",
                 Default::default(),
                 Default::default(),
                 "operator",

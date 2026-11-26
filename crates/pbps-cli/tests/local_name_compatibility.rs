@@ -219,7 +219,8 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
         },
         ids.clone(),
     );
-    let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "fixture");
+    let mut state =
+        StateSnapshot::new(StateKind::Apply, "postgres", schema.clone(), ids, "fixture");
     state.declared = Declared::from_schema(&schema);
     state.declared.bindings.checks.insert(
         name.clone(),

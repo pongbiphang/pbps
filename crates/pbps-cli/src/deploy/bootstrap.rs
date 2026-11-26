@@ -269,6 +269,7 @@ pub(super) fn refuse_extension_prerequisite_drift(
 /// Keep the read-back and authored definitions together: the former proves
 /// drift, while the latter preserves expressions the catalog respells.
 pub(super) fn bootstrap_record(
+    dialect: &str,
     built: pbps_diff::Scoped,
     held: IdsFile,
     loaded: &pbps_load::Loaded,
@@ -276,7 +277,8 @@ pub(super) fn bootstrap_record(
 ) -> anyhow::Result<StateSnapshot> {
     // `built` is the recorded form already: the read it came from keeps a kind held by
     // name only only where `loaded` names it (`managed_state_once`, DEC-2855.1).
-    let mut snapshot = StateSnapshot::new(StateKind::Bootstrap, built.schema, held, operator);
+    let mut snapshot =
+        StateSnapshot::new(StateKind::Bootstrap, dialect, built.schema, held, operator);
     snapshot.baseline_evidence = built.baseline_evidence;
     snapshot.object_deps = loaded
         .hints
@@ -745,7 +747,7 @@ pub(super) async fn bootstrap_async(
                     .await?;
                 let snapshot = with_provenance(
                     project.root(),
-                    bootstrap_record(built, held, &loaded, operator)?,
+                    bootstrap_record(dialect.as_ref().name(), built, held, &loaded, operator)?,
                 );
                 let id = crate::engine::record(&mut conn, &snapshot).await?;
                 write_script(&pin_zone(&conn))?;
@@ -797,6 +799,7 @@ pub(super) async fn record_failed_bootstrap(
 ) {
     let mut failed = StateSnapshot::new(
         StateKind::Failed,
+        crate::engine::of(conn.driver()).dialect(),
         Schema::default(),
         IdsFile::default(),
         operator,

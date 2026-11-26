@@ -5221,7 +5221,7 @@ async fn a_module_applied_then_read_back_equals_what_was_declared() {
 // ---------------------------------------------------------------------------
 
 fn snapshot(kind: pbps_model::StateKind, schema: &Schema, ids: &IdsFile) -> StateSnapshot {
-    StateSnapshot::new(kind, schema.clone(), ids.clone(), "live-test")
+    StateSnapshot::new(kind, "mssql", schema.clone(), ids.clone(), "live-test")
 }
 
 async fn rows_in(conn: &mut Conn, table: &str) -> i32 {
@@ -14383,6 +14383,7 @@ async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
         &mut db.conn,
         &StateSnapshot::new(
             pbps_model::StateKind::Apply,
+            "mssql",
             recorded,
             IdsFile::default(),
             "live-test",
@@ -14434,6 +14435,7 @@ async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
         &mut db.conn,
         &StateSnapshot::new(
             pbps_model::StateKind::Apply,
+            "mssql",
             Schema::default(),
             ids,
             "live-test",
@@ -14626,6 +14628,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         &mut db.conn,
         &StateSnapshot::new(
             pbps_model::StateKind::Apply,
+            "mssql",
             recorded,
             IdsFile::default(),
             "live-test",
@@ -18414,6 +18417,7 @@ async fn a_moved_table_does_not_keep_its_source_schema_managed_but_a_dropped_one
         &mut db.conn,
         &StateSnapshot::new(
             pbps_model::StateKind::Apply,
+            "mssql",
             recorded,
             recorded_ids,
             "live-test",
@@ -18540,6 +18544,7 @@ async fn a_recorded_module_keeps_its_schema_in_the_readiness_check_until_its_dro
             &mut db.conn,
             &StateSnapshot::new(
                 pbps_model::StateKind::Apply,
+                "mssql",
                 recorded,
                 IdsFile::default(),
                 "live-test",
@@ -18560,6 +18565,7 @@ async fn a_recorded_module_keeps_its_schema_in_the_readiness_check_until_its_dro
             &mut db.conn,
             &StateSnapshot::new(
                 pbps_model::StateKind::Apply,
+                "mssql",
                 Schema::default(),
                 IdsFile::default(),
                 "live-test",

@@ -84,15 +84,17 @@ pub(super) async fn read(
         .try_get::<&str>("state_json")
         .map_err(|_| Failure::Incomplete)?
         .ok_or(Failure::Incomplete)?;
-    // Validate the version before accepting the JSON. Keep the original full
+    // Validate the version and dialect before accepting the JSON. Keep the original full
     // value for its verifier: deserializing defaults must not erase changes.
-    pbps_model::StateSnapshot::read_json(text).map_err(|error| match error {
-        pbps_model::Unreadable::UnsupportedVersion(_) => Failure::Coverage(
-            super::Uncovered::class("recorded-baseline", "state format is not supported"),
-        ),
-        pbps_model::Unreadable::Malformed(_) => Failure::Incomplete,
-        pbps_model::Unreadable::Denied(_) => Failure::Read,
-    })?;
+    pbps_model::StateSnapshot::read_json_for_dialect(text, crate::types::DIALECT).map_err(
+        |error| match error {
+            pbps_model::Unreadable::UnsupportedVersion(_) => Failure::Coverage(
+                super::Uncovered::class("recorded-baseline", "state format is not supported"),
+            ),
+            pbps_model::Unreadable::Malformed(_) => Failure::Incomplete,
+            pbps_model::Unreadable::Denied(_) => Failure::Read,
+        },
+    )?;
     let state = serde_json::from_str(text).map_err(|_| Failure::Incomplete)?;
     Ok(Baseline::Recorded { entry, state })
 }

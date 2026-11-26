@@ -83,10 +83,12 @@ pub(super) fn stored(row: &Record) -> Result<StoredEntry, DbError> {
 pub(super) fn entry(row: &Record) -> Result<pbps_db::ledger::LedgerEntry, LedgerError> {
     let stored = stored(row)?;
     let id = stored.id;
-    stored.read().map_err(|error| LedgerError::BadEntry {
-        id,
-        message: error.to_string(),
-    })
+    stored
+        .read_for(crate::types::DIALECT)
+        .map_err(|error| LedgerError::BadEntry {
+            id,
+            message: error.to_string(),
+        })
 }
 
 /// One row of a timeline.
@@ -154,7 +156,10 @@ fn projected_state(row: &Record) -> Result<Result<TimelineState, Unreadable>, Db
                 )));
             }
         };
-        return Ok(StateSnapshot::read_json(json).map(|s| TimelineState::from_snapshot(&s)));
+        return Ok(
+            StateSnapshot::read_json_for_dialect(json, crate::types::DIALECT)
+                .map(|s| TimelineState::from_snapshot(&s)),
+        );
     };
     Ok(projection(row, version))
 }

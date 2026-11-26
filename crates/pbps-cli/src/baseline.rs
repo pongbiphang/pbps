@@ -80,6 +80,9 @@ pub fn load(
             // whichever field of its older shape serde reached first.
             let snap = crate::artifact::decode(&text, StateSnapshot::from_json)
                 .with_context(|| format!("baseline file `{}`", path.display()))?;
+            if let Err(why) = snap.check_dialect(dialect.name(), "project") {
+                anyhow::bail!("`{}` {why}", path.display());
+            }
             let ids = snap
                 .ids
                 .validated()

@@ -93,7 +93,8 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
     );
     plan.object_deps =
         pbps_model::object_ref::ObjectEdges::from_legacy(&[(view, [routine].into())].into());
-    let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "fixture");
+    let mut state =
+        StateSnapshot::new(StateKind::Apply, "postgres", schema.clone(), ids, "fixture");
     state.declared = Declared::from_schema(&schema);
     state.object_deps = plan.object_deps.clone();
     state.plan_checksum = Some(plan.wire_fingerprint());

@@ -2,6 +2,7 @@
 fn a_failed_apply_clears_the_previous_data_work_payload() {
     let before = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Apply,
+        "mssql",
         pbps_model::Schema::default(),
         pbps_model::IdsFile::default(),
         "deployer",
@@ -16,6 +17,7 @@ fn a_failed_apply_clears_the_previous_data_work_payload() {
     };
     let current = before
         .recording_data_work(
+            "mssql",
             work,
             "reporter".into(),
             pbps_model::Reason::new("backfill").unwrap(),
@@ -37,6 +39,7 @@ fn a_failed_apply_clears_the_previous_data_work_payload() {
         &anyhow::anyhow!("refused"),
     );
     assert_eq!(failed.kind, pbps_model::StateKind::Failed);
+    assert_eq!(failed.dialect.as_deref(), Some("mssql"));
     assert!(failed.data_work.is_none());
     assert!(failed.target_assertions.is_empty());
     assert_eq!(failed.schema, before.schema);
@@ -48,6 +51,7 @@ fn a_failed_apply_clears_the_previous_data_work_payload() {
 fn newest_state_from_an_older_build() -> pbps_model::StateSnapshot {
     let mut row = serde_json::to_value(pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Apply,
+        "postgres",
         pbps_model::Schema::default(),
         pbps_model::IdsFile::default(),
         "deployer",
@@ -55,8 +59,9 @@ fn newest_state_from_an_older_build() -> pbps_model::StateSnapshot {
     .unwrap();
     let fields = row.as_object_mut().unwrap();
     fields.shift_remove("object_deps");
-    // An older build recorded no fingerprint, so the row has none to keep.
+    // An older build recorded no fingerprint or dialect, so the row has neither to keep.
     fields.shift_remove("format_fingerprint");
+    fields.shift_remove("dialect");
     fields.insert(
         "version".into(),
         (pbps_model::state::OBJECT_DEPS_VERSION - 1).into(),
@@ -73,6 +78,7 @@ fn a_failed_apply_after_an_older_row_writes_a_row_the_next_read_accepts() {
     let current = newest_state_from_an_older_build();
     let older = current.version;
     assert!(older < pbps_model::state::CURRENT_VERSION);
+    assert!(current.dialect.is_none());
     let edges = current.object_deps.clone();
     assert!(!edges.is_empty());
 
@@ -85,6 +91,7 @@ fn a_failed_apply_after_an_older_row_writes_a_row_the_next_read_accepts() {
         &anyhow::anyhow!("refused"),
     );
     assert_eq!(failed.version, pbps_model::state::CURRENT_VERSION);
+    assert_eq!(failed.dialect.as_deref(), Some("postgres"));
     // The number and the build that wrote it are set together (DEC-2412.2).
     assert_eq!(
         failed.format_fingerprint.as_deref(),

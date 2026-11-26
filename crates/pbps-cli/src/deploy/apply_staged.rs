@@ -646,6 +646,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         let object_deps = dependency_hints_for_schema(&entry.snapshot, plan, &after.schema);
         let mut checkpoint = pbps_model::StateSnapshot::new(
             StateKind::Staged,
+            dialect.name(),
             // Recorded as the closing entry is (DEC-2855.1), by what has run: the statement
             // loop keeps `live_ids` as the database holds the identities now, so a search
             // object is recorded once its create ran and left out once its drop ran, and
@@ -827,6 +828,7 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
         })?;
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
+            dialect.name(),
             // An object is recorded when its identity is held and the database holds it,
             // and one the previous record holds keeps its recorded definition, not the
             // read-back's (DEC-2855.1), except one the plan creates or alters in place, which

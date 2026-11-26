@@ -59,6 +59,7 @@ fn the_ledger_is_written_and_read_back_through_the_trait() {
     assert!(now(ENGINE.is_initialized(&mut conn)).expect("read"));
     let snapshot = StateSnapshot::new(
         StateKind::Apply,
+        crate::types::DIALECT,
         Schema::default(),
         IdsFile::default(),
         "first",

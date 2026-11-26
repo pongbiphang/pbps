@@ -87,7 +87,13 @@ fn artifacts(text: &str) -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
             keys: Default::default(),
         },
     );
-    let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids.clone(), "fixture");
+    let mut state = StateSnapshot::new(
+        StateKind::Apply,
+        "postgres",
+        schema.clone(),
+        ids.clone(),
+        "fixture",
+    );
     state.declared = Declared::from_schema(&schema);
     state.plan_checksum = Some(plan.wire_fingerprint());
     (schema, ids, plan, state)

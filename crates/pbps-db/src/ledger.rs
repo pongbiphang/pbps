@@ -92,6 +92,16 @@ impl StoredEntry {
             snapshot: StateSnapshot::read_json(&self.state_json)?,
         })
     }
+
+    /// Decodes a row from a database of `expected_dialect`, refusing a present
+    /// `dialect` naming another engine as a corrupted row.
+    pub fn read_for(self, expected_dialect: &str) -> Result<LedgerEntry, pbps_model::Unreadable> {
+        Ok(LedgerEntry {
+            id: self.id,
+            applied_at: self.applied_at,
+            snapshot: StateSnapshot::read_json_for_dialect(&self.state_json, expected_dialect)?,
+        })
+    }
 }
 
 /// One ledger row as a *timeline* reads it: the projected columns always, and
@@ -640,6 +650,7 @@ mod tests {
         };
         let mut snapshot = StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "leon",
@@ -652,5 +663,36 @@ mod tests {
         assert!(why.contains("pbps baseline --reason ..."), "{why}");
         snapshot.format_fingerprint = None;
         assert!(row(&snapshot).read().is_err());
+    }
+
+    #[test]
+    fn a_ledger_row_with_another_engines_dialect_is_refused_as_malformed() {
+        use pbps_model::{IdsFile, Schema, StateKind, StateSnapshot, Unreadable};
+        let row = |snapshot: &StateSnapshot| StoredEntry {
+            id: 4,
+            applied_at: "2026-11-26".into(),
+            state_json: serde_json::to_string(snapshot).unwrap(),
+        };
+        let pg = StateSnapshot::new(
+            StateKind::Apply,
+            "postgres",
+            Schema::default(),
+            IdsFile::default(),
+            "leon",
+        );
+        assert_eq!(row(&pg).read_for("postgres").unwrap().snapshot, pg);
+
+        let Err(Unreadable::Malformed(why)) = row(&pg).read_for("mssql") else {
+            panic!("another engine's row in this ledger is corruption");
+        };
+        assert!(
+            why.contains("postgres") && why.contains("mssql"),
+            "refusal must name both dialects: {why}"
+        );
+
+        // Negative: a pre-dialect snapshot (no dialect recorded) stays readable.
+        let mut legacy = pg;
+        legacy.dialect = None;
+        assert_eq!(row(&legacy).read_for("mssql").unwrap().snapshot, legacy);
     }
 }

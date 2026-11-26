@@ -170,6 +170,9 @@ pub trait Engine: Send + Sync {
     /// The engine's name as error messages spell it ("PostgreSQL").
     fn name(&self) -> &'static str;
 
+    /// The engine's dialect name as saved plans and snapshots spell it ("postgres").
+    fn dialect(&self) -> &'static str;
+
     // -- The ledger and the lock (SPEC section 8.1) ------------------------
 
     /// Whether the ledger tables exist.
@@ -393,6 +396,9 @@ mod tests {
         }
         fn name(&self) -> &'static str {
             "Stub"
+        }
+        fn dialect(&self) -> &'static str {
+            "postgres"
         }
         fn is_initialized<'a>(
             &'a self,

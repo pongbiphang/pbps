@@ -2063,6 +2063,7 @@ mod extension_tests {
     fn old_snapshots_own_no_extensions_and_new_checksums_pin_exact_packages() {
         let old = crate::StateSnapshot::new(
             crate::StateKind::Baseline,
+            "postgres",
             crate::Schema::default(),
             IdsFile::default(),
             "operator",
