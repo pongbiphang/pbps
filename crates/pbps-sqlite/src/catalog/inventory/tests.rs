@@ -798,3 +798,51 @@ fn verify_names_catches_catalog_occupants_and_allows_freed_names_and_key_names()
         "{err}"
     );
 }
+
+#[test]
+fn a_column_change_on_anything_but_an_ordinary_table_is_refused_by_name() {
+    let dialect = Sqlite::default();
+    let (schema, ids) = (Schema::default(), IdsFile::default());
+    let side = pbps_diff::Side {
+        schema: &schema,
+        ids: &ids,
+    };
+    let changes = ChangeSet::default();
+    let facts = CatalogFacts::default();
+    let asked = |columns: Vec<(&str, TableColumns)>| {
+        let inventory = Inventory {
+            entries: Vec::new(),
+            columns: columns
+                .into_iter()
+                .map(|(name, found)| (name.to_owned(), found))
+                .collect(),
+        };
+        verify_names(
+            &inventory, &changes, side, side, &dialect, &facts, "test.db",
+        )
+    };
+    // The inventory holds the tables whose columns the plan changes: a virtual
+    // table, a view and a missing table each refuse, whatever the change is.
+    let refused = asked(vec![
+        ("fts", TableColumns::Virtual),
+        ("report", TableColumns::View),
+        ("gone", TableColumns::Absent),
+    ])
+    .unwrap_err();
+    for expected in [
+        "`main.fts` is a virtual table in SQLite",
+        "`main.report` is a view in SQLite",
+        "`main.gone` does not exist in SQLite",
+    ] {
+        assert!(refused.contains(expected), "{refused}");
+    }
+    // Negative: an ordinary table's columns are not a problem by themselves.
+    asked(vec![(
+        "items",
+        TableColumns::Columns(vec![ColumnEntry {
+            name: "id".into(),
+            hidden: 0,
+        }]),
+    )])
+    .expect("an ordinary table passes");
+}

@@ -383,9 +383,8 @@ pub fn catalog_facts(
 }
 
 /// Verifies `changes` in its current order against `inventory` and `facts`
-/// through [`pbps_diff::order::slots::verify`] plus a virtual-table guard.
-// The complement is every change that neither adds nor renames a column.
-#[allow(clippy::wildcard_enum_match_arm)]
+/// through [`pbps_diff::order::slots::verify`], after refusing a column change
+/// on anything that is not an ordinary table.
 pub fn verify_names(
     inventory: &Inventory,
     changes: &ChangeSet,
@@ -395,38 +394,24 @@ pub fn verify_names(
     facts: &CatalogFacts,
     label: &str,
 ) -> Result<(), String> {
-    let mut problems: Vec<String> = changes
-        .changes
+    // The inventory holds exactly the tables whose columns this plan adds,
+    // renames or drops ([`column_tables`]). `ALTER TABLE` takes none of those
+    // on anything but an ordinary table, and the facts hold no column of one,
+    // so each is refused here and not left for SQLite to refuse mid-apply.
+    let mut problems: Vec<String> = inventory
+        .columns
         .iter()
-        .filter_map(|p| {
-            let (table, what) = match &p.change {
-                Change::Column(ColumnChange::AddColumn { table, name, .. }) => (
-                    table,
-                    format!("column `{}.{}`", table.shown(), name.shown()),
-                ),
-                Change::Column(ColumnChange::RenameColumn {
-                    table, from, to, ..
-                }) => (
-                    table,
-                    format!(
-                        "column rename `{}.{}` -> `{}`",
-                        table.shown(),
-                        from.shown(),
-                        to.shown()
-                    ),
-                ),
-                _ => return None,
+        .filter_map(|(table, columns)| {
+            let found = match columns {
+                TableColumns::Columns(_) => return None,
+                TableColumns::Virtual => "is a virtual table",
+                TableColumns::View => "is a view",
+                TableColumns::Absent => "does not exist",
             };
-            inventory
-                .columns
-                .iter()
-                .any(|(t, c)| ident::same(t, &table.name) && matches!(c, TableColumns::Virtual))
-                .then(|| {
-                    format!(
-                        "{what}: `{}` is a virtual table in SQLite and cannot be altered",
-                        table.shown()
-                    )
-                })
+            Some(format!(
+                "`main.{}` {found} in SQLite, so this plan cannot add, rename or drop its columns",
+                Escaped(table)
+            ))
         })
         .collect();
     let (ops, owners, before, analysed) = analyse_plan(changes, base, desired, dialect)?;
