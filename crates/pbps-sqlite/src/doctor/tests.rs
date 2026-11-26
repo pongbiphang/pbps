@@ -186,7 +186,7 @@ fn a_query_only_connection_is_a_write_gap_and_an_open_descriptor_is_asked_throug
 }
 
 #[test]
-fn unreadable_busy_unlinked_and_journal_off_databases_are_errors_not_clean_or_gaps() {
+fn busy_and_journal_off_databases_are_errors_not_clean_or_gaps() {
     // Busy (another writer holds `BEGIN IMMEDIATE`).
     let mut busy = Fresh::file();
     busy.connection()
@@ -206,8 +206,13 @@ fn unreadable_busy_unlinked_and_journal_off_databases_are_errors_not_clean_or_ga
         .expect("journal off");
     let err = permissions(off.connection()).expect_err("journal off must refuse");
     assert!(matches!(err, DbError::Refused(_)), "{err:?}");
+}
 
-    // File vanished under an open handle: absent/unreadable is an error, never clean.
+// Unix only: Windows refuses to remove a file that is open, so a connection
+// there cannot be left holding a file that is gone.
+#[cfg(unix)]
+#[test]
+fn a_file_removed_under_the_connection_is_an_error_not_a_clean_answer() {
     let mut gone = Fresh::file();
     let gone_path = gone.path().to_path_buf();
     gone.connection()
