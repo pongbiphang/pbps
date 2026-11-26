@@ -171,18 +171,22 @@ fn real_sqlite_file_measurements_confirm_namespace_key_constraint_column_and_int
             &vec![
                 ColumnEntry {
                     name: "a".into(),
+                    pk: 0,
                     hidden: 0
                 },
                 ColumnEntry {
                     name: "b".into(),
+                    pk: 0,
                     hidden: 0
                 },
                 ColumnEntry {
                     name: "gv".into(),
+                    pk: 0,
                     hidden: 2
                 },
                 ColumnEntry {
                     name: "gs".into(),
+                    pk: 0,
                     hidden: 3
                 },
             ]
@@ -307,14 +311,17 @@ fn read_captures_whole_file_inventory_without_loading_missing_virtual_module_and
         TableColumns::Columns(vec![
             ColumnEntry {
                 name: "id".into(),
+                pk: 1,
                 hidden: 0
             },
             ColumnEntry {
                 name: "a".into(),
+                pk: 0,
                 hidden: 0
             },
             ColumnEntry {
                 name: "g".into(),
+                pk: 0,
                 hidden: 2
             },
         ])
@@ -497,6 +504,7 @@ fn catalog_facts_decides_every_ascii_case_pair_with_zero_skipped_and_keeps_non_a
             },
         ],
         columns: BTreeMap::new(),
+        ..Inventory::default()
     };
 
     let base = pbps_diff::Side {
@@ -616,15 +624,18 @@ fn verify_names_catches_catalog_occupants_and_allows_freed_names_and_key_names()
             TableColumns::Columns(vec![
                 ColumnEntry {
                     name: "id".into(),
+                    pk: 0,
                     hidden: 0,
                 },
                 ColumnEntry {
                     name: "gen_c".into(),
+                    pk: 0,
                     hidden: 2,
                 },
             ]),
         )]
         .into(),
+        ..Inventory::default()
     };
 
     let existing_uid = uid(UidKind::Table, "main.existing");
@@ -825,6 +836,7 @@ fn a_column_change_on_anything_but_an_ordinary_table_is_refused_by_name() {
                 .into_iter()
                 .map(|(name, found)| (name.to_owned(), found))
                 .collect(),
+            ..Inventory::default()
         };
         verify_names(
             &inventory, &changes, side, side, &dialect, &facts, "test.db",
@@ -850,6 +862,7 @@ fn a_column_change_on_anything_but_an_ordinary_table_is_refused_by_name() {
         "items",
         TableColumns::Columns(vec![ColumnEntry {
             name: "id".into(),
+            pk: 0,
             hidden: 0,
         }]),
     )])
@@ -1137,6 +1150,7 @@ fn view_dependents_treats_absent_view_null_sql_and_foreign_modules_as_errors() {
                 },
             ],
             columns: BTreeMap::new(),
+            ..Inventory::default()
         };
         let err = view_dependents(&inv, std::slice::from_ref(&v_id), &empty_known).unwrap_err();
         assert!(
@@ -1154,6 +1168,7 @@ fn view_dependents_treats_absent_view_null_sql_and_foreign_modules_as_errors() {
             sql: Some("CREATE VIEW v AS SELECT 1".into()),
         }],
         columns: BTreeMap::new(),
+        ..Inventory::default()
     };
     let foreign_schema = ModuleId::Named(TableName::new("other", "v"));
     let schema_err = view_dependents(&inv, &[foreign_schema], &empty_known).unwrap_err();
@@ -1205,6 +1220,7 @@ fn a_reader_is_found_whatever_its_ascii_case_and_an_attached_trigger_says_it_is_
             ),
         ],
         columns: BTreeMap::new(),
+        ..Inventory::default()
     };
     let root = ModuleId::Named(TableName::new("main", "base_v"));
     let found = view_dependents(&inventory, std::slice::from_ref(&root), &BTreeSet::new())
@@ -1223,4 +1239,754 @@ fn a_reader_is_found_whatever_its_ascii_case_and_an_attached_trigger_says_it_is_
         "{:?}",
         attached.holds
     );
+}
+
+#[test]
+fn real_sqlite_file_measurements_confirm_drop_table_column_and_index_rules() {
+    let setup = |stmts: &[&str]| {
+        let mut db = Fresh::file();
+        let fk_on = db
+            .connection()
+            .query("PRAGMA foreign_keys", &[])
+            .expect("fk")[0]
+            .integer(0)
+            .expect("int");
+        assert_eq!(fk_on, 1);
+        for sql in stmts {
+            db.connection().execute_batch(sql).expect(sql);
+        }
+        db
+    };
+
+    // M1a: DROP TABLE parent with inbound FK, child empty -> SQLite permits,
+    // PRAGMA foreign_key_check returns 0 rows, next INSERT fails with no such table.
+    {
+        let mut db = setup(&[
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
+        ]);
+        let c = db.connection();
+        c.execute_batch("DROP TABLE parent")
+            .expect("permitted when child empty");
+        assert!(
+            c.query("PRAGMA foreign_key_check", &[])
+                .expect("fkc")
+                .is_empty()
+        );
+        for ins in [
+            "INSERT INTO child VALUES (1, 1)",
+            "INSERT INTO child VALUES (2, NULL)",
+        ] {
+            let err = c.execute_batch(ins).expect_err(ins).to_string();
+            assert!(err.contains("no such table: main.parent"), "{ins}: {err}");
+        }
+    }
+
+    // M1b: DROP TABLE parent with inbound FK, child has referencing row -> SQLite refuses.
+    {
+        let mut db = setup(&[
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
+            "INSERT INTO parent VALUES (1)",
+            "INSERT INTO child VALUES (1, 1)",
+        ]);
+        let err = db
+            .connection()
+            .execute_batch("DROP TABLE parent")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("FOREIGN KEY constraint failed"), "{err}");
+    }
+
+    // M1c: DROP TABLE parent with child row having NULL FK -> SQLite permits, next non-NULL INSERT fails.
+    {
+        let mut db = setup(&[
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
+            "INSERT INTO child VALUES (1, NULL)",
+        ]);
+        let c = db.connection();
+        c.execute_batch("DROP TABLE parent")
+            .expect("permitted with NULL FK");
+        assert!(
+            c.query("PRAGMA foreign_key_check", &[])
+                .expect("fkc")
+                .is_empty()
+        );
+        let err = c
+            .execute_batch("INSERT INTO child VALUES (2, 1)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such table: main.parent"), "{err}");
+    }
+
+    // M1d: DROP TABLE with self-referencing FK and row -> SQLite permits.
+    {
+        let mut db = setup(&[
+            "CREATE TABLE node (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES node(id))",
+            "INSERT INTO node VALUES (1, 1)",
+        ]);
+        db.connection()
+            .execute_batch("DROP TABLE node")
+            .expect("self-FK does not block DROP TABLE");
+    }
+
+    // M2a/M2b: ALTER TABLE parent DROP COLUMN c after dropping backing UNIQUE INDEX ->
+    // SQLite permits EVEN WITH ROWS in child, leaving `foreign key mismatch`.
+    for with_rows in [false, true] {
+        let mut stmts = vec![
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, c INTEGER)",
+            "CREATE UNIQUE INDEX uq_c ON parent(c)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pc INTEGER REFERENCES parent(c))",
+        ];
+        if with_rows {
+            stmts.push("INSERT INTO parent VALUES (1, 10)");
+            stmts.push("INSERT INTO child VALUES (1, 10)");
+        }
+        stmts.push("DROP INDEX uq_c");
+        let mut db = setup(&stmts);
+        let c = db.connection();
+        c.execute_batch("ALTER TABLE parent DROP COLUMN c")
+            .expect("SQLite permits drop");
+        let err = c
+            .query("PRAGMA foreign_key_check", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("foreign key mismatch"), "{err}");
+        let ins = c
+            .execute_batch("INSERT INTO child VALUES (2, 10)")
+            .unwrap_err()
+            .to_string();
+        assert!(ins.contains("foreign key mismatch"), "{ins}");
+    }
+
+    // M2c: inline UNIQUE column -> SQLite refuses DROP COLUMN directly.
+    {
+        let mut db = setup(&[
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, c INTEGER UNIQUE)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pc INTEGER REFERENCES parent(c))",
+        ]);
+        let err = db
+            .connection()
+            .execute_batch("ALTER TABLE parent DROP COLUMN c")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot drop UNIQUE column"), "{err}");
+    }
+
+    // M3a/M3c: DROP INDEX of sole standalone full UNIQUE INDEX behind inbound FK ->
+    // SQLite permits (even if a partial unique index exists), next write fails with foreign key mismatch.
+    for with_partial in [false, true] {
+        let mut stmts = vec![
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE UNIQUE INDEX uq_k ON parent(k)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pk INTEGER REFERENCES parent(k))",
+            "INSERT INTO parent VALUES (1, 10)",
+            "INSERT INTO child VALUES (1, 10)",
+        ];
+        if with_partial {
+            stmts.push("CREATE UNIQUE INDEX uq_part ON parent(k) WHERE k > 0");
+        }
+        let mut db = setup(&stmts);
+        let c = db.connection();
+        c.execute_batch("DROP INDEX uq_k")
+            .expect("SQLite permits DROP INDEX");
+        let err = c
+            .execute_batch("INSERT INTO child VALUES (2, 10)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("foreign key mismatch"), "{err}");
+    }
+
+    // M3b: Another full UNIQUE INDEX covering the same column set (in reversed order) keeps FK valid.
+    {
+        let mut db = setup(&[
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+            "CREATE UNIQUE INDEX uq_xy ON parent(x, y)",
+            "CREATE UNIQUE INDEX uq_yx ON parent(y, x)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, px INTEGER, py INTEGER, FOREIGN KEY (px, py) REFERENCES parent(x, y))",
+            "INSERT INTO parent VALUES (1, 10, 20)",
+            "INSERT INTO child VALUES (1, 10, 20)",
+        ]);
+        let c = db.connection();
+        c.execute_batch("DROP INDEX uq_xy")
+            .expect("drop first unique index");
+        assert!(
+            c.query("PRAGMA foreign_key_check", &[])
+                .expect("fkc")
+                .is_empty()
+        );
+        c.execute_batch("INSERT INTO child VALUES (2, 10, 20)")
+            .expect("FK still works");
+    }
+
+    // M4a/M4b: DROP TABLE t while view or trigger on another table reads t ->
+    // SQLite permits, breaking the reader AND subsequent ALTER TABLE DROP/RENAME on unrelated tables.
+    {
+        let mut db = setup(&[
+            "CREATE TABLE t (a INTEGER)",
+            "CREATE TABLE unrelated (x INTEGER, y INTEGER)",
+            "CREATE VIEW v AS SELECT a FROM t",
+        ]);
+        let c = db.connection();
+        c.execute_batch("DROP TABLE t").expect("permitted");
+        assert!(
+            c.query("SELECT * FROM v", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("no such table")
+        );
+        c.execute_batch("ALTER TABLE unrelated ADD COLUMN z INTEGER")
+            .expect("ADD COLUMN still works");
+        for stmt in [
+            "ALTER TABLE unrelated DROP COLUMN y",
+            "ALTER TABLE unrelated RENAME COLUMN x TO x2",
+            "ALTER TABLE unrelated RENAME TO unrelated2",
+        ] {
+            let err = c.execute_batch(stmt).expect_err(stmt).to_string();
+            assert!(err.contains("error in view v"), "{stmt}: {err}");
+        }
+    }
+    {
+        let mut db = setup(&[
+            "CREATE TABLE t (a INTEGER)",
+            "CREATE TABLE other (id INTEGER)",
+            "CREATE TABLE log (x INTEGER)",
+            "CREATE TABLE unrelated (x INTEGER, y INTEGER)",
+            "CREATE TRIGGER tr_reads_t AFTER INSERT ON other BEGIN INSERT INTO log SELECT a FROM t; END",
+        ]);
+        let c = db.connection();
+        c.execute_batch("DROP TABLE t").expect("permitted");
+        assert!(
+            c.execute_batch("INSERT INTO other VALUES (1)")
+                .unwrap_err()
+                .to_string()
+                .contains("no such table")
+        );
+        let err = c
+            .execute_batch("ALTER TABLE unrelated DROP COLUMN y")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("error in trigger tr_reads_t"), "{err}");
+    }
+
+    // M4c: DROP TABLE t with trigger ON t silently drops the trigger.
+    {
+        let mut db = setup(&[
+            "CREATE TABLE t (a INTEGER)",
+            "CREATE TABLE log (x INTEGER)",
+            "CREATE TRIGGER tr_on_t AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.a); END",
+        ]);
+        let c = db.connection();
+        c.execute_batch("DROP TABLE t").expect("permitted");
+        let rows = c
+            .query(
+                "SELECT name FROM main.sqlite_schema WHERE type = 'trigger' AND name = 'tr_on_t'",
+                &[],
+            )
+            .expect("q");
+        assert!(rows.is_empty(), "SQLite silently dropped trigger ON t");
+    }
+
+    // M5a–M5e: DROP COLUMN refused by SQLite for trigger (ON t or ON other), generated columns, expression index.
+    for (label, stmts, expected) in [
+        (
+            "trigger on t",
+            vec![
+                "CREATE TABLE t (a INTEGER, b INTEGER)",
+                "CREATE TABLE log (x INTEGER)",
+                "CREATE TRIGGER tr_on_t AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.b); END",
+            ],
+            "error in trigger tr_on_t",
+        ),
+        (
+            "trigger on other",
+            vec![
+                "CREATE TABLE t (a INTEGER, b INTEGER)",
+                "CREATE TABLE other (id INTEGER)",
+                "CREATE TABLE log (x INTEGER)",
+                "CREATE TRIGGER tr_other AFTER INSERT ON other BEGIN INSERT INTO log SELECT b FROM t; END",
+            ],
+            "error in trigger tr_other",
+        ),
+        (
+            "virtual generated",
+            vec![
+                "CREATE TABLE t (a INTEGER, b INTEGER, gv INTEGER GENERATED ALWAYS AS (b + 1) VIRTUAL)",
+            ],
+            "error in table t",
+        ),
+        (
+            "stored generated",
+            vec![
+                "CREATE TABLE t (a INTEGER, b INTEGER, gs INTEGER GENERATED ALWAYS AS (b + 1) STORED)",
+            ],
+            "error in table t",
+        ),
+        (
+            "expression index",
+            vec![
+                "CREATE TABLE t (a INTEGER, b TEXT)",
+                "CREATE INDEX ix_expr ON t(lower(b))",
+            ],
+            "error in index ix_expr",
+        ),
+    ] {
+        let mut db = setup(&stmts);
+        let err = db
+            .connection()
+            .execute_batch("ALTER TABLE t DROP COLUMN b")
+            .expect_err(label)
+            .to_string();
+        assert!(err.contains(expected), "{label}: {err}");
+    }
+}
+
+fn ids_after_plan(stored_ids: &IdsFile, changes: &[Change]) -> IdsFile {
+    let mut out = stored_ids.clone();
+    for ch in changes {
+        if let Change::Table(TableChange::RenameTable { uid, from, to, .. }) = ch {
+            out.tables.insert(uid.clone(), to.clone());
+            for col in out.columns.values_mut() {
+                if col.table == *from {
+                    col.table = to.clone();
+                }
+            }
+        } else if let Change::Table(TableChange::DropTable { uid, name, .. }) = ch {
+            out.tables.remove(uid);
+            out.columns.retain(|_, col| col.table != *name);
+        } else if let Change::Column(ColumnChange::DropColumn { uid, .. }) = ch {
+            out.columns.remove(uid);
+        }
+    }
+    out
+}
+
+fn drop_tbl(name: &str) -> Change {
+    Change::Table(TableChange::DropTable {
+        uid: uid(UidKind::Table, &format!("main.{name}")),
+        name: TableName::new("main", name),
+        detach_from: None,
+    })
+}
+
+fn drop_col(table: &str, col: &str) -> Change {
+    Change::Column(ColumnChange::DropColumn {
+        uid: uid(UidKind::Column, &format!("main.{table}.{col}")),
+        column: TableName::new("main", table).column(col),
+    })
+}
+
+fn drop_idx(table: &str, name: &str) -> Change {
+    Change::Index(IndexChange::DropIndex {
+        table: TableName::new("main", table),
+        name: name.into(),
+    })
+}
+
+fn seed_stored(specs: &[(&str, &[&str])]) -> (Schema, IdsFile) {
+    let (mut schema, mut ids) = (Schema::default(), IdsFile::default());
+    for &(tname, cols) in specs {
+        let tn = TableName::new("main", tname);
+        schema.tables.insert(tn.clone(), plain_table(cols));
+        ids.tables
+            .insert(uid(UidKind::Table, &format!("main.{tname}")), tn.clone());
+        for &col in cols {
+            ids.columns.insert(
+                uid(UidKind::Column, &format!("main.{tname}.{col}")),
+                tn.column(col),
+            );
+        }
+    }
+    (schema, ids)
+}
+
+fn drop_eval(
+    c: &Connection,
+    stored: &Schema,
+    stored_ids: &IdsFile,
+    changes: Vec<Change>,
+) -> Result<Vec<pbps_db::impact::DropReport>, DbError> {
+    let desired_ids = ids_after_plan(stored_ids, &changes);
+    let cs = ChangeSet {
+        changes: changes.into_iter().map(PlannedChange::new).collect(),
+    };
+    let names = PlanNames::of(&cs.changes, &desired_ids).expect("names");
+    let sources = pbps_model::physical_sources::PhysicalSources::of(names, stored, stored_ids)
+        .expect("sources");
+    let inv = read_for_drops(c, &sources)?;
+    drop_blockers(&inv, &sources)
+}
+
+#[test]
+fn drop_blockers_allows_unreferenced_drops_and_self_fks_and_clears_earlier_plan_steps() {
+    use pbps_model::ConstraintChange;
+
+    let mut db = Fresh::file();
+    let c = db.connection();
+    c.execute_batch(
+        "CREATE TABLE solo (id INTEGER PRIMARY KEY, extra INTEGER); \
+         CREATE INDEX ix_extra ON solo(extra); \
+         CREATE TABLE self_ref (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES self_ref(id)); \
+         CREATE TABLE parent (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, k INTEGER); \
+         CREATE UNIQUE INDEX uq_xy ON parent(x, y); \
+         CREATE UNIQUE INDEX uq_yx ON parent(y, x); \
+         CREATE UNIQUE INDEX uq_pk ON parent(id); \
+         CREATE UNIQUE INDEX uq_k ON parent(k); \
+         CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER, px INTEGER, py INTEGER, pk INTEGER, \
+           CONSTRAINT fk_p FOREIGN KEY (pid) REFERENCES parent(id), \
+           CONSTRAINT fk_xy FOREIGN KEY (px, py) REFERENCES parent(x, y), \
+           CONSTRAINT fk_k FOREIGN KEY (pk) REFERENCES parent(k)); \
+         CREATE VIEW v_solo AS SELECT extra FROM solo; \
+         CREATE VIEW v_safe AS SELECT id FROM solo; \
+         PRAGMA writable_schema = ON; \
+         INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) VALUES \
+           ('table', 'ghost_vtab', 'ghost_vtab', 0, 'CREATE VIRTUAL TABLE ghost_vtab USING missing_mod()'); \
+         PRAGMA writable_schema = OFF",
+    )
+    .expect("setup");
+    let (stored, stored_ids) = seed_stored(&[
+        ("solo", &["id", "extra"]),
+        ("self_ref", &["id", "pid"]),
+        ("parent", &["id", "x", "y", "k"]),
+        ("child", &["id", "pid", "px", "py", "pk"]),
+    ]);
+
+    // 1. Unreferenced index, PK-covered / sibling-covered unique index, self-FK table drop,
+    //    and column drop after dropping reading view (while `v_safe` stays active) all pass.
+    let v_solo = ModuleId::Named(TableName::new("main", "v_solo"));
+    let reports = drop_eval(
+        c,
+        &stored,
+        &stored_ids,
+        vec![
+            drop_idx("solo", "ix_extra"),
+            drop_idx("parent", "uq_pk"),
+            drop_idx("parent", "uq_xy"),
+            Change::Module(ModuleChange::DropModule {
+                id: v_solo.clone(),
+                kind: ModuleKind::View,
+            }),
+            drop_col("solo", "extra"),
+            drop_tbl("self_ref"),
+        ],
+    )
+    .expect("read and evaluate");
+    assert!(
+        reports.iter().all(|r| r.blocking.is_empty()),
+        "{reports:#?}"
+    );
+
+    // 2. Dropping child table before parent clears inbound FKs; dropping named FK clears it too.
+    let by_tbl = drop_eval(
+        c,
+        &stored,
+        &stored_ids,
+        vec![drop_tbl("child"), drop_tbl("parent")],
+    )
+    .expect("child before parent");
+    assert!(by_tbl.iter().all(|r| r.blocking.is_empty()), "{by_tbl:#?}");
+
+    let by_fk = drop_eval(
+        c,
+        &stored,
+        &stored_ids,
+        vec![
+            Change::Constraint(ConstraintChange::DropForeignKey {
+                table: TableName::new("main", "child"),
+                name: "fk_k".into(),
+            }),
+            drop_idx("parent", "uq_k"),
+            drop_col("parent", "k"),
+        ],
+    )
+    .expect("fk before unique index and column");
+    assert!(by_fk.iter().all(|r| r.blocking.is_empty()), "{by_fk:#?}");
+
+    // 3. Altering a view to stop reading the table clears it for a later DropTable.
+    let by_alter = drop_eval(
+        c,
+        &stored,
+        &stored_ids,
+        vec![
+            Change::Module(ModuleChange::AlterModule {
+                id: v_solo,
+                module: Box::new(Module {
+                    kind: ModuleKind::View,
+                    description: None,
+                    definition: "SELECT 1".into(),
+                    options: Default::default(),
+                }),
+            }),
+            Change::Module(ModuleChange::DropModule {
+                id: ModuleId::Named(TableName::new("main", "v_safe")),
+                kind: ModuleKind::View,
+            }),
+            drop_tbl("solo"),
+        ],
+    )
+    .expect("alter view before drop table");
+    assert!(
+        by_alter.iter().all(|r| r.blocking.is_empty()),
+        "{by_alter:#?}"
+    );
+}
+
+#[test]
+fn drop_blockers_catches_every_permitted_but_broken_blocker_wrong_order_and_renamed_targets() {
+    let mut db = Fresh::file();
+    let c = db.connection();
+    c.execute_batch(
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY, c INTEGER, k INTEGER, u INTEGER UNIQUE); \
+         CREATE UNIQUE INDEX uq_k ON parent(k); \
+         CREATE UNIQUE INDEX uq_k_part ON parent(k) WHERE k > 0; \
+         CREATE UNIQUE INDEX uq_c ON parent(c); \
+         CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id), \
+           pc INTEGER REFERENCES parent(c), pk INTEGER REFERENCES parent(k)); \
+         CREATE TABLE other (id INTEGER PRIMARY KEY); \
+         CREATE VIEW v_star AS SELECT * FROM parent; \
+         CREATE TRIGGER tr_on_p AFTER INSERT ON parent BEGIN SELECT NEW.c; END; \
+         CREATE TRIGGER tr_reads_p AFTER INSERT ON other BEGIN SELECT c FROM parent; END",
+    )
+    .expect("setup");
+    let (stored, stored_ids) = seed_stored(&[
+        ("parent", &["id", "c", "k", "u"]),
+        ("child", &["id", "pid", "pc", "pk"]),
+    ]);
+
+    // 1. DropTable(parent) BEFORE DropTable(child) refuses naming child FK, v_star, tr_on_p, tr_reads_p.
+    let table_reps = drop_eval(
+        c,
+        &stored,
+        &stored_ids,
+        vec![drop_tbl("parent"), drop_tbl("child")],
+    )
+    .expect("reports");
+    let joined = table_reps[0].blocking.join("\n");
+    for pat in [
+        "main.child",
+        "main.parent",
+        "view `main.v_star`",
+        "trigger `main.tr_on_p`",
+        "dropped with it",
+        "trigger `main.tr_reads_p`",
+    ] {
+        assert!(joined.contains(pat), "missing `{pat}` in:\n{joined}");
+    }
+
+    // 2. Sole unique index (with partial sibling) refused; autoindex refused.
+    let auto_name = c
+        .query(
+            "SELECT name FROM main.sqlite_schema WHERE type = 'index' AND tbl_name = 'parent' AND name LIKE 'sqlite_autoindex_%'",
+            &[],
+        )
+        .expect("autoindex")[0]
+        .text(0)
+        .expect("name")
+        .to_owned();
+    let idx_reps = drop_eval(
+        c,
+        &stored,
+        &stored_ids,
+        vec![drop_idx("parent", "uq_k"), drop_idx("parent", &auto_name)],
+    )
+    .expect("idx reports");
+    let k_msg = idx_reps[0].blocking.join("\n");
+    assert!(
+        k_msg.contains("main.child") && k_msg.contains("uq_k") && k_msg.contains("mismatch"),
+        "{k_msg}"
+    );
+    assert!(
+        idx_reps[1]
+            .blocking
+            .join("\n")
+            .contains("PRIMARY KEY or UNIQUE"),
+        "{:?}",
+        idx_reps[1]
+    );
+
+    // 3. DropColumn(parent.c) after dropping uq_c still blocked by inbound FK, v_star (`*`), and both triggers;
+    //    DropColumn(parent.id) blocked by PK; DropColumn(child.pid) blocked by outbound FK.
+    let col_reps = drop_eval(
+        c,
+        &stored,
+        &stored_ids,
+        vec![
+            drop_idx("parent", "uq_c"),
+            drop_col("parent", "c"),
+            drop_col("parent", "id"),
+            drop_col("child", "pid"),
+        ],
+    )
+    .expect("col reports");
+    let c_msg = col_reps[1].blocking.join("\n");
+    for pat in [
+        "main.child",
+        "main.parent.c",
+        "view `main.v_star`",
+        "trigger `main.tr_on_p`",
+        "trigger `main.tr_reads_p`",
+    ] {
+        assert!(c_msg.contains(pat), "missing `{pat}` in:\n{c_msg}");
+    }
+    assert!(
+        col_reps[2].blocking.join("\n").contains("primary key"),
+        "{:?}",
+        col_reps[2]
+    );
+    assert!(
+        col_reps[3].blocking.join("\n").contains("main.child"),
+        "{:?}",
+        col_reps[3]
+    );
+
+    // 4. Renamed table before drop resolves via PhysicalSources to catalog name `parent`.
+    let p_uid = uid(UidKind::Table, "main.parent");
+    let ren_reps = drop_eval(
+        c,
+        &stored,
+        &stored_ids,
+        vec![
+            Change::Table(TableChange::RenameTable {
+                uid: p_uid.clone(),
+                from: TableName::new("main", "parent"),
+                to: TableName::new("main", "parent_renamed"),
+                defaults: Vec::new(),
+            }),
+            Change::Table(TableChange::DropTable {
+                uid: p_uid,
+                name: TableName::new("main", "parent_renamed"),
+                detach_from: None,
+            }),
+        ],
+    )
+    .expect("renamed drop");
+    assert!(
+        ren_reps[0]
+            .blocking
+            .iter()
+            .any(|b| b.contains("main.child")),
+        "{:?}",
+        ren_reps[0]
+    );
+}
+
+#[test]
+fn drop_blockers_refuses_rebuild_changes_absent_targets_and_unreadable_or_missing_metadata() {
+    use pbps_model::ConstraintChange;
+
+    let mut db = Fresh::file();
+    db.connection()
+        .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)")
+        .expect("setup");
+    // Ledger also records `ghost` / `t.ghost` dropped out-of-band in SQLite.
+    let (stored, stored_ids) = seed_stored(&[("t", &["id", "a", "ghost"]), ("ghost", &["id"])]);
+    let t = TableName::new("main", "t");
+    let t_uid = uid(UidKind::Table, "main.t");
+    let a_uid = uid(UidKind::Column, "main.t.a");
+
+    // 1. Rebuild-requiring and unsupported changes refuse naming SQLite.
+    for ch in [
+        Change::Column(ColumnChange::AlterColumnType {
+            uid: a_uid.clone(),
+            column: t.column("a"),
+            from: "integer".parse().expect("ty"),
+            to: "text".parse().expect("ty"),
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: None,
+            through_external_partitions: false,
+            using: None,
+        }),
+        Change::Constraint(ConstraintChange::DropUnique {
+            table: t.clone(),
+            name: "uq_a".into(),
+        }),
+        Change::Constraint(ConstraintChange::SetPrimaryKey {
+            table: t.clone(),
+            from: Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            }),
+            to: None,
+            nonclustered: false,
+        }),
+        Change::Column(ColumnChange::AlterColumnNumbering {
+            uid: a_uid,
+            column: t.column("a"),
+            ty: "integer".parse().expect("ty"),
+            from: pbps_model::ValueSource::None,
+            to: pbps_model::ValueSource::None,
+        }),
+        Change::Table(TableChange::DropTable {
+            uid: t_uid,
+            name: t.clone(),
+            detach_from: Some(TableName::new("main", "p")),
+        }),
+    ] {
+        let desired_ids = ids_after_plan(&stored_ids, std::slice::from_ref(&ch));
+        let cs = ChangeSet {
+            changes: vec![PlannedChange::new(ch)],
+        };
+        assert!(has_drop_blocker_target(&cs));
+        let names = PlanNames::of(&cs.changes, &desired_ids).expect("names");
+        let sources =
+            pbps_model::physical_sources::PhysicalSources::of(names, &stored, &stored_ids)
+                .expect("sources");
+        let err = drop_blockers(&Inventory::default(), &sources).unwrap_err();
+        assert!(err.to_string().contains("SQLite"), "{err}");
+    }
+
+    // 2. Absent table, column or index refuses (never "no blockers").
+    for ch in [
+        drop_tbl("ghost"),
+        drop_col("t", "ghost"),
+        drop_idx("t", "ix_ghost"),
+    ] {
+        let err = drop_eval(db.connection(), &stored, &stored_ids, vec![ch]).unwrap_err();
+        assert!(err.to_string().contains("not in SQLite's catalog"), "{err}");
+    }
+
+    // 3. Unread metadata (`foreign_keys: None`, NULL view `sql`) errors.
+    let drop_t_ch = drop_tbl("t");
+    let desired_ids = ids_after_plan(&stored_ids, std::slice::from_ref(&drop_t_ch));
+    let drop_t = ChangeSet {
+        changes: vec![PlannedChange::new(drop_t_ch)],
+    };
+    let names = PlanNames::of(&drop_t.changes, &desired_ids).expect("names");
+    let sources = pbps_model::physical_sources::PhysicalSources::of(names, &stored, &stored_ids)
+        .expect("sources");
+    assert!(matches!(
+        drop_blockers(&Inventory::default(), &sources),
+        Err(DbError::BadRow(_))
+    ));
+
+    let null_view = Inventory {
+        entries: vec![SchemaEntry {
+            kind: EntryKind::View,
+            name: "broken_v".into(),
+            table: "broken_v".into(),
+            sql: None,
+        }],
+        foreign_keys: Some(BTreeMap::new()),
+        ..Inventory::default()
+    };
+    assert!(matches!(
+        drop_blockers(&null_view, &sources),
+        Err(DbError::BadRow(_))
+    ));
+
+    // 4. Exclusively locked file errors on read_for_drops, never "no blockers".
+    let locker = Connection::open(db.path(), OpenMode::ExistingOnly).expect("second conn");
+    locker.execute_batch("BEGIN EXCLUSIVE").expect("lock");
+    let lock_err = read_for_drops(db.connection(), &sources).unwrap_err();
+    assert_eq!(
+        lock_err.server_error_code().as_deref(),
+        Some("5"),
+        "{lock_err}"
+    );
+    locker.execute_batch("ROLLBACK").expect("unlock");
 }

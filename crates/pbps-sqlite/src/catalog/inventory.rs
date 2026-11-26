@@ -17,12 +17,18 @@ use pbps_model::escape::Escaped;
 use pbps_model::operation::{
     ModuleEdits, ObjectKey, Operations, PlanOwners, Snapshot, base_table_named,
 };
+use pbps_model::physical_sources::PhysicalSources;
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{Change, ChangeSet, ColumnChange, ModuleId, ModuleKind, TableChange, TableName};
 
+use crate::catalog::facts;
+use crate::catalog::text::{self, Kind as TextKind};
 use crate::dialect::Sqlite;
 use crate::pragma::{self, table_list, table_xinfo};
 use crate::{ident, lexis, names};
+
+mod drops;
+pub use drops::{drop_blockers, has_drop_blocker_target};
 
 /// The kind of a row in `main.sqlite_schema`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -85,6 +91,8 @@ impl SchemaEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnEntry {
     pub name: String,
+    /// 1-based position in the table's primary key, or 0 if not part of it.
+    pub pk: i64,
     pub hidden: i64,
 }
 
@@ -98,6 +106,25 @@ impl ColumnEntry {
             _ => "column",
         }
     }
+}
+
+/// One index reported by `PRAGMA main.index_list` and `index_xinfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub name: String,
+    pub unique: bool,
+    pub origin: String,
+    pub partial: bool,
+    pub keys: Vec<(Option<String>, String)>,
+}
+
+/// One foreign key reported by `PRAGMA main.foreign_key_list` (grouped by `id`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyEntry {
+    pub name: Option<String>,
+    pub parent: String,
+    pub from: Vec<String>,
+    pub to: Vec<Option<String>>,
 }
 
 /// What `PRAGMA main.table_list` / `table_xinfo` answered for a requested name.
@@ -116,6 +143,8 @@ pub enum TableColumns {
 pub struct Inventory {
     pub entries: Vec<SchemaEntry>,
     pub columns: BTreeMap<String, TableColumns>,
+    pub indexes: BTreeMap<String, Vec<IndexEntry>>,
+    pub foreign_keys: Option<BTreeMap<String, Vec<ForeignKeyEntry>>>,
 }
 
 /// Reads `main.sqlite_schema` (`type`, `name`, `tbl_name`, `sql`) and, for each
@@ -137,6 +166,7 @@ pub fn read(c: &Connection, column_tables: &[&str]) -> Result<Inventory, DbError
             })
         })
         .collect::<Result<Vec<_>, DbError>>()?;
+
     let mut columns = BTreeMap::new();
     if !column_tables.is_empty() {
         let version = c.version()?;
@@ -149,15 +179,42 @@ pub fn read(c: &Connection, column_tables: &[&str]) -> Result<Inventory, DbError
         let mut unique: Vec<&str> = column_tables.to_vec();
         unique.sort_unstable();
         unique.dedup();
-        for &req in &unique {
-            columns.insert(req.to_owned(), read_table_columns(c, req)?);
+        for &requested in &unique {
+            columns.insert(requested.to_owned(), read_table_columns(c, requested)?);
         }
     }
-    Ok(Inventory { entries, columns })
+
+    Ok(Inventory {
+        entries,
+        columns,
+        indexes: BTreeMap::new(),
+        foreign_keys: None,
+    })
+}
+
+/// Reads everything [`drop_blockers`] needs inside the caller's transaction
+/// without loading any virtual table's module (DEC-2950.14).
+pub fn read_for_drops(c: &Connection, sources: &PhysicalSources<'_>) -> Result<Inventory, DbError> {
+    let tables = drops::inspected_tables(sources);
+    let refs: Vec<&str> = tables.iter().map(String::as_str).collect();
+    let mut inv = read(c, &refs)?;
+    for (req, cols) in &inv.columns {
+        if matches!(cols, TableColumns::Columns(_)) {
+            let actual = inv
+                .entries
+                .iter()
+                .find(|e| e.kind == EntryKind::Table && ident::same(&e.name, req))
+                .map_or(req.as_str(), |e| e.name.as_str());
+            inv.indexes.insert(req.clone(), read_indexes(c, actual)?);
+        }
+    }
+    inv.foreign_keys = Some(read_all_foreign_keys(c, &inv.entries)?);
+    Ok(inv)
 }
 
 fn read_table_columns(c: &Connection, requested: &str) -> Result<TableColumns, DbError> {
-    // Check `table_list` first so `table_xinfo` never runs on virtual tables or views.
+    // Check `table_list` first so `table_xinfo` never runs on a virtual table
+    // (which would load its module) or on a view.
     let listed = pragma::table(c, requested)?;
     let Some(row) = listed.first() else {
         return Ok(TableColumns::Absent);
@@ -179,6 +236,7 @@ fn read_table_columns(c: &Connection, requested: &str) -> Result<TableColumns, D
                 .map(|col| {
                     Ok(ColumnEntry {
                         name: col.text(table_xinfo::NAME)?.to_owned(),
+                        pk: col.integer(table_xinfo::PK)?,
                         hidden: col.integer(table_xinfo::HIDDEN)?,
                     })
                 })
@@ -191,6 +249,92 @@ fn read_table_columns(c: &Connection, requested: &str) -> Result<TableColumns, D
             Escaped(other)
         ))),
     }
+}
+
+fn read_indexes(c: &Connection, table: &str) -> Result<Vec<IndexEntry>, DbError> {
+    Ok(facts::indexes(c, table)?
+        .into_iter()
+        .map(|ix| IndexEntry {
+            name: ix.name,
+            unique: ix.unique,
+            origin: ix.origin,
+            partial: ix.partial,
+            keys: ix.keys.into_iter().map(|(n, _, coll)| (n, coll)).collect(),
+        })
+        .collect())
+}
+
+fn read_all_foreign_keys(
+    c: &Connection,
+    entries: &[SchemaEntry],
+) -> Result<BTreeMap<String, Vec<ForeignKeyEntry>>, DbError> {
+    let mut out = BTreeMap::new();
+    for entry in entries.iter().filter(|e| e.kind == EntryKind::Table) {
+        let mut grouped: Vec<(i64, ForeignKeyEntry)> = Vec::new();
+        for r in facts::foreign(c, &entry.name)? {
+            if let Some((prev, fk)) = grouped.last_mut()
+                && *prev == r.id
+            {
+                fk.from.push(r.from);
+                fk.to.push(r.to);
+            } else {
+                grouped.push((
+                    r.id,
+                    ForeignKeyEntry {
+                        name: None,
+                        parent: r.table,
+                        from: vec![r.from],
+                        to: vec![r.to],
+                    },
+                ));
+            }
+        }
+        if grouped.is_empty() {
+            continue;
+        }
+        // A name comes from the table's text, clause by clause in the order
+        // the pragma lists the keys. It is taken only when every clause is the
+        // key it stands beside, so a name is never bound to another key: an
+        // unnamed key is one no `DropForeignKey` can clear.
+        let sql = require_stored_sql(entry)?;
+        if let Ok(t) = text::table(&entry.name, sql) {
+            let clauses: Vec<_> = t
+                .constraints
+                .into_iter()
+                .filter_map(|c| match c.kind {
+                    TextKind::ForeignKey {
+                        columns, parent, ..
+                    } => Some((c.name, columns, parent)),
+                    TextKind::PrimaryKey { .. }
+                    | TextKind::Unique { .. }
+                    | TextKind::Check { .. }
+                    | TextKind::NotNull
+                    | TextKind::Null
+                    | TextKind::Default { .. } => None,
+                })
+                .collect();
+            let same_key = |fk: &ForeignKeyEntry, columns: &[String], parent: &str| {
+                ident::same(&fk.parent, parent)
+                    && fk.from.len() == columns.len()
+                    && fk.from.iter().zip(columns).all(|(a, b)| ident::same(a, b))
+            };
+            if clauses.len() == grouped.len()
+                && grouped
+                    .iter()
+                    .zip(&clauses)
+                    .all(|((_, fk), (_, columns, parent))| same_key(fk, columns, parent))
+            {
+                for ((_, fk), (name, _, _)) in grouped.iter_mut().zip(clauses) {
+                    fk.name = name;
+                }
+            }
+        }
+        out.insert(
+            entry.name.clone(),
+            grouped.into_iter().map(|(_, fk)| fk).collect(),
+        );
+    }
+    Ok(out)
 }
 
 /// Pre-rename catalog names of existing tables whose columns `changes` edits.
