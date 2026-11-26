@@ -5432,6 +5432,33 @@ fn a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken() {
             ),
             "{said}"
         );
+        // Negative (draft round 2): a key over `(ts)` is no reference to an own
+        // `(ts, ts)`. The engine binds a key only to an index with as many keys
+        // (measured on 18.7), so that own is rebuilt, not refused. The key is
+        // restated around the drop, as around any of a unique index on the
+        // table it references, and binds again to `ev_1_u`.
+        let doubled = [
+            ("ev_1_u", index(&["ts"], true, None)),
+            ("ev_1_uu", index(&["ts", "ts"], true, None)),
+        ];
+        let cs = planned(
+            &referencing(tree(&[], &doubled, false), &["ts"]),
+            &referencing(tree(&parent(&["ts", "ts"]), &doubled, false), &["ts"]),
+            false,
+        )
+        .expect("planned");
+        assert_eq!(
+            steps(&cs),
+            [
+                "drop foreign key app.r",
+                "drop index app.ev_1",
+                "add index app.ev",
+                "add index app.ev_1",
+                "add foreign key app.r"
+            ],
+            "{:?}",
+            cs.changes
+        );
         // A key the plan drops holds nothing: the own is rebuilt, the key gone
         // ahead of it.
         let cs = planned(

@@ -96,19 +96,19 @@ pub(super) fn referencing_key<'a>(
     if !own.unique || own.filter.is_some() {
         return None;
     }
-    // In any order: a key names the index's columns as it likes.
-    let columns: BTreeSet<ColumnName> = own.column_keys()?.into_iter().collect();
+    // In any order: a key names the index's columns as it likes. The counts
+    // must agree too: the engine binds a key only to an index with as many
+    // keys, and refuses a key that names a column twice, so `(a)` is never
+    // bound to `(a, a)` (measured on 18.7, draft round 2).
+    let keys = own.column_keys()?;
+    let columns: BTreeSet<&ColumnName> = keys.iter().collect();
     declared.tables.iter().find_map(|(table, t)| {
         t.foreign_keys
             .iter()
             .find(|(_, key)| {
                 key.references_table == *partition
-                    && key
-                        .references_columns
-                        .iter()
-                        .cloned()
-                        .collect::<BTreeSet<_>>()
-                        == columns
+                    && key.references_columns.len() == keys.len()
+                    && key.references_columns.iter().collect::<BTreeSet<_>>() == columns
             })
             .map(|(name, _)| (table, name))
     })
