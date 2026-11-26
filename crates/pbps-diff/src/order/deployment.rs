@@ -1993,9 +1993,9 @@ fn expand_new_tables(
 /// first, but a partition's own index that calls a rebuilt function can still
 /// come ahead of the parent's restoration.
 ///
-/// An edge from the parent's index to each partition index it could adopt
-/// (`adopts`), and none to one it could not, which `settle` orders: the
-/// partition's index sinks to right after the parent's. What rests on it
+/// An edge from the parent's index to each partition index it might adopt
+/// (`may_adopt`, DEC-1671.1), and none to one it could not, which `settle`
+/// orders: the partition's index sinks to right after the parent's. What rests on it
 /// between them sinks with it, by the same edges [`rests_on`] reads: a
 /// foreign key on a unique one, a literal naming it, a replica identity on
 /// it. What the parent's index needs runs before it already. A partition's
@@ -2004,13 +2004,13 @@ fn expand_new_tables(
 /// or a module: what rests on that is not read.
 ///
 /// A parent's new exclusion also comes after every removal (a drop, or the drop
-/// half of a redefinition) of a partition's own exclusion it could take: the
-/// engine makes the own the parent's inherited clone when the add runs, and
-/// refuses the drop of an inherited constraint (measured on 18.7, DEC-2448.7).
-/// The differ's classes already put a drop ahead of an add; the edge keeps
-/// that when a pass before moved the add. An index has no such edge: its drop
-/// is a class-2 change as the exclusion's is, and the frozen oracle of this
-/// pass covers indexes only.
+/// half of a redefinition or of a rebuild around it) of a partition's own
+/// exclusion it might take (`may_adopt_exclusion`): the engine makes the own
+/// the parent's inherited clone when the add runs, and refuses the drop of an
+/// inherited constraint (measured on 18.7, DEC-2448.7). The differ's classes
+/// already put a drop ahead of an add; the edge keeps that when a pass before
+/// moved the add. An index has no such edge: its drop is a class-2 change as
+/// the exclusion's is, and the frozen oracle of this pass covers indexes only.
 pub fn before_its_partitions_indexes(
     cs: &mut PlanningPlan,
     declared: &Schema,
@@ -2064,9 +2064,11 @@ pub fn before_its_partitions_indexes(
         };
         partition_of(parent, &table)
             && match (mine, own) {
-                (Building::Index(p), Building::Index(o)) => crate::schema_diff::adopts(p, o),
+                (Building::Index(p), Building::Index(o)) => {
+                    crate::schema_diff::may_adopt(p, o, dialect)
+                }
                 (Building::Exclusion(p), Building::Exclusion(o)) => {
-                    crate::schema_diff::adopts_exclusion(p, o)
+                    crate::schema_diff::may_adopt_exclusion(p, o, dialect)
                 }
                 (Building::Index(_), Building::Exclusion(_))
                 | (Building::Exclusion(_), Building::Index(_)) => false,
@@ -2103,7 +2105,7 @@ pub fn before_its_partitions_indexes(
             for (j, q) in cs.changes.iter().enumerate() {
                 if let Some((table, old)) = removed(&q.change)
                     && partition_of(&parent, &table)
-                    && crate::schema_diff::adopts_exclusion(parents, old)
+                    && crate::schema_diff::may_adopt_exclusion(parents, old, dialect)
                 {
                     schedule.edge(j, k, Source::Effect, OrderReason::Structural);
                     removals.push((j, k));

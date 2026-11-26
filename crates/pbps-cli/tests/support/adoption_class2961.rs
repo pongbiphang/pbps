@@ -1,10 +1,10 @@
 //! A new index on a standing partitioned parent over an expression key, beside a
 //! partition's own index on the same expression (#2961, DEC-2961.1). The engine
-//! compares an expression key's operator class, so under another class the own
-//! is not taken as the clone: the plan builds the parent's index, and the own
-//! stays the partition's. Under the same class it would be taken, which stays
-//! refused by name, nothing changed. Each case runs on both pinned engines.
-use super::{Demo, OwnDatabase, approved_apply, code, on_server, scalar, stderr, stdout, succeeds};
+//! would take an own under the same class as the clone and not one under another;
+//! the plan predicts neither, drops the own ahead of the parent's and adds it
+//! again (DEC-1671.1). So under either class the own stays the partition's. Each
+//! case runs on both pinned engines.
+use super::{Demo, OwnDatabase, approved_apply, on_server, scalar, stdout, succeeds};
 
 fn servers(mut check: impl FnMut(&str)) {
     for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
@@ -20,12 +20,12 @@ const SETUP: &str = "CREATE SCHEMA app; \
     CREATE INDEX ev_1_x ON app.ev_1 USING brin ((n + 1) int4_minmax_multi_ops); \
     INSERT INTO app.ev VALUES (1, 1, 1), (2, 11, 2)";
 
-/// A parent index over an expression under another class than a partition's own
-/// is planned and built, and the own is kept; under the same class the plan is
-/// refused by name.
+/// A parent index over an expression, under the class a partition's own index
+/// has or under another, is built with a clone on each partition, and the own
+/// stays the partition's own.
 #[test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-fn a_parent_index_over_an_expression_under_another_class_leaves_a_partitions_own() {
+fn a_parent_index_over_an_expression_leaves_a_partitions_own_under_either_class() {
     servers(|url| {
         let own = OwnDatabase::new(url, "adoption-class-2961");
         let conn = own.connection().to_owned();
@@ -49,36 +49,32 @@ fn a_parent_index_over_an_expression_under_another_class_leaves_a_partitions_own
         let taken =
             || held("SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.ev_1_x'::regclass");
 
-        // Negative: under the same class the own would be the clone.
+        let applied = |name: &str| {
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let plan = d.dir.join(name);
+            succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+            succeeds(approved_apply(
+                &d,
+                &conn,
+                &plan,
+                &["--allow", "destructive,constraint"],
+            ));
+            succeeds(d.run(&["verify", "--db", &conn]));
+            let next = succeeds(d.run(&["plan", "--db", &conn]));
+            assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+            assert_eq!(taken(), 0, "the partition's own index is still its own");
+            assert_eq!(
+                held("SELECT count(*) FROM pg_inherits WHERE inhparent = 'app.ev_x'::regclass"),
+                2,
+                "a clone on each partition"
+            );
+        };
+        // Under the same class, which the engine would take.
         declare(", opclass: int4_minmax_multi_ops");
-        let o = d.run(&["plan"]);
-        assert_ne!(code(&o), 0, "{}", stdout(&o));
-        assert!(
-            stderr(&o).contains("which can take app.ev_1's `ev_1_x`"),
-            "{}",
-            stderr(&o)
-        );
-
-        // Under the default class it is another index to the engine.
+        applied("add.json");
+        // Then redefined under the default class, which is another index to it.
         declare("");
-        succeeds(d.run(&["plan"]));
-        d.commit();
-        let plan = d.dir.join("add.json");
-        succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
-        succeeds(approved_apply(
-            &d,
-            &conn,
-            &plan,
-            &["--allow", "destructive,constraint"],
-        ));
-        succeeds(d.run(&["verify", "--db", &conn]));
-        let next = succeeds(d.run(&["plan", "--db", &conn]));
-        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
-        assert_eq!(taken(), 0, "the partition's own index is still its own");
-        assert_eq!(
-            held("SELECT count(*) FROM pg_inherits WHERE inhparent = 'app.ev_x'::regclass"),
-            2,
-            "a clone on each partition"
-        );
+        applied("redefine.json");
     });
 }

@@ -543,9 +543,15 @@ depends_on:
   and keeps its rows, `constraint` since the engine checks every row against
   its bound. The table must already hold its parent's columns, in order, and
   none of the keys or constraints a partition does not hold, or it is refused
-  by name; an exclusion constraint of its own that its parent's would take as its
-  clone is refused too, and any other stays its own (DEC-2448.7). What it keeps of its own is then brought to the declaration in the
-  same plan, and its column uids leave the ids file. The apply's pre-flight
+  by name. Which of its indexes and constraints the engine would adopt is not
+  predicted: each one a parent's might take (the same uniqueness, number of
+  keys and columns, an expression matching another expression or a column it
+  may read) is dropped before the attach and, where declared, added after it,
+  but for a lone index equal to the parent's with nothing for the engine to
+  parse; an exclusion's drop that is not added back needs its record
+  (DEC-1671.1). What it keeps of its own is then brought to
+  the declaration in the same plan, and its column uids leave the ids file.
+  The apply's pre-flight
   refuses rows of the table outside the range, and DEFAULT-partition rows
   inside it (DEC-1545.1); outside a list's values, or a hash's remainder,
   likewise (DEC-1632.1). Attached as the DEFAULT partition, it may hold no
@@ -562,9 +568,14 @@ depends_on:
   key column is never dropped or retyped, and the columns do not change in a
   plan that attaches, detaches or drops under the parent. Its indexes are
   added and dropped, a new name being a drop and an add, each recursing as
-  the partitions' clones; `strategy: online`, a unique index without a key
-  column, and a new index that can take a partition's own as its clone are
-  refused by name (DEC-1688.1). Its primary key, unique constraints, checks
+  the partitions' clones; `strategy: online` and a unique index without a key
+  column are refused by name (DEC-1688.1). A standing partition's own index or
+  exclusion that a parent's new one might take is dropped before it and added
+  after it, but for a unique index a foreign key references, which stays as it
+  stands. Refused by name (DEC-1671.1) are such a referenced one the engine
+  would take, an own index it would take that the plan creates with a
+  partition, and an own exclusion it would take that the plan adds. Its
+  primary key, unique constraints, checks
   and foreign keys are added and dropped the same way, and a foreign key may
   reference it; a key without a partition-key column, and a check under a
   name a partition holds as its own, are refused by name (DEC-1689.1). The

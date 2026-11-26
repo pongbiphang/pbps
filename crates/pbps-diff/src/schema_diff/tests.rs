@@ -3204,6 +3204,28 @@ fn partitioned_booking(
     s
 }
 
+/// Each exclusion half of a plan, as `add` or `drop` of `table.name`, in order.
+fn exclusion_halves(cs: &ChangeSet) -> Vec<String> {
+    cs.changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::Constraint(ConstraintChange::SetExclusion {
+                table, name, to, ..
+            }) = &p.change
+            {
+                Some(format!(
+                    "{} {}.{}",
+                    if to.is_some() { "add" } else { "drop" },
+                    table.shown(),
+                    name.shown()
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// `adopts_exclusion` is the engine's rule (measured on 18.6, on `ATTACH` and on a
 /// parent's `ADD` over a standing leaf): method, keys with operators and classes,
 /// `INCLUDE` and the predicate decide; timing, storage parameters and name do not
@@ -3249,10 +3271,10 @@ fn an_own_exclusion_is_taken_as_a_clone_by_shape_and_not_by_timing_or_options() 
     assert!(adopts_exclusion(&other, &same));
 }
 
-/// A standing parent takes an exclusion by one change; the engine's key rule and
-/// its adoption of a partition's own are refused by name, an option-only edit is a
-/// replacement (a partitioned index takes no `ALTER INDEX SET`), and a drop needs
-/// its record as any other (DEC-2448.6).
+/// A standing parent takes an exclusion by one change; the engine's key rule is
+/// refused by name, a partition's own it might take is rebuilt around it
+/// (DEC-1671.1), an option-only edit is a replacement (a partitioned index takes
+/// no `ALTER INDEX SET`), and a drop needs its record as any other (DEC-2448.6).
 #[test]
 fn a_standing_parents_exclusion_is_added_replaced_and_dropped_under_the_engines_rules() {
     let none = partitioned_booking(&[], &[]);
@@ -3285,34 +3307,37 @@ fn a_standing_parents_exclusion_is_added_replaced_and_dropped_under_the_engines_
             "{said}"
         );
     }
-    // A partition's own of the same shape would be taken as the clone: refused, even
-    // with another timing, and accepted when it differs in shape or is the parent's
-    // alone.
-    let mut own = parent_exclusion();
-    own.timing = pbps_model::ExclusionTiming::DeferrableImmediate;
-    let said = exclusion_plan(
-        &partitioned_booking(&[], &[("mine", own.clone())]),
-        &partitioned_booking(&[("x", parent_exclusion())], &[("mine", own.clone())]),
+    // A standing partition's own the parent's might take is dropped ahead of it
+    // and added again after, even with another timing or `INCLUDE`; one over
+    // another number of keys is left alone.
+    let mut timed = parent_exclusion();
+    timed.timing = pbps_model::ExclusionTiming::DeferrableImmediate;
+    let mut including = parent_exclusion();
+    including.include = vec!["id".into()];
+    for own in [timed, including] {
+        let cs = exclusion_plan(
+            &partitioned_booking(&[], &[("mine", own.clone())]),
+            &partitioned_booking(&[("x", parent_exclusion())], &[("mine", own)]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            exclusion_halves(&cs),
+            [
+                "drop app.booking_1.mine",
+                "add app.booking.x",
+                "add app.booking_1.mine"
+            ]
+        );
+    }
+    let narrower = exclusion("int4range(b, c)", "&&");
+    let cs = exclusion_plan(
+        &partitioned_booking(&[], &[("mine", narrower.clone())]),
+        &partitioned_booking(&[("x", parent_exclusion())], &[("mine", narrower)]),
         &[],
     )
-    .unwrap_err()
-    .join("\n");
-    assert!(
-        said.contains("which can take app.booking_1's `mine`"),
-        "{said}"
-    );
-    own.include = vec!["id".into()];
-    assert_eq!(
-        kinds(
-            &exclusion_plan(
-                &partitioned_booking(&[], &[("mine", own.clone())]),
-                &partitioned_booking(&[("x", parent_exclusion())], &[("mine", own)]),
-                &[],
-            )
-            .unwrap()
-        ),
-        ["SetExclusion"]
-    );
+    .unwrap();
+    assert_eq!(exclusion_halves(&cs), ["add app.booking.x"]);
     // An option-only edit is a drop and an add carrying the final options.
     let mut tuned = parent_exclusion();
     tuned
@@ -3399,13 +3424,15 @@ fn a_standing_partitions_own_exclusion_is_added_edited_replaced_and_dropped_as_i
     assert!(cs.risks().contains(&RiskClass::Destructive));
 }
 
-/// A parent's new exclusion is refused over every own exclusion it would adopt, whether
-/// the own stood before the plan or the plan adds it, as the declaration rule refuses the
-/// same pair (DEC-2448.7; the same-plan order the engine allows is #2992's). Negatives: an
-/// own that differs (by `INCLUDE`) is not refused, and a plan that leaves the own out of
-/// the declaration has nothing left to take.
+/// A parent's new exclusion is refused over an own it would adopt that the plan
+/// adds, on a standing partition or on one it creates, as the declaration rule
+/// refuses the same pair (DEC-2448.7; the same-plan order the engine allows is
+/// #2992's). A standing own the plan leaves as it was is rebuilt around the
+/// parent's (DEC-1671.1). Negatives: an own it adds that differs (by `INCLUDE`)
+/// is not refused, and a standing own left out of the declaration is never
+/// rebuilt: it is dropped with a record, and refused without one.
 #[test]
-fn a_parents_new_exclusion_refuses_every_own_it_would_take_and_not_one_that_differs() {
+fn a_parents_new_exclusion_rebuilds_a_standing_own_and_refuses_one_the_plan_adds() {
     let none = partitioned_booking(&[], &[]);
     let both = partitioned_booking(
         &[("x", parent_exclusion())],
@@ -3417,38 +3444,73 @@ fn a_parents_new_exclusion_refuses_every_own_it_would_take_and_not_one_that_diff
         said.contains("which can take app.booking_1's `mine`"),
         "{said}"
     );
-    // The own standing already: refused the same.
-    let standing = partitioned_booking(&[], &[("mine", parent_exclusion())]);
-    let said = exclusion_plan(&standing, &both, &[])
+    // The own redefined into the parent's shape is one the plan adds too.
+    let mut including = parent_exclusion();
+    including.include = vec!["id".into()];
+    let redefined = partitioned_booking(&[], &[("mine", including.clone())]);
+    let said = exclusion_plan(&redefined, &both, &[])
         .unwrap_err()
         .join("\n");
     assert!(
         said.contains("which can take app.booking_1's `mine`"),
         "{said}"
     );
+    // So is one on a partition the plan creates.
+    let without_partition = {
+        let mut s = partitioned_booking(&[], &[]);
+        s.tables
+            .remove(&"app.booking_1".parse::<TableName>().unwrap());
+        s
+    };
+    let said = exclusion_plan(&without_partition, &both, &[])
+        .unwrap_err()
+        .join("\n");
+    assert!(
+        said.contains("which can take app.booking_1's `mine`"),
+        "{said}"
+    );
+    // The own standing already: rebuilt, with no record asked of a drop that
+    // is put back.
+    let standing = partitioned_booking(&[], &[("mine", parent_exclusion())]);
+    let cs = exclusion_plan(&standing, &both, &[]).unwrap();
+    assert_eq!(
+        exclusion_halves(&cs),
+        [
+            "drop app.booking_1.mine",
+            "add app.booking.x",
+            "add app.booking_1.mine"
+        ]
+    );
     // Negative: an own that differs is the partition's own, added beside the parent's.
-    let mut differs = parent_exclusion();
-    differs.include = vec!["id".into()];
-    let other = partitioned_booking(&[("x", parent_exclusion())], &[("mine", differs)]);
+    let other = partitioned_booking(&[("x", parent_exclusion())], &[("mine", including)]);
     let cs = exclusion_plan(&none, &other, &[]).unwrap();
     assert_eq!(kinds(&cs), ["SetExclusion", "SetExclusion"]);
-    // Negative: the standing own left out of the declaration is dropped, leaving nothing to take.
-    let cs = exclusion_plan_with(
-        &standing,
-        &partitioned_booking(&[("x", parent_exclusion())], &[]),
-        |ids, _| {
-            let leaf = ids
-                .table_uid(&"app.booking_1".parse().unwrap())
-                .unwrap()
-                .clone();
-            ids.exclusions.entry(leaf).or_default().insert(
-                "mine".into(),
-                retirement(parent_exclusion().canonical_text()),
-            );
-        },
-    )
+    // Negative: the standing own left out of the declaration is dropped, once,
+    // and not put back.
+    let left_out = partitioned_booking(&[("x", parent_exclusion())], &[]);
+    let cs = exclusion_plan_with(&standing, &left_out, |ids, _| {
+        let leaf = ids
+            .table_uid(&"app.booking_1".parse().unwrap())
+            .unwrap()
+            .clone();
+        ids.exclusions.entry(leaf).or_default().insert(
+            "mine".into(),
+            retirement(parent_exclusion().canonical_text()),
+        );
+    })
     .unwrap();
-    assert_eq!(kinds(&cs).len(), 2, "{:?}", kinds(&cs));
+    assert_eq!(
+        exclusion_halves(&cs),
+        ["drop app.booking_1.mine", "add app.booking.x"]
+    );
+    // Negative: without the record it is refused: the rebuild is no way past it.
+    let said = exclusion_plan(&standing, &left_out, &[])
+        .unwrap_err()
+        .join("\n");
+    assert!(
+        said.contains("pbps drop-exclusion app.booking_1 mine --reason"),
+        "{said}"
+    );
 }
 
 /// A standing partition's own exclusion that a parent's new one would take, and that the
@@ -3456,7 +3518,8 @@ fn a_parents_new_exclusion_refuses_every_own_it_would_take_and_not_one_that_diff
 /// of a constraint the parent's add already made a clone (`cannot drop inherited
 /// constraint`, measured on 18.7), and the drop alone runs first. A drop is a
 /// `SetExclusion` in the class of the add, so only the ordering pass puts it first
-/// (DEC-2448.7). Negative: an adoptable own the declaration keeps is still refused by name.
+/// (DEC-2448.7). So is the drop half of a rebuild, of an own the declaration keeps
+/// (DEC-1671.1).
 #[test]
 fn a_standing_own_exclusion_the_plan_drops_or_replaces_goes_before_the_parents_add() {
     let leaf: TableName = "app.booking_1".parse().unwrap();
@@ -3492,7 +3555,7 @@ fn a_standing_own_exclusion_the_plan_drops_or_replaces_goes_before_the_parents_a
         kinds(&cs)
     );
     // Redefined under its own name to a shape the parent's does not take.
-    let declared = partitioned_booking(&[("x", parent_exclusion())], &[("mine", differs)]);
+    let declared = partitioned_booking(&[("x", parent_exclusion())], &[("mine", differs.clone())]);
     let cs = exclusion_plan(&standing, &declared, &[]).unwrap();
     let (dropped, added) = at(&cs);
     assert!(
@@ -3500,26 +3563,42 @@ fn a_standing_own_exclusion_the_plan_drops_or_replaces_goes_before_the_parents_a
         "the leaf's redefinition drops before the parent's add: {:?}",
         kinds(&cs)
     );
-    // Negative: an adoptable own the declaration keeps is refused by name, not ordered.
+    // In the differ's own order too, which the resolver's schedule starts
+    // from: a parent's exclusion goes ahead of a partition's whose name sorts
+    // before its own.
+    let early = |parent: &[(&str, pbps_model::ExclusionConstraint)]| {
+        let mut s = partitioned_booking(parent, &[("mine", differs.clone())]);
+        let t = s.tables.remove(&leaf).unwrap();
+        s.tables.insert("app.aa".parse().unwrap(), t);
+        s
+    };
+    let cs = exclusion_plan(&early(&[]), &early(&[("x", parent_exclusion())]), &[]).unwrap();
+    assert_eq!(
+        exclusion_halves(&cs),
+        ["drop app.aa.mine", "add app.booking.x", "add app.aa.mine"]
+    );
+    // An adoptable own the declaration keeps is rebuilt, its drop first too.
     let declared = partitioned_booking(
         &[("x", parent_exclusion())],
         &[("mine", parent_exclusion())],
     );
-    let said = exclusion_plan(&standing, &declared, &[])
-        .unwrap_err()
-        .join("\n");
+    let cs = exclusion_plan(&standing, &declared, &[]).unwrap();
+    let (dropped, added) = at(&cs);
     assert!(
-        said.contains("which can take app.booking_1's `mine`"),
-        "{said}"
+        dropped.unwrap() < added.unwrap(),
+        "the rebuild's drop runs before the parent's add: {:?}",
+        kinds(&cs)
     );
 }
 
-/// An ordinary table attached as a partition: its own exclusion the parent's would take
-/// is refused by name (the engine makes it the parent's clone on `ATTACH`, so it would
-/// vanish with the parent's), and one that differs stays the partition's own and is
-/// compared with what the declaration says of it (DEC-2448.7).
+/// An ordinary table attached as a partition (S8, DEC-1671.1): its own exclusion
+/// the parent's might take is dropped before the attach, since the engine would
+/// make it the parent's clone (DEC-2448.7). One the declaration keeps is added
+/// back after it; one it leaves out is dropped with a record and refused without
+/// one. An own over another number of keys stays the table's own through the
+/// attach, and is compared with the declaration as for any partition.
 #[test]
-fn an_attached_tables_own_exclusion_is_kept_unless_the_parents_would_take_it() {
+fn an_attached_tables_own_exclusion_the_parents_might_take_is_dropped_before_the_attach() {
     use pbps_model::{PartitionBound, PartitionOf};
     let booking_table: TableName = "app.booking".parse().unwrap();
     let late: TableName = "app.late".parse().unwrap();
@@ -3551,13 +3630,21 @@ fn an_attached_tables_own_exclusion_is_kept_unless_the_parents_would_take_it() {
         s.tables.insert(late.clone(), t);
         s
     };
-    let plan = |base: &Schema, declared: &Schema| {
+    let plan = |base: &Schema, declared: &Schema, retired: Option<String>| {
         let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
             .unwrap()
             .ids;
-        let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+        let mut declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
             .unwrap()
             .ids;
+        if let Some(was) = retired {
+            let uid = declared_ids.table_uid(&late).unwrap().clone();
+            declared_ids
+                .exclusions
+                .entry(uid)
+                .or_default()
+                .insert("late_own".into(), retirement(was));
+        }
         diff(
             Side {
                 schema: base,
@@ -3570,35 +3657,55 @@ fn an_attached_tables_own_exclusion_is_kept_unless_the_parents_would_take_it() {
             &MinimalDialect,
             &Hints::default(),
         )
+        .map(|p| p.changes().clone())
+        .map_err(|errors| {
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
     };
-    // The parent's would take it: refused by name, before anything is planned.
-    let said = plan(&base(parent_exclusion()), &declared(None))
-        .map(|p| kinds(p.changes()))
-        .unwrap_err()
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        said.contains("its exclusion constraint `late_own` is its parent's `x` in shape"),
-        "{said}"
-    );
-    // One that differs stays its own: attached with no change to it, and compared with
-    // the declaration as for any partition (an own left out is a drop needing a record).
+    // The same shape, and one that differs only where the loose match does not
+    // look: both dropped first, and the kept one added back.
     let mut differs = parent_exclusion();
     differs.include = vec!["id".into()];
-    let attached = plan(&base(differs.clone()), &declared(Some(differs.clone())))
-        .unwrap()
-        .changes()
-        .clone();
-    assert_eq!(kinds(&attached), ["AttachPartition"]);
-    let said = plan(&base(differs), &declared(None))
-        .map(|p| kinds(p.changes()))
-        .unwrap_err()
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
+    differs.keys[1].operator = pbps_model::OperatorRef::symbol("-|-").unwrap();
+    for own in [parent_exclusion(), differs.clone()] {
+        let cs = plan(&base(own.clone()), &declared(Some(own)), None).unwrap();
+        assert_eq!(
+            kinds(&cs),
+            ["SetExclusion", "AttachPartition", "SetExclusion"]
+        );
+        assert_eq!(
+            exclusion_halves(&cs),
+            ["drop app.late.late_own", "add app.late.late_own"]
+        );
+    }
+    // Left out with a record: dropped before the attach, and nothing comes back.
+    let cs = plan(
+        &base(differs.clone()),
+        &declared(None),
+        Some(differs.canonical_text()),
+    )
+    .unwrap();
+    assert_eq!(kinds(&cs), ["SetExclusion", "AttachPartition"]);
+    // Negative: left out with no record, the drop is refused, not made on the way.
+    let said = plan(&base(differs), &declared(None), None).unwrap_err();
+    assert!(
+        said.contains("pbps drop-exclusion app.late late_own --reason"),
+        "{said}"
+    );
+    // Negative: one the parent's could not take stays through the attach.
+    let narrower = exclusion("int4range(b, c)", "&&");
+    let cs = plan(
+        &base(narrower.clone()),
+        &declared(Some(narrower.clone())),
+        None,
+    )
+    .unwrap();
+    assert_eq!(kinds(&cs), ["AttachPartition"]);
+    let said = plan(&base(narrower), &declared(None), None).unwrap_err();
     assert!(
         said.contains("pbps drop-exclusion app.late late_own --reason"),
         "{said}"
@@ -4800,7 +4907,9 @@ fn persistence_switches_follow_the_foreign_keys() {
 /// dropped, and a new name as a drop and an add, the engine recursing
 /// each into every partition. Refused by name: `strategy: online`, a
 /// unique index without a partition-key column, and a new index that
-/// would take a partition's own as its clone (measured on 16 and 18).
+/// would take as its clone an own index of a partition the plan creates
+/// (measured on 16 and 18). A standing partition's own that it might take
+/// is rebuilt around it (DEC-1671.1).
 #[test]
 fn a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken() {
     use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
@@ -4948,17 +5057,58 @@ fn a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken() {
         )
         .is_ok()
     );
-    // Adoption: a standing partition's own index, and one created by the
-    // same plan, a key's direction notwithstanding.
+    // A standing partition's own index the parent's might take is dropped
+    // ahead of it and added again after.
+    let steps = |cs: &ChangeSet| -> Vec<String> {
+        cs.changes
+            .iter()
+            .map(|p| {
+                format!(
+                    "{} {}",
+                    change_in_words(&p.change),
+                    p.change.table().unwrap().shown()
+                )
+            })
+            .collect()
+    };
+    let rebuilt = [
+        "drop index app.ev_1",
+        "add index app.ev",
+        "add index app.ev_1",
+    ];
     let own = [("ev_1_n", index(&["n"], false, None))];
-    refused(
-        outcome(
-            &tree(&[], &own, false),
-            &tree(&[("ev_n", index(&["n"], false, None))], &own, false),
+    let cs = planned(
+        &tree(&[], &own, false),
+        &tree(&[("ev_n", index(&["n"], false, None))], &own, false),
+        false,
+    )
+    .expect("planned");
+    assert_eq!(steps(&cs), rebuilt);
+    // Once, however many of the parent's might take it.
+    let cs = planned(
+        &tree(&[], &own, false),
+        &tree(
+            &[
+                ("ev_n", index(&["n"], false, None)),
+                ("ev_n_where", index(&["n"], false, Some("n > 0"))),
+            ],
+            &own,
             false,
         ),
-        "which can take app.ev_1's `ev_1_n`",
+        false,
+    )
+    .expect("planned");
+    assert_eq!(
+        steps(&cs),
+        [
+            "drop index app.ev_1",
+            "add index app.ev",
+            "add index app.ev",
+            "add index app.ev_1"
+        ]
     );
+    // One the plan creates the partition with cannot be moved: refused, a
+    // key's direction notwithstanding.
     let mut descending = index(&["n"], false, None);
     descending.columns[0].descending = true;
     refused(
@@ -5032,60 +5182,78 @@ fn a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken() {
     );
     // Negative: the partition dropped alone is planned.
     assert!(outcome(&indexed, &without_partition, false).is_ok());
-    // A predicate or an expression key is a match whatever its text: the
-    // engine compares what it parses (#1737 review).
-    let mut spaced = index(&["n"], false, None);
-    spaced.columns[0].key = pbps_model::IndexKey::Expression("n + 1".into());
-    let mut packed = spaced.clone();
-    packed.columns[0].key = pbps_model::IndexKey::Expression("n+1".into());
+    // A predicate or an expression key may be a match whatever its text, an
+    // expression may be a column it reads (`((n))` is stored as `n`), and a
+    // predicate the parent lacks is not asked either: each own is rebuilt.
+    let keyed = |expression: &str| {
+        let mut x = index(&["n"], false, None);
+        x.columns[0].key = pbps_model::IndexKey::Expression(expression.into());
+        x
+    };
     for (own_index, parent_index) in [
         (
             index(&["n"], false, Some("n>0")),
             index(&["n"], false, Some("n > 0")),
         ),
-        (packed, spaced),
+        (
+            index(&["n"], false, Some("n > 0")),
+            index(&["n"], false, None),
+        ),
+        (keyed("n+1"), keyed("n + 1")),
+        (index(&["n"], false, None), keyed("n")),
+        (keyed("(n)::bigint"), index(&["n"], false, None)),
+        (index(&["n"], false, None), keyed("n + 1")),
+        (keyed("abs(n)"), index(&["n"], false, None)),
     ] {
         let own = [("ev_1_x", own_index)];
-        refused(
-            outcome(
-                &tree(&[], &own, false),
-                &tree(&[("ev_x", parent_index)], &own, false),
-                false,
-            ),
-            "which can take app.ev_1's `ev_1_x`",
-        );
+        let cs = planned(
+            &tree(&[], &own, false),
+            &tree(&[("ev_x", parent_index)], &own, false),
+            false,
+        )
+        .expect("planned");
+        assert_eq!(steps(&cs), rebuilt, "{:?}", cs.changes);
     }
-    // An expression key's class is not text: the same expression under another
-    // class is another index to the engine, so the parent's is planned and the
-    // own stays beside its clone (measured on 18.6, BRIN's
-    // `int4_minmax_multi_ops`; DEC-2961.1). Negative: under the same class it
-    // is still refused by name.
-    let expression = |class: Option<&str>| {
-        let mut x = index(&["n"], false, None);
-        x.columns[0].key = pbps_model::IndexKey::Expression("n + 1".into());
+    // Negative: an expression that does not read the column is not a match for
+    // it, on either side, so one parent index over an expression does not
+    // rebuild every own of one key. A literal naming it reads nothing.
+    for (own_index, parent_index) in [
+        (index(&["id"], false, None), keyed("n + 1")),
+        (keyed("(n)"), index(&["id"], false, None)),
+        (index(&["n"], false, None), keyed("length('n')")),
+    ] {
+        let own = [("ev_1_x", own_index)];
+        let cs = planned(
+            &tree(&[], &own, false),
+            &tree(&[("ev_x", parent_index)], &own, false),
+            false,
+        )
+        .expect("planned");
+        assert_eq!(steps(&cs), ["add index app.ev"], "{:?}", cs.changes);
+    }
+    // For a partition the plan creates, an expression key's class is not
+    // text: the same expression under another class is another index to the
+    // engine, so the parent's is planned (measured on 18.6, BRIN's
+    // `int4_minmax_multi_ops`; DEC-2961.1), and under the same class it is
+    // refused by name.
+    let classed = |class: Option<&str>| {
+        let mut x = keyed("n + 1");
         x.columns[0].opclass = class.map(pbps_model::OpClassRef::bare);
         x
     };
-    let own = [("ev_1_x", expression(Some("int4_minmax_multi_ops")))];
-    assert!(
-        outcome(
-            &tree(&[], &own, false),
-            &tree(&[("ev_x", expression(None))], &own, false),
-            false,
-        )
-        .is_ok()
-    );
+    let own = [("ev_new_x", classed(Some("int4_minmax_multi_ops")))];
+    assert!(outcome(&plain, &tree(&[("ev_x", classed(None))], &own, true), false,).is_ok());
     refused(
         outcome(
-            &tree(&[], &own, false),
+            &plain,
             &tree(
-                &[("ev_x", expression(Some("int4_minmax_multi_ops")))],
+                &[("ev_x", classed(Some("int4_minmax_multi_ops")))],
                 &own,
-                false,
+                true,
             ),
             false,
         ),
-        "which can take app.ev_1's `ev_1_x`",
+        "which can take app.ev_new's `ev_new_x`",
     );
     // Negative: an own index the plan redefines is dropped before the
     // parent's is built and added after it, so it is its own.
@@ -5124,7 +5292,7 @@ fn a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken() {
         "{order:?}"
     );
     // An own index kept across its parent's column rename stands when
-    // the parent's is built: compared as renamed, it is not dropped
+    // the parent's is built: compared as renamed, it is rebuilt with it
     // (#1737 review).
     {
         let own = |column: &str| [("ev_1_n", index(&[column], false, None))];
@@ -5144,7 +5312,7 @@ fn a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken() {
         let declared_ids = crate::resolve(&declared, &base_ids, &rename, &ctx())
             .unwrap()
             .ids;
-        let errors = diff(
+        let cs = diff(
             Side {
                 schema: &base,
                 ids: &base_ids,
@@ -5156,19 +5324,25 @@ fn a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken() {
             &MinimalDialect,
             &Hints::default(),
         )
-        .expect_err("refused");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.to_string().contains("which can take app.ev_1's `ev_1_n`")),
-            "{errors:?}"
+        .expect("planned");
+        assert_eq!(
+            steps(&cs),
+            [
+                "drop index app.ev_1",
+                "rename column app.ev",
+                "add index app.ev",
+                "add index app.ev_1"
+            ],
+            "{:?}",
+            cs.changes
         );
     }
-    // Negative: an own index the engine does not adopt, by uniqueness or
-    // by predicate, leaves the parent's planned.
+    // Negative: an own index the parent's could not take, by uniqueness, by
+    // the number of keys or by a column, is not touched.
     for other in [
-        index(&["n", "ts"], true, None),
-        index(&["n"], false, Some("n > 0")),
+        index(&["n"], true, None),
+        index(&["n", "ts"], false, None),
+        index(&["id"], false, None),
     ] {
         let own = [("ev_1_x", other)];
         assert_eq!(
@@ -5180,6 +5354,147 @@ fn a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken() {
             Ok(vec!["AddIndex".to_owned()])
         );
     }
+    // An own unique index a foreign key references is not rebuilt: the key,
+    // added again, would be bound to the parent's clone (DEC-1671.1).
+    {
+        let referencing = |mut s: Schema, columns: &[&str]| {
+            let mut t = table(&[
+                ("ts", Column::new(ty("date"))),
+                ("id", Column::new(ty("int"))),
+            ]);
+            let columns: Vec<pbps_model::ColumnName> =
+                columns.iter().map(|c| (*c).into()).collect();
+            t.foreign_keys.insert(
+                "r_ts".into(),
+                pbps_model::ForeignKey {
+                    columns: columns.clone(),
+                    references_table: "app.ev_1".parse().unwrap(),
+                    references_columns: columns,
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+            s.tables.insert("app.r".parse().unwrap(), t);
+            s
+        };
+        let including = |columns: &[&str]| {
+            let mut x = index(columns, true, None);
+            x.include = vec!["n".into()];
+            x
+        };
+        let parent = |columns: &[&str]| [("ev_u", index(columns, true, None))];
+        // One the engine would not adopt, here for its `INCLUDE`, is left
+        // standing, and so is the key, whatever order it names the columns in.
+        for (columns, keyed_by) in [
+            (&["ts"][..], &["ts"][..]),
+            (&["id", "ts"][..], &["ts", "id"][..]),
+        ] {
+            let own = [("ev_1_u", including(columns))];
+            let cs = planned(
+                &referencing(tree(&[], &own, false), keyed_by),
+                &referencing(tree(&parent(columns), &own, false), keyed_by),
+                false,
+            )
+            .expect("planned");
+            assert_eq!(steps(&cs), ["add index app.ev"], "{:?}", cs.changes);
+        }
+        // Negative: the same shape that no key references is rebuilt, a key
+        // over other columns of the table being no reference to it.
+        let own = [("ev_1_u", including(&["id", "ts"]))];
+        for (base, declared) in [
+            (
+                tree(&[], &own, false),
+                tree(&parent(&["id", "ts"]), &own, false),
+            ),
+            (
+                referencing(tree(&[], &own, false), &["id"]),
+                referencing(tree(&parent(&["id", "ts"]), &own, false), &["id"]),
+            ),
+        ] {
+            let cs = planned(&base, &declared, false).expect("planned");
+            assert_eq!(steps(&cs), rebuilt, "{:?}", cs.changes);
+        }
+        // A referenced one the engine would adopt is refused by name, with the
+        // key.
+        let own = [("ev_1_u", index(&["ts"], true, None))];
+        let held = referencing(tree(&[], &own, false), &["ts"]);
+        let said = planned(
+            &held,
+            &referencing(tree(&parent(&["ts"]), &own, false), &["ts"]),
+            false,
+        )
+        .expect_err("refused")
+        .join("\n");
+        assert!(
+            said.contains(
+                "which can take as the partition's copy of it app.ev_1's `ev_1_u`, which the \
+                 foreign key `r_ts` of app.r references"
+            ),
+            "{said}"
+        );
+        // Negative (draft round 2): a key over `(ts)` is no reference to an own
+        // `(ts, ts)`. The engine binds a key only to an index with as many keys
+        // (measured on 18.7), so that own is rebuilt, not refused. The key is
+        // restated around the drop, as around any of a unique index on the
+        // table it references, and binds again to `ev_1_u`.
+        let doubled = [
+            ("ev_1_u", index(&["ts"], true, None)),
+            ("ev_1_uu", index(&["ts", "ts"], true, None)),
+        ];
+        let cs = planned(
+            &referencing(tree(&[], &doubled, false), &["ts"]),
+            &referencing(tree(&parent(&["ts", "ts"]), &doubled, false), &["ts"]),
+            false,
+        )
+        .expect("planned");
+        assert_eq!(
+            steps(&cs),
+            [
+                "drop foreign key app.r",
+                "drop index app.ev_1",
+                "add index app.ev",
+                "add index app.ev_1",
+                "add foreign key app.r"
+            ],
+            "{:?}",
+            cs.changes
+        );
+        // A key the plan drops holds nothing: the own is rebuilt, the key gone
+        // ahead of it.
+        let cs = planned(
+            &held,
+            &{
+                let mut s = referencing(tree(&parent(&["ts"]), &own, false), &["ts"]);
+                s.tables
+                    .get_mut(&"app.r".parse::<TableName>().unwrap())
+                    .unwrap()
+                    .foreign_keys
+                    .clear();
+                s
+            },
+            false,
+        )
+        .expect("planned");
+        assert_eq!(
+            steps(&cs),
+            [
+                "drop foreign key app.r",
+                "drop index app.ev_1",
+                "add index app.ev",
+                "add index app.ev_1"
+            ],
+            "{:?}",
+            cs.changes
+        );
+    }
+    // An own index the declarations no longer hold is dropped once.
+    let cs = planned(
+        &tree(&[], &[("ev_1_n", index(&["n"], false, None))], false),
+        &tree(&[("ev_n", index(&["n"], false, None))], &[], false),
+        false,
+    )
+    .expect("planned");
+    assert_eq!(steps(&cs), ["drop index app.ev_1", "add index app.ev"]);
 }
 /// #1533: a parent whose partitions are external is changed as any
 /// standing parent is. Switching it between declared and external
@@ -7357,6 +7672,291 @@ fn a_default_tightened_in_a_moving_plan_follows_the_move() {
     );
 }
 
+/// What an attach drops of the table's own indexes and keys (#1671, DEC-1671.1),
+/// in the shapes measured on 16.15 and 18.6: every one a parent's index might take,
+/// compared only on uniqueness, the number of keys and the columns, where an
+/// expression may be any other expression, or a column it reads. The one case left to be adopted is a
+/// lone candidate equal to the parent's, with no text and no key beside it.
+/// Negatives: what no index of the parent's might take stays the table's own,
+/// expression and filtered indexes among it.
+#[test]
+fn an_attach_drops_each_own_index_and_key_a_parents_index_might_take() {
+    use pbps_model::{BoundDatum, IndexColumn, IndexKey, PartitionBound, PartitionBy, PartitionOf};
+    let key = |text: &str| match text.strip_prefix('=') {
+        Some(expression) => IndexColumn {
+            key: IndexKey::Expression(expression.into()),
+            ..IndexColumn::column("m")
+        },
+        None => IndexColumn::column(text),
+    };
+    let index = |keys: &[&str], unique: bool, filter: Option<&str>| Index {
+        columns: keys.iter().map(|k| key(k)).collect(),
+        include: Vec::new(),
+        unique,
+        filter: filter.map(Into::into),
+        method: Default::default(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    let columns = || {
+        table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("m", Column::new(ty("int"))),
+            ("n", Column::new(ty("int"))),
+        ])
+    };
+    let unique_key = || pbps_model::UniqueConstraint {
+        columns: vec!["m".into(), "id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    // An index the declaration adds to the parent beside the attach (round 1).
+    let added: std::cell::RefCell<Option<Index>> = Default::default();
+    // The statements ahead of the attach, with the table's indexes all kept by
+    // the declaration unless `declared` is empty.
+    let outcome = |theirs: &[Index], own: &[(&str, Index)], constrained: bool, kept: bool| {
+        let mut parent = columns();
+        parent.partition_by = Some(PartitionBy {
+            external: false,
+            columns: vec!["id".into()],
+            strategy: Default::default(),
+        });
+        for (at, ix) in theirs.iter().enumerate() {
+            parent
+                .indexes
+                .insert(format!("p_{at}").as_str().into(), ix.clone());
+        }
+        if constrained {
+            parent.unique.insert("p_u".into(), unique_key());
+        }
+        let mut ordinary = columns();
+        if constrained {
+            ordinary.unique.insert("t_u".into(), unique_key());
+        }
+        for (name, ix) in own {
+            ordinary.indexes.insert((*name).into(), ix.clone());
+        }
+        let attached = Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: PartitionBound::Range {
+                    from: vec![BoundDatum::Value("0".into())],
+                    to: vec![BoundDatum::Value("10".into())],
+                },
+                columns: Default::default(),
+            }),
+            indexes: if kept {
+                ordinary.indexes.clone()
+            } else {
+                Default::default()
+            },
+            ..Default::default()
+        };
+        let mut base = schema_of("app.ev", parent.clone());
+        base.tables.insert("app.t".parse().unwrap(), ordinary);
+        let mut declared_parent = parent;
+        if let Some(ix) = added.borrow().clone() {
+            declared_parent.indexes.insert("p_new".into(), ix);
+        }
+        let mut declared = schema_of("app.ev", declared_parent);
+        declared.tables.insert("app.t".parse().unwrap(), attached);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(&declared, &base_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        let cs = diff(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        );
+        let cs = match cs {
+            Ok(cs) => cs,
+            Err(e) => return Err(format!("{e:?}")),
+        };
+        let steps: Vec<String> = cs
+            .changes
+            .iter()
+            .filter_map(|c| {
+                if let Change::Index(IndexChange::DropIndex { name, .. }) = &c.change {
+                    Some(format!("drop {}", name.shown()))
+                } else if let Change::Index(IndexChange::AddIndex { name, .. }) = &c.change {
+                    Some(format!("add {}", name.shown()))
+                } else if let Change::Constraint(ConstraintChange::DropUnique { name, .. }) =
+                    &c.change
+                {
+                    Some(format!("drop unique {}", name.shown()))
+                } else if let Change::Partition(PartitionChange::AttachPartition { .. }) = &c.change
+                {
+                    Some("attach".to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Ok(steps)
+    };
+    let before = |theirs: &[Index], own: &[(&str, Index)], constrained: bool, kept: bool| {
+        outcome(theirs, own, constrained, kept).expect("an attach is planned")
+    };
+    let m = || index(&["m"], false, None);
+    let mut descending = m();
+    descending.columns[0].descending = true;
+    let mut collated = m();
+    collated.columns[0].collation = Some("C".into());
+    let mut including = m();
+    including.include = vec!["n".into()];
+    let mut hashed = m();
+    hashed.method = pbps_model::IndexMethod::Brin;
+    // S1, the certain case: left to be adopted, nothing planned for it.
+    assert_eq!(before(&[m()], &[("t_m", m())], false, false), ["attach"]);
+    // A lone candidate that is not the certain case is dropped, and what the
+    // declaration keeps added after the attach: S5's differing predicate, a
+    // predicate on one side only, a collation, an `INCLUDE` column and a method
+    // the engine tells apart; S3's respelled text; the same expression and
+    // predicate, which only a parse could call the same; and S6, an expression
+    // the engine stores as the column it names, on either side.
+    for (theirs, own) in [
+        (
+            index(&["m"], false, Some("m > 0")),
+            index(&["m"], false, Some("m > 1")),
+        ),
+        (m(), index(&["m"], false, Some("m > 1"))),
+        (index(&["m"], false, Some("m > 0")), m()),
+        (m(), collated),
+        (m(), including),
+        (m(), hashed),
+        (
+            index(&["=n + 1"], false, Some("n>0")),
+            index(&["=n+1"], false, Some("n > 0")),
+        ),
+        (
+            index(&["=n + 1"], false, None),
+            index(&["=n + 1"], false, None),
+        ),
+        (
+            index(&["m"], false, Some("m > 0")),
+            index(&["m"], false, Some("m > 0")),
+        ),
+        (index(&["=(m)"], false, None), m()),
+        (m(), index(&["=(m)"], false, None)),
+        (m(), index(&["=(m)::bigint"], false, None)),
+    ] {
+        assert_eq!(
+            before(
+                std::slice::from_ref(&theirs),
+                &[("own", own.clone())],
+                false,
+                false
+            ),
+            ["drop own", "attach"],
+            "{theirs:?} over {own:?}"
+        );
+        assert_eq!(
+            before(
+                std::slice::from_ref(&theirs),
+                &[("own", own.clone())],
+                false,
+                true
+            ),
+            ["drop own", "attach", "add own"],
+            "{theirs:?} over {own:?}"
+        );
+    }
+    // S2: two candidates, one of them descending, both dropped.
+    assert_eq!(
+        before(
+            &[m()],
+            &[("t_a", m()), ("t_b", descending.clone())],
+            false,
+            false
+        ),
+        ["drop t_a", "drop t_b", "attach"]
+    );
+    // One candidate of two of the parent's indexes is certain for neither.
+    assert_eq!(
+        before(
+            &[m(), index(&["m"], false, Some("m > 0"))],
+            &[("t_m", m())],
+            false,
+            false
+        ),
+        ["drop t_m", "attach"]
+    );
+    // S4: the table's unique constraint, whose index a parent's plain unique
+    // index might take, is released, and so is the own index equal to that
+    // parent's, which the constraint stands beside. Equal columns, an
+    // expression that reads the column, or a predicate: all might.
+    for theirs in [
+        index(&["m", "id"], true, None),
+        index(&["=(m)", "id"], true, None),
+        index(&["=m + 0", "id"], true, None),
+        index(&["m", "id"], true, Some("n > 0")),
+    ] {
+        assert_eq!(
+            before(std::slice::from_ref(&theirs), &[], true, false),
+            ["drop unique t_u", "attach"],
+            "{theirs:?}"
+        );
+    }
+    assert_eq!(
+        before(
+            &[index(&["m", "id"], true, None)],
+            &[("t_m", index(&["m", "id"], true, None))],
+            true,
+            false
+        ),
+        ["drop t_m", "drop unique t_u", "attach"]
+    );
+    // Negative: a plain parent index, one over other columns, or one with
+    // another number of keys could not take the constraint's index.
+    for theirs in [
+        index(&["m", "id"], false, None),
+        index(&["n", "id"], true, None),
+        index(&["=m", "n", "id"], true, None),
+        index(&["=n + 0", "id"], true, None),
+    ] {
+        assert_eq!(
+            before(std::slice::from_ref(&theirs), &[], true, false),
+            ["attach"],
+            "{theirs:?}"
+        );
+    }
+    // S7 and the other negatives: an own index no parent's might take stays,
+    // declared and untouched, an expression or a predicate as much as any.
+    for own in [
+        index(&["m"], true, None),
+        index(&["n"], false, None),
+        index(&["n"], false, Some("n > 0")),
+        index(&["=n + 1", "id"], false, None),
+        index(&["=n + 1"], true, Some("n > 0")),
+        index(&["=n + 0"], false, None),
+        index(&["=abs(n)"], false, Some("m > 0")),
+    ] {
+        assert_eq!(
+            before(&[m()], &[("own", own.clone())], false, true),
+            ["attach"],
+            "{own:?}"
+        );
+    }
+    // Negative (round 1): a parent's index the plan adds beside the attach is
+    // refused by name (DEC-1687.1), so the attach never meets a parent's index
+    // the base did not hold, and nothing of the table's is left to be adopted
+    // by it.
+    *added.borrow_mut() = Some(m());
+    let refused = outcome(&[], &[("t_m", m())], false, true).expect_err("refused");
+    assert!(refused.contains("while this plan attaches"), "{refused}");
+    *added.borrow_mut() = None;
+}
+
 /// An ordinary table declared as a partition of a standing parent is
 /// attached and keeps its rows (#1545, DEC-1545.1). Its matching key,
 /// foreign key and index become the parent's clones and the parent's
@@ -7993,8 +8593,8 @@ fn an_ordinary_table_declared_as_a_partition_is_attached() {
     assert_eq!(attaches, ["app.z", "app.t"]);
 
     // The engine's match: a descending index is its parent's all the
-    // same, and of two matches neither is assumed adopted. One is left,
-    // one the declaration does not keep, and the other goes first.
+    // same, and a lone one is left to it (S1). Of two the engine takes one
+    // by an order the model does not hold, so both go first (S2).
     let order_of = |cs: &ChangeSet| -> Vec<String> {
         cs.changes
             .iter()
@@ -8028,8 +8628,11 @@ fn an_ordinary_table_declared_as_a_partition_is_attached() {
     let twice = ordinary(&|t| {
         t.indexes.insert("a_n".into(), index_on("n"));
     });
-    let planned = outcome(&twice, &declared, &[]).2.expect("one is left");
-    assert_eq!(order_of(&planned), ["drop t_id", "drop t_n", "attach"]);
+    let planned = outcome(&twice, &declared, &[]).2.expect("both dropped");
+    assert_eq!(
+        order_of(&planned),
+        ["drop a_n", "drop t_id", "drop t_n", "attach"]
+    );
     let mut keeps_a_n = declared.clone();
     keeps_a_n
         .tables
@@ -8039,10 +8642,10 @@ fn an_ordinary_table_declared_as_a_partition_is_attached() {
         .insert("a_n".into(), index_on("n"));
     let planned = outcome(&twice, &keeps_a_n, &[])
         .2
-        .expect("the other is left");
+        .expect("the kept one is added again");
     assert_eq!(
         order_of(&planned),
-        ["drop a_n", "drop t_id", "attach", "add a_n"]
+        ["drop a_n", "drop t_id", "drop t_n", "attach", "add a_n"]
     );
 
     // A deprecation is an annotation, not the column's shape.
@@ -8560,14 +9163,15 @@ fn an_ordinary_table_declared_as_a_partition_is_attached() {
     outcome(&g_base, &g_declared, &[])
         .2
         .expect("a generated column attaches in its parent's schema");
-    // An expression index kept as its own is dropped before the attach
-    // and built again after, in another schema and in the parent's.
-    let expression = |t: &mut Table| {
+    // An expression index kept as its own, which the parent's might take, is
+    // dropped before the attach and built again after, in another schema and
+    // in the parent's.
+    let expression = |t: &mut Table, text: &str| {
         t.indexes.insert(
             "t_f".into(),
             Index {
                 columns: vec![pbps_model::IndexColumn {
-                    key: pbps_model::IndexKey::Expression("f(n)".into()),
+                    key: pbps_model::IndexKey::Expression(text.into()),
                     descending: false,
                     opclass: None,
                     collation: None,
@@ -8577,28 +9181,38 @@ fn an_ordinary_table_declared_as_a_partition_is_attached() {
             },
         );
     };
-    let mut keeps_t_f = declared.clone();
-    expression(
-        keeps_t_f
-            .tables
-            .get_mut(&"app.t".parse::<TableName>().unwrap())
-            .unwrap(),
-    );
-    let with_t_f = ordinary(&|t| expression(t));
+    let keeping = |text: &str| {
+        let mut keeps = declared.clone();
+        expression(
+            keeps
+                .tables
+                .get_mut(&"app.t".parse::<TableName>().unwrap())
+                .unwrap(),
+            text,
+        );
+        (ordinary(&|t| expression(t, text)), keeps)
+    };
+    let (with_t_f, keeps_t_f) = keeping("(n)::bigint");
     let rebuilt = outcome(&elsewhere(&with_t_f), &elsewhere(&keeps_t_f), &[])
         .2
         .expect("rebuilt");
     assert_eq!(
         order_of(&rebuilt),
-        ["drop t_f", "drop t_id", "attach", "add t_f"]
+        ["drop t_f", "drop t_id", "drop t_n", "attach", "add t_f"]
     );
-    // In the parent's schema too: `f(n)` and the engine's own spelling of
-    // it are not told apart by text.
+    // In the parent's schema too: the cast may be the column's own type, which
+    // the text does not say.
     let kept = outcome(&with_t_f, &keeps_t_f, &[]).2.expect("kept");
     assert_eq!(
         order_of(&kept),
-        ["drop t_f", "drop t_id", "attach", "add t_f"]
+        ["drop t_f", "drop t_id", "drop t_n", "attach", "add t_f"]
     );
+    // Negative: an expression that does not read the parent's column is no
+    // index the parent's could take, so it stays the table's own, and the lone
+    // `t_n` is left to be adopted.
+    let (with_call, keeps_call) = keeping("f(id)");
+    let stays = outcome(&with_call, &keeps_call, &[]).2.expect("kept");
+    assert_eq!(order_of(&stays), ["drop t_id", "attach"]);
 
     // Negative: an ordinary table that stays one keeps its column uids,
     // and plans nothing.
@@ -9778,9 +10392,9 @@ fn a_partitions_own_checks_and_indexes_are_its_own_through_a_detach() {
             .collect();
         assert_eq!(kinds, expected, "{:?}", planned.changes);
     }
-    // Negative: one added to the parent is the parent's change, and one
-    // the partition's own `p_ts` would be adopted into as its clone is
-    // refused by name (#1688, DEC-1688.1).
+    // One added to the parent is the parent's change, and the partition's
+    // own `p_ts`, which it might take as its clone, is rebuilt around it
+    // (#1688, DEC-1671.1).
     let mut declared = tree.clone();
     declared
         .tables
@@ -9788,13 +10402,21 @@ fn a_partitions_own_checks_and_indexes_are_its_own_through_a_detach() {
         .unwrap()
         .indexes
         .insert("ev_ts".into(), index("ts"));
-    let errors = said(outcome(&tree, &declared).expect_err("refused"));
-    assert!(
-        errors.iter().any(
-            |e| e.starts_with("app.ev is a partitioned table or a partition")
-                && e.contains(&format!("which can take {p}'s `p_ts`", p = p.shown()))
-        ),
-        "{errors:?}"
+    let planned = outcome(&tree, &declared).expect("planned");
+    let kinds: Vec<String> = planned
+        .changes
+        .iter()
+        .map(|c| {
+            format!(
+                "{} {}",
+                change_in_words(&c.change),
+                c.change.table().unwrap().shown()
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["drop index app.p", "add index app.ev", "add index app.p"]
     );
 
     // Detached: the parent's index renamed to the declared name, its own

@@ -1,6 +1,7 @@
 //! Changes to a partitioned table the engine does not carry through its partitions, and why they are refused.
 
 use super::super::*;
+use super::adoption::referencing_key;
 
 pub(in super::super) fn refuse_partition_changes(
     base: Side<'_>,
@@ -327,8 +328,10 @@ pub(in super::super) fn refuse_partition_changes(
             continue;
         }
         // Before the attach, still the ordinary table's: a key or unique
-        // constraint whose index a parent's plain index could take (#1642
-        // review). On a standing partition it is the parent's clone.
+        // constraint whose index a parent's index might take (#1642 review,
+        // DEC-1671.1). On a standing partition it is the parent's clone. The
+        // exclusion dropped there for the same reason is among a partition's
+        // own, above.
         if matches!(
             change,
             Change::Constraint(ConstraintChange::DropUnique { .. })
@@ -545,10 +548,12 @@ pub(in super::super) fn refuse_partition_changes(
 /// - a unique index lacking a partition-key column is refused by the engine,
 ///   "unique constraint on partitioned table must include all partitioning
 ///   columns";
-/// - a new index adopts a partition's own index that matches it (DEC-1577.1),
-///   which then becomes the parent's clone, and the partition's own is gone
-///   from every later read. Refused by name (leon, 2026-10-08), the remedy
-///   being to drop or rename the partition's own first;
+/// - a new index or exclusion adopts a partition's own that matches it
+///   (DEC-1577.1), which then becomes the parent's clone, and the partition's
+///   own is gone from every later read. A standing partition's is rebuilt
+///   around the addition (`adoption.rs`, DEC-1671.1); one the plan creates the
+///   partition with, or for an exclusion adds, is refused by name, as is a
+///   standing own index a foreign key references, which is not rebuilt;
 /// - a primary key or unique constraint lacking a partition-key column is
 ///   refused by the engine as a unique index is;
 /// - a new check absorbs a partition's own check of its name.
@@ -582,8 +587,7 @@ fn refuse_parent_index(
                 .is_some_and(|of| of.parent == *table)
         })
     };
-    // The partition as the base held it, if it did: what a parent's new index can adopt is
-    // what stood before the plan.
+    // The partition as the base held it, if it did: one the plan creates has none.
     let held_before = |partition: &TableName| {
         declared
             .ids
@@ -641,17 +645,24 @@ fn refuse_parent_index(
                 name = name.shown(),
             ));
         }
-        // Every declared own the parent's would adopt, whether it stood before the plan or
-        // is added by it: the declaration rule (`validate_partition`, DEC-2448.7) already
-        // refuses an own of the parent's shape, because the state it declares is one the
-        // engine reaches only by order. An index is different (below): its same-plan own is
-        // legal. The same-plan order the engine allows is #2992's. A redefined own (a drop
-        // and an add under one name) is the declared one, so it is refused as well.
+        // An own the plan adds that the parent's would adopt, on a partition it creates, adds
+        // it to or redefines it on: the declaration rule (`validate_partition`, DEC-2448.7)
+        // already refuses an own of the parent's shape, because the state it declares is one
+        // the engine reaches only by order, and the order within one plan is #2992's. A
+        // standing own the plan leaves as it was is rebuilt around the parent's instead
+        // (DEC-1671.1), which runs after this and so is not seen here.
+        let adds = |partition: &TableName, own: &pbps_model::ObjectLocalName| {
+            changes.iter().any(|c| {
+                matches!(c, Change::Constraint(ConstraintChange::SetExclusion {
+                    table, name, to: Some(_), ..
+                }) if table == partition && name == own)
+            })
+        };
         let adopted: Vec<String> = partitions()
             .flat_map(|(partition, t)| {
                 t.exclude
                     .iter()
-                    .filter(|(_, own)| adopts_exclusion(exclusion, own))
+                    .filter(move |(own, x)| adds(partition, own) && adopts_exclusion(exclusion, x))
                     .map(move |(own, _)| {
                         format!(
                             "{partition}'s `{own}`",
@@ -664,8 +675,8 @@ fn refuse_parent_index(
         return (!adopted.is_empty()).then(|| {
             format!(
                 "add exclusion constraint `{name}`, which can take {} as the partition's copy \
-                 of it and leave the partition without its own; drop or rename the \
-                 partition's own exclusion in an earlier plan",
+                 of it and leave the partition without its own; add the partition's own \
+                 exclusion in a later plan",
                 adopted.join(", "),
                 name = name.shown(),
             )
@@ -707,26 +718,53 @@ fn refuse_parent_index(
             name = name.shown(),
         ));
     }
-    // Only an own index standing when the parent's is built: one the
-    // partition held before the plan and the plan does not drop, or every
-    // one of a partition the plan creates, which is created with them. One
-    // the plan adds to a standing partition is built after its parent's, and
-    // is its own. Held, not equal: across a column rename the index is
-    // compared as renamed and kept, not dropped (#1737 review).
-    let adopted: Vec<String> = partitions()
-        .flat_map(|(partition, t)| {
-            let before = held_before(partition);
+    // A standing own a foreign key references is not rebuilt, since the key
+    // would then be bound to the parent's clone. Where the parent's would adopt
+    // it, nothing keeps it the partition's own, so the add is refused, naming
+    // the key (DEC-1671.1).
+    let referenced: Vec<String> = partitions()
+        .filter_map(|(partition, t)| Some((partition, t, held_before(partition)?)))
+        .flat_map(|(partition, t, before)| {
             t.indexes
                 .iter()
-                .filter(move |(own, _)| {
-                    before.is_none_or(|b| {
-                        b.indexes.contains_key(own.raw())
-                            && !changes.iter().any(|c| {
-                                matches!(c, Change::Index(IndexChange::DropIndex { table, name })
-                                    if table == partition && name == *own)
-                            })
-                    })
+                .filter(move |(own, x)| {
+                    before.indexes.contains_key(own.raw())
+                        && !changes.iter().any(|c| {
+                            matches!(c, Change::Index(IndexChange::DropIndex { table, name })
+                                if table == partition && name == *own)
+                        })
+                        && adopts(index, x)
                 })
+                .filter_map(move |(own, x)| {
+                    let (from, key) = referencing_key(declared.schema, partition, x)?;
+                    Some(format!(
+                        "{partition}'s `{own}`, which the foreign key `{key}` of {from} references",
+                        partition = partition.shown(),
+                        own = own.shown(),
+                        key = key.shown(),
+                        from = from.shown(),
+                    ))
+                })
+        })
+        .collect();
+    if !referenced.is_empty() {
+        return Some(format!(
+            "add index `{name}`, which can take as the partition's copy of it {}; the own index \
+             cannot be rebuilt around it, since the key would then reference the copy, so remove \
+             that foreign key first",
+            referenced.join(", and "),
+            name = name.shown(),
+        ));
+    }
+    // An own index of a partition the plan creates, which is built with the
+    // partition and so before its parent's. A standing partition's own is
+    // otherwise rebuilt around the parent's (DEC-1671.1), and one the plan adds
+    // to it is built after the parent's, and is its own.
+    let adopted: Vec<String> = partitions()
+        .filter(|(partition, _)| held_before(partition).is_none())
+        .flat_map(|(partition, t)| {
+            t.indexes
+                .iter()
                 .filter(|(_, own)| adopts(index, own))
                 .map(move |(own, _)| {
                     format!(
@@ -740,8 +778,7 @@ fn refuse_parent_index(
     (!adopted.is_empty()).then(|| {
         format!(
             "add index `{name}`, which can take {} as the partition's copy of it and leave the \
-             partition without its own; drop or rename the partition's own index in an earlier \
-             plan",
+             partition without its own; add the partition's own index in a later plan",
             adopted.join(", "),
             name = name.shown(),
         )
