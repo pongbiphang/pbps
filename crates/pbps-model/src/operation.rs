@@ -1404,7 +1404,9 @@ impl Incarnations {
 }
 
 mod slots;
-pub use slots::{Address, NameKind, Named, Names, baseline_names, names};
+pub use slots::{
+    Address, NameKind, Named, Names, baseline_names, names, table_reference, trigger_table,
+};
 
 mod effects;
 mod lineage;

@@ -37,7 +37,7 @@ use pbps_model::TypeChange;
 use pbps_model::operation::{
     ObjectKey, Operation, OperationId, OwnerError, Owners, Snapshot, base_table_named,
 };
-use pbps_model::{Change, TableName};
+use pbps_model::{Change, ColumnName, TableName};
 
 /// One step's slots: what it claims and releases, each with its holder.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -412,7 +412,10 @@ pub fn carried(
         .into_iter()
         .flat_map(|named| slots_of(dialect, &named.address))
         .collect();
-    let keys: Vec<Option<ObjectKey>> = operations.iter().map(|op| op.key(owners).ok()).collect();
+    let actions = operations
+        .iter()
+        .map(|op| catalog_action(op, owners))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut out = Vec::new();
     for (k, o) in facts.occupants.iter().enumerate() {
         if declared.contains(&o.slot) {
@@ -442,19 +445,22 @@ pub fn carried(
         // else the one step that may. A column dropped before the move frees
         // the name earlier still, so the edge holds the claim longer than it
         // must, and never too short.
-        let possible: Vec<usize> = operations
+        let possible: Vec<usize> = actions
             .iter()
-            .zip(&keys)
             .enumerate()
-            .filter(|(_, (op, key))| {
-                leaves(op, key.as_ref(), &who)
-                    || moves(op, key.as_ref(), &who)
-                    || detached_release(op, key.as_ref(), &o.slot, Some(facts))
+            .filter(|(_, action)| {
+                action.as_ref().is_some_and(|action| {
+                    frees(action, &o.slot, &who, Some(facts)) || moves(action, &who).is_some()
+                })
             })
             .map(|(i, _)| i)
             .collect();
         let ranked: [&dyn Fn(usize) -> bool; 3] = [
-            &|i| moves(&operations[i], keys[i].as_ref(), &who),
+            &|i| {
+                actions[i]
+                    .as_ref()
+                    .is_some_and(|action| moves(action, &who).is_some())
+            },
             &|i| {
                 matches!(
                     operations[i].change(),
@@ -476,16 +482,13 @@ pub fn carried(
         let [step] = steps[..] else { continue };
         // As in the replay, an occupant the step takes out of its schema
         // does not land anywhere: a default renamed with its table's move.
-        let key = keys[step].as_ref();
-        let lands = if let Change::Table(TableChange::RenameTable { from, to, .. }) =
-            operations[step].change()
-            && from.schema != to.schema
-            && !leaves(&operations[step], key, &who)
-            && moves(&operations[step], key, &who)
+        let lands = if let Some(action) = &actions[step]
+            && let Some(to_schema) = moves(action, &who)
+            && !frees(action, &o.slot, &who, Some(facts))
         {
             let mut landed = o.slot.clone();
             if let pbps_dialect::slots::Namespace::Relations(schema) = &mut landed.namespace {
-                schema.clone_from(&to.schema);
+                to_schema.clone_into(schema);
             }
             Some(landed)
         } else {
@@ -944,6 +947,10 @@ pub fn verify(
             ));
         }
     }
+    let actions = operations
+        .iter()
+        .map(|op| catalog_action(op, owners))
+        .collect::<Result<Vec<_>, _>>()?;
     let claim = |held: &[(SlotKey, Occupier)],
                  operation: OperationId,
                  s: &SlotKey,
@@ -964,11 +971,8 @@ pub fn verify(
                         // An occupant leaves with its table or its column;
                         // one no step takes away holds the name whatever the
                         // order.
-                        Occupier::Catalog { .. } => operations.iter().any(|op| {
-                            let key = op.key(owners).ok();
-                            leaves(op, key.as_ref(), who)
-                                || moves(op, key.as_ref(), who)
-                                || detached_release(op, key.as_ref(), h, facts)
+                        Occupier::Catalog { .. } => actions.iter().flatten().any(|action| {
+                            frees(action, h, who, facts) || moves(action, who).is_some()
                         }),
                     };
                     return Some((who.describe(), gives_up));
@@ -983,7 +987,7 @@ pub fn verify(
         }
         None
     };
-    for (op, fx) in operations.iter().zip(&slots.effects) {
+    for ((op, fx), action) in operations.iter().zip(&slots.effects).zip(&actions) {
         for (s, h) in &fx.reads {
             if !held.iter().any(|(slot, who)| {
                 same(dialect, facts, slot, s) == Same::Yes && who == &Occupier::Managed(h.clone())
@@ -1003,22 +1007,17 @@ pub fn verify(
         // A catalog occupant goes with its table: out with a drop, and into
         // the new schema with a move, where it claims its name again.
         let mut landed = Vec::new();
-        let key = op.key(owners).ok();
-        held.retain(|(slot, who)| {
-            !leaves(op, key.as_ref(), who)
-                && !(matches!(who, Occupier::Catalog { .. })
-                    && detached_release(op, key.as_ref(), slot, facts))
-        });
-        if let Change::Table(TableChange::RenameTable { from, to, .. }) = op.change()
-            && from.schema != to.schema
-        {
+        if let Some(action) = action {
+            held.retain(|(slot, who)| !frees(action, slot, who, facts));
+        }
+        if let Some(action @ CatalogAction::RenameTable(_, Some(to_schema), _)) = action {
             let (moving, staying): (Vec<_>, Vec<_>) = std::mem::take(&mut held)
                 .into_iter()
-                .partition(|(_, who)| moves(op, key.as_ref(), who));
+                .partition(|(_, who)| moves(action, who).is_some());
             held = staying;
             for (mut s, who) in moving {
                 if let pbps_dialect::slots::Namespace::Relations(schema) = &mut s.namespace {
-                    schema.clone_from(&to.schema);
+                    str::clone_into(to_schema, schema);
                 }
                 landed.push((s, who));
             }
@@ -1076,22 +1075,43 @@ pub fn verify(
     Ok((violations, skipped))
 }
 
+/// A step that can take a catalog occupant away, with the key it acts on.
+/// [`catalog_action`] is the only place that says which kinds these are, so
+/// the release, move and detach readings below cannot drift from it.
+enum CatalogAction<'a> {
+    DropTable(ObjectKey),
+    /// The schema the table moves to, if it changes schema, and the columns
+    /// whose defaults the rename carries.
+    RenameTable(ObjectKey, Option<&'a str>, &'a [ColumnName]),
+    /// A column drop, rename, retype, or change of default or numbering.
+    Column(ObjectKey),
+    Detach(ObjectKey),
+}
+
+/// Whether the action releases the occupant's slot: the occupant leaves, or
+/// a detach renames the clone that holds it.
+fn frees(
+    action: &CatalogAction<'_>,
+    slot: &SlotKey,
+    who: &Occupier,
+    facts: Option<&CatalogFacts>,
+) -> bool {
+    leaves(action, who)
+        || matches!(who, Occupier::Catalog { .. }) && detached_release(action, slot, facts)
+}
+
 /// A detach only releases the clone names the catalog proved it renames.
 /// Its other indexes, and an unnamed key, keep their names (DEC-1558.1).
 fn detached_release(
-    op: &Operation,
-    key: Option<&ObjectKey>,
+    action: &CatalogAction<'_>,
     slot: &SlotKey,
     facts: Option<&CatalogFacts>,
 ) -> bool {
-    matches!(
-        op.change(),
-        Change::Partition(PartitionChange::DetachPartition { .. })
-    ) && matches!(key, Some(ObjectKey::Table(owner))
-            if facts.and_then(|f| f.detach_releases.get(slot)) == Some(owner.uid()))
+    matches!(action, CatalogAction::Detach(ObjectKey::Table(owner))
+        if facts.and_then(|f| f.detach_releases.get(slot)) == Some(owner.uid()))
 }
 
-/// Whether `op`, whose own key is `key`, takes a catalog occupant out of its
+/// Whether the action takes a catalog occupant out of its
 /// schema: its table dropped, or a column's own occupant (an owned sequence, a
 /// default constraint) at the first step that may drop or rename it, which is
 /// its column dropped, renamed, retyped or given another default or
@@ -1099,30 +1119,62 @@ fn detached_release(
 /// that step really gives the name up is the engine's walk (`object_order`,
 /// `order_carried_moves`); reading it as given up can let a misorder pass,
 /// never refuse a valid plan (DEC-1964.2).
-fn leaves(op: &Operation, key: Option<&ObjectKey>, who: &Occupier) -> bool {
+fn leaves(action: &CatalogAction<'_>, who: &Occupier) -> bool {
     let Occupier::Catalog { owner, column, .. } = who else {
         return false;
     };
-    let owned = owner.is_some() && owner.as_ref() == key;
-    if let Change::Table(TableChange::DropTable { .. }) = op.change() {
-        return owned;
+    if let CatalogAction::DropTable(key) = action {
+        return owner.as_ref() == Some(key);
     }
     let Some((column, column_name)) = column else {
         return false;
     };
-    if let Change::Table(TableChange::RenameTable { defaults, .. }) = op.change() {
-        return owned && defaults.contains(column_name);
+    if let CatalogAction::RenameTable(key, _, defaults) = action {
+        return owner.as_ref() == Some(key) && defaults.contains(column_name);
     }
-    matches!(
+    matches!(action, CatalogAction::Column(key)
+        if column_of(key).is_some_and(|key| Some(key) == column_of(column)))
+}
+
+/// The catalog action a step is, if it is one. Only such a step is asked for
+/// its key, and a key it cannot give is the caller's error. Every other step
+/// answers `None` unasked: a rebuild's copy or analyze step names an
+/// intermediate table no project declares, and its lookup error used to read
+/// as "no key" by accident (DEC-2993.4).
+fn catalog_action<'a>(
+    op: &'a Operation,
+    owners: &dyn Owners,
+) -> Result<Option<CatalogAction<'a>>, OwnerError> {
+    if matches!(
         op.change(),
         Change::Column(ColumnChange::DropColumn { .. })
             | Change::Column(ColumnChange::RenameColumn { .. })
             | Change::Column(ColumnChange::AlterColumnType { .. })
             | Change::Column(ColumnChange::AlterColumnDefault { .. })
             | Change::Column(ColumnChange::AlterColumnNumbering { .. })
-    ) && key
-        .and_then(column_of)
-        .is_some_and(|k| Some(k) == column_of(column))
+    ) {
+        return Ok(Some(CatalogAction::Column(op.key(owners)?)));
+    }
+    let action = if matches!(op.change(), Change::Table(TableChange::DropTable { .. })) {
+        CatalogAction::DropTable(op.key(owners)?)
+    } else if let Change::Table(TableChange::RenameTable {
+        from, to, defaults, ..
+    }) = op.change()
+    {
+        CatalogAction::RenameTable(
+            op.key(owners)?,
+            (from.schema != to.schema).then_some(to.schema.as_str()),
+            defaults,
+        )
+    } else if matches!(
+        op.change(),
+        Change::Partition(PartitionChange::DetachPartition { .. })
+    ) {
+        CatalogAction::Detach(op.key(owners)?)
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(action))
 }
 
 /// The column a key is about: a column's own key, or its default's, which is
@@ -1145,13 +1197,15 @@ fn column_of(key: &ObjectKey) -> Option<&pbps_model::operation::ColumnKey> {
     }
 }
 
-/// Whether `op` moves a catalog occupant's table to another schema, which
-/// carries the occupant there.
-fn moves(op: &Operation, key: Option<&ObjectKey>, who: &Occupier) -> bool {
+/// Whether the action moves the occupant's table to another schema.
+fn moves<'a>(action: &CatalogAction<'a>, who: &Occupier) -> Option<&'a str> {
     let Occupier::Catalog { owner, .. } = who else {
-        return false;
+        return None;
     };
-    matches!(op.change(), Change::Table(TableChange::RenameTable { from, to, .. }) if from.schema != to.schema)
-        && owner.is_some()
-        && owner.as_ref() == key
+    if let CatalogAction::RenameTable(key, to_schema, _) = action
+        && owner.as_ref() == Some(key)
+    {
+        return *to_schema;
+    }
+    None
 }

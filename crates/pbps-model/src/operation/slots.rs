@@ -18,7 +18,7 @@
 //! several (review of #1346), and a PostgreSQL array type is not a slot at all
 //! (#1503). They reach the order only through the catalog, as occupants.
 
-use super::effects::door;
+use super::effects::{Answer, door};
 use super::{ColumnKey, ObjectKey, Operation, OwnerError, Owners, PartKey, Recorded, Spelling};
 use crate::ColumnChange;
 use crate::ConstraintChange;
@@ -33,7 +33,7 @@ use crate::TableChange;
 use crate::TypeChange;
 use crate::TypeValueChange;
 use crate::change::DetachedKind;
-use crate::{Change, ModuleId, ModuleKind, Table, TableName};
+use crate::{Change, ModuleId, ModuleKind, Table, TableName, Uid};
 
 /// The kind of a name. The dialect maps each to the namespace that holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -103,6 +103,38 @@ struct Nx<'a> {
     names: Names,
 }
 
+/// A table a name only points at (DEC-2993.2): one the project does not
+/// declare is nobody's scope, and any other failure is the refusal.
+pub fn table_reference(
+    owners: &dyn Owners,
+    name: &TableName,
+    spelling: Spelling,
+) -> Result<Option<Uid>, OwnerError> {
+    door(owners.table(name, spelling))?.reference()
+}
+
+/// The table a trigger sits on, when its target is a table at that moment.
+///
+/// A trigger can sit on a view, and the table history records only tables.
+/// So a vacant table name is not a refusal here: it means the target is not
+/// a table now, as when a view has replaced the table (DEC-2993.4). An
+/// unreadable name is still the refusal.
+///
+/// Only a trigger's own target may be read this way. Every other table
+/// reference uses [`table_reference`], where a vacant name is refused.
+pub fn trigger_table(
+    owners: &dyn Owners,
+    name: &TableName,
+    at: Spelling,
+) -> Result<Option<Uid>, OwnerError> {
+    match door(owners.table(name, at))? {
+        Answer::Held(uid) => Ok(Some(uid)),
+        Answer::Undeclared(_) => Ok(None),
+        // A vacant table name can hold the trigger's view (DEC-2993.4).
+        Answer::Vacant(_) => Ok(None),
+    }
+}
+
 impl Nx<'_> {
     fn table(&self, name: &TableName) -> Result<Recorded, OwnerError> {
         self.owners
@@ -110,15 +142,8 @@ impl Nx<'_> {
             .map(Recorded)
     }
 
-    /// A table a name only points at (DEC-2993.2): one the project does not
-    /// declare is nobody's scope, and any other failure is the refusal.
     fn table_reference(&self, name: &TableName) -> Result<Option<Recorded>, OwnerError> {
-        door(
-            self.owners
-                .table(name, self.op.origin().spelling())
-                .map(Recorded),
-        )?
-        .reference()
+        Ok(table_reference(self.owners, name, self.op.origin().spelling())?.map(Recorded))
     }
 
     fn claim(&mut self, address: Address, holder: ObjectKey) {

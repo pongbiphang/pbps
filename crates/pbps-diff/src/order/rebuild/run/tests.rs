@@ -151,3 +151,23 @@ fn a_composed_rebuild_obeys_the_same_engine_and_mode_gate() {
         "{why}"
     );
 }
+
+#[test]
+fn a_surface_without_an_expected_key_does_not_consider_steps() {
+    use pbps_model::operation::module_key;
+
+    let key = module_key(&"app.v".parse().unwrap());
+    let other = module_key(&"app.other".parse().unwrap());
+    let candidates = [(2, &other), (3, &key)];
+    assert_eq!(locate_surface(Some(&key), candidates.into_iter()), Some(3));
+    assert_eq!(locate_surface(Some(&key), [(2, &other)].into_iter()), None);
+    assert_eq!(
+        locate_surface(
+            None,
+            candidates
+                .into_iter()
+                .inspect(|_| panic!("looked for a missing endpoint"))
+        ),
+        None
+    );
+}

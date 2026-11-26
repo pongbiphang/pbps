@@ -2354,3 +2354,23 @@ Pinned by `operation/effects/tests.rs` (the four lookups, `type_input`, `renames
 - The benchmark returns the error to the fixture assertion at each test entry point.
 
 Pinned by the model's scripted owners, the fallible baseline constructor, and the scoped analysis, captured observation, resolver and carried-move tests.
+
+<a id="dec-2993-4"></a>
+
+**DEC-2993.4. A step is asked for its key only when it can use one, and the dialect's table lookups stop reading an error as "none" (#2993).** Nine release sites still called `.ok()` on a name lookup. This entry covers seven of them. They are two different things.
+
+*Steps that were asked without need.* The catalog replay and the carried moves asked every step for its key, and only a few kinds can use it: a table drop or rename, a column change that can free the name, and a partition detach. `catalog_action` now classifies the step first and asks only those kinds. Each of them carries its uid in its payload, so its key does not come from a name lookup, and an error there is returned. The release, move and detach readings take the classified action, so there is one list of kinds. Rebuild ordering reads the selected steps' keys once and returns a key error. A surface with no key at one end binds no step; before, an absent key could match a step whose lookup had failed.
+
+*Table references in the dialect's slots.* The parent of a prospective partition and the table of a baseline trigger use the reference reading of DEC-2993.2: a held table gives its uid, an undeclared table gives no scope, and a vacant or unreadable name returns the original error. A partition step that matches its parent carries its own uid, so its key is required.
+
+*The table a trigger sits on.* The trigger scope and the old trigger id asked the same question twice. They now share one read, `trigger_table`. It differs from the reference reading in one answer: a vacant table name gives no table scope instead of a refusal. A trigger can sit on a view, and the table history records only tables. When a view replaces a table of the same name and the trigger is edited, both lookups meet a vacant name, and that SQL Server plan is accepted today. A refusal there would refuse a valid plan. An unreadable name still returns the original error. `trigger_table` is for a trigger's own target only. The types do not enforce this; the name, its doc comment and this entry do.
+
+Measured in the live run before the change: 6,082 carried lookups and 72 collision lookups, all held. 274,721 replay lookups, of which 154 were undeclared: a rebuild's intermediate table on copy, analyze and partitioned-index steps. 2,506 rebuild-ordering lookups, all held. 36 prospective-parent lookups, all held. 231 and 490 trigger lookups, with 24 and 12 undeclared answers (a trigger on a view or on a table the project does not declare). No site met a vacant or unreadable name. The baseline trigger table was not in that run; offline replacement probes met only held and undeclared answers there.
+
+Rejected:
+
+- Changing the return type of `Operation::key` for every caller. The keys that matter come from the payload and do not fail. The lookups that failed belonged to steps that should not have been asked.
+- Asking, on a vacant table name, whether a view holds it. `Owners` has no relation lookup, and a new method on it for one caller is more than this needs.
+- Refusing the two history builds in `order/generated.rs` here. They are not owner lookups, and a refusal would refuse plans accepted today. That is a later slice.
+
+Pinned by the catalog movement and collision tests in `slot_tests.rs`, the missing-surface test in `rebuild/run/tests.rs`, the four answers at each lookup and the shared trigger read in the dialect's slot tests, and the SQL Server plan in `engine_effects.rs` that edits a trigger after a view replaces its table.

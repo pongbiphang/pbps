@@ -1939,3 +1939,33 @@ fn sql_server_refuses_the_last_data_column_and_postgresql_does_not() {
     use pbps_dialect::Dialect as _;
     assert!(Mssql.refuses_dropping_last_column());
 }
+
+#[test]
+fn a_trigger_edit_follows_the_view_that_replaces_its_table() {
+    let (trigger_id, trigger) = instead_of_trigger();
+    let relation = TableName::new("dbo", "v");
+    let mut before = with_views("int", &[]);
+    before
+        .tables
+        .insert(relation.clone(), before.tables[&t()].clone());
+    before.modules.insert(trigger_id.clone(), trigger.clone());
+
+    let view = view_of("SELECT id, a FROM dbo.t", true);
+    let mut after = with_views("int", &[("v", view)]);
+    let mut edited = trigger;
+    edited.definition.push_str(" -- edited");
+    after.modules.insert(trigger_id, edited);
+    let plan = Diffed::deciding(
+        &before,
+        &after,
+        &[pbps_model::Intent::DropTable {
+            table: relation,
+            reason: "replaced by a view".parse().unwrap(),
+        }],
+    );
+
+    assert_eq!(
+        steps(&plan),
+        ["drop table dbo.v", "create dbo.v", "alter dbo.v.trg"]
+    );
+}
