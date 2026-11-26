@@ -2,10 +2,11 @@
 //!
 //! Implements the 7 required methods of [`PlanSession`], the 4 non-catalog plan
 //! gates (`require_transactional_rebuilds`, `vet_plan_sites`, `support_rows`,
-//! `server_limits`), and the 3 name-namespace methods
+//! `server_limits`), the 3 name-namespace methods
 //! (`refuse_occupied_relation_names`, `check_names_against_catalog`,
-//! `order_by_catalog`); `schedule` and `check_final_order` keep their refusing
-//! defaults until SQLite's dependency and drop-blocker passes are built.
+//! `order_by_catalog`), and connected view-dependent scheduling (`schedule`);
+//! `check_final_order` keeps its refusing default until SQLite's drop-blocker
+//! pass is built.
 
 use super::*;
 use pbps_dialect::Dialect as _;
@@ -141,6 +142,65 @@ pub(in crate::engine) fn refuse_system_versioned(changes: &ChangeSet) -> anyhow:
         "SQLite does not support system-versioned tables"
     );
     Ok(())
+}
+
+/// Collects every dropped or rebuilt view in `changes` (refusing non-view
+/// modules on SQLite) and resolves its catalog readers from `inventory` through
+/// [`inventory::view_dependents`]. Shared by [`PlanSession::schedule`] and
+/// [`ApplySession::check_module_dependency_facts`].
+pub(in crate::engine) fn module_dependents_from(
+    inventory: &Inventory,
+    changes: &ChangeSet,
+    known_modules: &BTreeSet<pbps_model::ModuleId>,
+) -> anyhow::Result<crate::dependents::schedule::ModuleDependents> {
+    let dropped = crate::dependents::dropped_modules(changes);
+    let mut views = Vec::with_capacity(dropped.len());
+    for (id, kind) in dropped {
+        match kind {
+            pbps_model::ModuleKind::View => views.push(id),
+            pbps_model::ModuleKind::Procedure => {
+                anyhow::bail!("SQLite does not support procedures (`{}`)", id.shown())
+            }
+            pbps_model::ModuleKind::Function => {
+                anyhow::bail!(
+                    "SQLite does not support stored functions (`{}`)",
+                    id.shown()
+                )
+            }
+            pbps_model::ModuleKind::Trigger => {
+                anyhow::bail!(
+                    "SQLite does not support managed triggers yet (`{}`)",
+                    id.shown()
+                )
+            }
+        }
+    }
+    Ok(inventory::view_dependents(
+        inventory,
+        &views,
+        known_modules,
+    )?)
+}
+
+pub(in crate::engine) fn known_module_ids<'a>(
+    changes: &ChangeSet,
+    schemas: impl IntoIterator<Item = &'a Schema>,
+) -> BTreeSet<pbps_model::ModuleId> {
+    let mut known: BTreeSet<pbps_model::ModuleId> = schemas
+        .into_iter()
+        .flat_map(|s| s.modules.keys().cloned())
+        .collect();
+    for p in &changes.changes {
+        if let pbps_model::Change::Module(
+            pbps_model::ModuleChange::CreateModule { id, .. }
+            | pbps_model::ModuleChange::AlterModule { id, .. }
+            | pbps_model::ModuleChange::DropModule { id, .. },
+        ) = &p.change
+        {
+            known.insert(id.clone());
+        }
+    }
+    known
 }
 
 fn ensure_inventory<'a>(
@@ -395,6 +455,107 @@ impl PlanSession for Sqlite {
         let inv = ensure_inventory(state, conn, changes, frame)?.clone();
         order_and_check_names(self, &inv, changes, frame)?;
         Ok(())
+    }
+
+    /// Schedules view edits and drops against `main.sqlite_schema`: managed
+    /// views that may read an edited view are woven around it (dropped before,
+    /// created after), while unmanaged views, triggers (including `INSTEAD OF`
+    /// triggers on the view), and managed views kept over a dropped view refuse
+    /// the plan naming SQLite, the view and the reader. Foreign role, enum and
+    /// partitioned-table rebuild plans are refused by name.
+    async fn schedule<S: pbps_diff::order::RouteState<Self>>(
+        &self,
+        state: &mut PlanState,
+        conn: &mut Conn,
+        changes: PlanningPlan<S>,
+        frame: Frame<'_>,
+        role_members: Option<&RoleMembers>,
+        _again: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
+    ) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck)> {
+        let _ = sqlite_conn(conn)?;
+        anyhow::ensure!(
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::Partition(
+                    pbps_model::PartitionChange::RebuildPartitionedTable(_)
+                )
+            )),
+            "SQLite does not support partitioned-table rebuilds"
+        );
+        if role_members.is_some()
+            || changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::Role(_)))
+        {
+            return Err(sqlite_has_no_roles("scheduling role changes"));
+        }
+        anyhow::ensure!(
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                pbps_model::Change::TypeValue(pbps_model::TypeValueChange::EnumRebuild { .. })
+            )),
+            "SQLite has no enum types to rebuild"
+        );
+        let (declarations, read) = defaults::scheduled_inputs(
+            frame.written.schema,
+            crate::dependents::Sources {
+                before: frame.recorded,
+                after: frame.written.ids,
+            },
+            &frame.hints.annotations,
+            None,
+        );
+        if crate::dependents::dropped_modules(&changes).is_empty() {
+            let scheduled =
+                crate::dependents::schedule::schedule(changes, &declarations, &read, self)?;
+            return Ok((
+                scheduled.changes,
+                defaults::not_applicable(
+                    "SQLite",
+                    "module_dependents",
+                    "the plan drops or rebuilds no view",
+                ),
+            ));
+        }
+        let inv = ensure_inventory(state, conn, &changes, frame)?.clone();
+        let known = known_module_ids(&changes, [frame.written.schema, frame.recorded.schema]);
+        let found = module_dependents_from(&inv, &changes, &known)?;
+        let read = read.with_module_dependents(&found);
+        let scheduled = crate::dependents::schedule::schedule(changes, &declarations, &read, self)?;
+        let partitions =
+            crate::dependents::standing_partitions(frame.written.schema, &scheduled.changes);
+        let sources = crate::dependents::Sources {
+            before: frame.recorded,
+            after: frame.written.ids,
+        };
+        let left = crate::dependents::unaccounted(
+            &scheduled.changes,
+            &found,
+            &partitions,
+            &sources
+                .project(&scheduled.changes.changes)
+                .map_err(anyhow::Error::msg)?,
+        );
+        if !left.is_empty() {
+            anyhow::bail!(
+                "module_dependents (SQLite): the plan still drops a view before what depends \
+                 on it; this is a bug in pbps, please report it:\n  {}",
+                left.join("\n  ")
+            );
+        }
+        let dependents: usize = found.values().map(Vec::len).sum();
+        let check = ConnectedCheck {
+            name: "module_dependents",
+            engine: "SQLite",
+            status: "passed",
+            message: format!(
+                "{dependents} dependent(s) of {} dropped or rebuilt view(s) accounted for; {} change(s) added to the plan for them",
+                found.len(),
+                scheduled.added
+            ),
+        };
+        Ok((scheduled.changes, check))
     }
 
     /// Orders column renames and slot handovers over the cached inventory and
@@ -2768,7 +2929,69 @@ mod tests {
             .expect("rename column passes every PlanSession position");
         }
 
-        // 10. Pin the positions that still refuse plans needing later PRs:
+        // 10. Drop view (alone and with a managed reader) now passes EVERY
+        //     PlanSession position!
+        {
+            let mut base_v = base.clone();
+            let v_id = ModuleId::Named(TableName::new("main", "v_old"));
+            base_v
+                .modules
+                .insert(v_id.clone(), *view_module("SELECT 1"));
+            run_all_positions(
+                &[
+                    "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+                    "CREATE VIEW v_old AS SELECT 1",
+                ],
+                &base_v,
+                &base_ids,
+                &base,
+                &base_ids,
+                vec![Change::Module(ModuleChange::DropModule {
+                    id: v_id,
+                    kind: ModuleKind::View,
+                })],
+            )
+            .expect("drop view alone passes every PlanSession position");
+        }
+        {
+            let mut base_v = base.clone();
+            let v_id = ModuleId::Named(TableName::new("main", "v_old"));
+            let u_id = ModuleId::Named(TableName::new("main", "u_reads_v"));
+            base_v
+                .modules
+                .insert(v_id.clone(), *view_module("SELECT id FROM items"));
+            base_v
+                .modules
+                .insert(u_id.clone(), *view_module("SELECT id FROM v_old"));
+            // Even given [DropModule(v_old), DropModule(u_reads_v)], `schedule`
+            // reorders `u_reads_v` ahead of `v_old` and all positions pass.
+            run_all_positions(
+                &[
+                    "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+                    "CREATE VIEW v_old AS SELECT id FROM items",
+                    "CREATE VIEW u_reads_v AS SELECT id FROM v_old",
+                ],
+                &base_v,
+                &base_ids,
+                &base,
+                &base_ids,
+                vec![
+                    Change::Module(ModuleChange::DropModule {
+                        id: v_id,
+                        kind: ModuleKind::View,
+                    }),
+                    Change::Module(ModuleChange::DropModule {
+                        id: u_id,
+                        kind: ModuleKind::View,
+                    }),
+                ],
+            )
+            .expect("drop view with dropped managed reader passes every PlanSession position");
+        }
+
+        // 11. Pin the positions that still refuse plans needing later PRs:
         // - DropTable -> `check_final_order` (drop blockers)
         {
             let mut desired = base.clone();
@@ -2820,32 +3043,8 @@ mod tests {
             .unwrap_err();
             assert_eq!(pos, "check_final_order");
         }
-        // - DropModule (View) -> `schedule` (module dependents)
-        {
-            let mut base_v = base.clone();
-            let v_id = ModuleId::Named(TableName::new("main", "v_old"));
-            base_v
-                .modules
-                .insert(v_id.clone(), *view_module("SELECT 1"));
-            let (pos, _) = run_all_positions(
-                &[
-                    "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
-                    "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
-                    "CREATE VIEW v_old AS SELECT 1",
-                ],
-                &base_v,
-                &base_ids,
-                &base,
-                &base_ids,
-                vec![Change::Module(ModuleChange::DropModule {
-                    id: v_id,
-                    kind: ModuleKind::View,
-                })],
-            )
-            .unwrap_err();
-            assert_eq!(pos, "schedule");
-        }
-        // - AlterModule (View) -> `schedule` (module dependents)
+        // - AlterModule (View) alone -> now passes `schedule` and `order_by_catalog`,
+        //   stopped at `check_final_order` (`defaults::module_rebuilds`).
         {
             let mut base_v = base.clone();
             let v_id = ModuleId::Named(TableName::new("main", "v_edit"));
@@ -2872,7 +3071,566 @@ mod tests {
                 })],
             )
             .unwrap_err();
-            assert_eq!(pos, "schedule");
+            assert_eq!(pos, "check_final_order");
+        }
+        // - AlterModule (View) with managed reader -> `schedule` weaves the reader
+        //   around the edit and passes `order_by_catalog`, stopped at `check_final_order`.
+        {
+            let mut base_v = base.clone();
+            let v_id = ModuleId::Named(TableName::new("main", "v_edit"));
+            let u_id = ModuleId::Named(TableName::new("main", "u_reader"));
+            base_v
+                .modules
+                .insert(v_id.clone(), *view_module("SELECT id FROM items"));
+            base_v
+                .modules
+                .insert(u_id.clone(), *view_module("SELECT id FROM v_edit"));
+            let mut desired_v = base_v.clone();
+            desired_v
+                .modules
+                .insert(v_id.clone(), *view_module("SELECT id + 1 AS id FROM items"));
+            let (pos, _) = run_all_positions(
+                &[
+                    "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+                    "CREATE VIEW v_edit AS SELECT id FROM items",
+                    "CREATE VIEW u_reader AS SELECT id FROM v_edit",
+                ],
+                &base_v,
+                &base_ids,
+                &desired_v,
+                &base_ids,
+                vec![Change::Module(ModuleChange::AlterModule {
+                    id: v_id,
+                    module: view_module("SELECT id + 1 AS id FROM items"),
+                })],
+            )
+            .unwrap_err();
+            assert_eq!(pos, "check_final_order");
+        }
+    }
+
+    #[test]
+    fn schedule_passes_for_unreferenced_view_edit_and_drop_and_rebuilds_managed_readers_in_executable_order()
+     {
+        use pbps_model::{Change, ModuleChange, ModuleId, ModuleKind};
+
+        let dialect = Sqlite::default();
+        let rediff =
+            |_also: &BTreeSet<ModuleId>| -> anyhow::Result<PlanningPlan<pbps_diff::order::Draft>> {
+                anyhow::bail!("unexpected rediff")
+            };
+
+        let run_schedule = |conn: &mut Conn,
+                            base: &Schema,
+                            desired: &Schema,
+                            changes: Vec<Change>|
+         -> anyhow::Result<(
+            PlanningPlan<pbps_diff::order::Draft>,
+            ConnectedCheck,
+        )> {
+            let ids = IdsFile::default();
+            let hints = pbps_model::Hints::default();
+            let baseline = StateSnapshot::new(
+                pbps_model::StateKind::Baseline,
+                base.clone(),
+                ids.clone(),
+                "test",
+            );
+            let base_side = pbps_diff::Side {
+                schema: base,
+                ids: &ids,
+            };
+            let desired_side = pbps_diff::Side {
+                schema: desired,
+                ids: &ids,
+            };
+            let frame = Frame {
+                label: "test.db",
+                recorded: base_side,
+                written: desired_side,
+                base: base_side,
+                declared: desired_side,
+                hints: &hints,
+                baseline: &baseline,
+            };
+            let mut state = PlanState::default();
+            let plan = pbps_diff::order::propose(change_set(changes));
+            let (mut scheduled, check) =
+                now(dialect.schedule(&mut state, conn, plan, frame, None, &rediff))?;
+            let ordered = now(dialect.order_by_catalog(&mut state, conn, &mut scheduled, frame))?;
+            #[cfg(debug_assertions)]
+            if !ordered.verified {
+                pbps_diff::order::shadow::observe_scheduled(
+                    base_side,
+                    desired_side,
+                    &dialect,
+                    &hints.annotations.modules(desired),
+                    &scheduled,
+                    pbps_diff::order::shadow::Stage::Final,
+                    ordered.facts.as_ref(),
+                    &Default::default(),
+                )?;
+            }
+            Ok((scheduled, check))
+        };
+
+        // 1. Editing and dropping a view nothing reads both pass.
+        {
+            let (_tmp, mut conn) = TempDb::create();
+            for sql in [
+                "CREATE TABLE items (id INTEGER PRIMARY KEY)",
+                "CREATE VIEW solo AS SELECT id FROM items",
+            ] {
+                now(conn.execute(sql)).expect(sql);
+            }
+            let solo = ModuleId::Named(TableName::new("main", "solo"));
+            let mut base = Schema::default();
+            base.modules
+                .insert(solo.clone(), *view_module("SELECT id FROM items"));
+
+            let mut edited = Schema::default();
+            edited
+                .modules
+                .insert(solo.clone(), *view_module("SELECT id + 1 AS id FROM items"));
+            let (plan, check) = run_schedule(
+                &mut conn,
+                &base,
+                &edited,
+                vec![Change::Module(ModuleChange::AlterModule {
+                    id: solo.clone(),
+                    module: view_module("SELECT id + 1 AS id FROM items"),
+                })],
+            )
+            .expect("unreferenced edit passes");
+            assert_eq!(check.engine, "SQLite");
+            assert_eq!(check.status, "passed");
+            assert_eq!(plan.changes.len(), 1);
+
+            let (drop_plan, drop_check) = run_schedule(
+                &mut conn,
+                &base,
+                &Schema::default(),
+                vec![Change::Module(ModuleChange::DropModule {
+                    id: solo,
+                    kind: ModuleKind::View,
+                })],
+            )
+            .expect("unreferenced drop passes");
+            assert_eq!(drop_check.status, "passed");
+            assert_eq!(drop_plan.changes.len(), 1);
+        }
+
+        // 2. Managed direct + transitive readers (`u -> w -> v`) are rebuilt
+        //    around an edit of `v` in an order SQLite accepts and executes.
+        {
+            let (_tmp, mut conn) = TempDb::create();
+            for sql in [
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+                "INSERT INTO items VALUES (1, 10)",
+                "CREATE VIEW v AS SELECT id, qty FROM items",
+                "CREATE VIEW w AS SELECT id, qty FROM v",
+                "CREATE VIEW u AS SELECT qty FROM w",
+            ] {
+                now(conn.execute(sql)).expect(sql);
+            }
+            let v = ModuleId::Named(TableName::new("main", "v"));
+            let w = ModuleId::Named(TableName::new("main", "w"));
+            let u = ModuleId::Named(TableName::new("main", "u"));
+            let mut base = Schema::default();
+            base.modules
+                .insert(v.clone(), *view_module("SELECT id, qty FROM items"));
+            base.modules
+                .insert(w.clone(), *view_module("SELECT id, qty FROM v"));
+            base.modules
+                .insert(u.clone(), *view_module("SELECT qty FROM w"));
+            let mut desired = base.clone();
+            desired.modules.insert(
+                v.clone(),
+                *view_module("SELECT id, qty * 2 AS qty FROM items"),
+            );
+
+            let ids = IdsFile::default();
+            let hints = pbps_model::Hints::default();
+            let baseline = StateSnapshot::new(
+                pbps_model::StateKind::Baseline,
+                base.clone(),
+                ids.clone(),
+                "test",
+            );
+            let base_side = pbps_diff::Side {
+                schema: &base,
+                ids: &ids,
+            };
+            let desired_side = pbps_diff::Side {
+                schema: &desired,
+                ids: &ids,
+            };
+            let frame = Frame {
+                label: "test.db",
+                recorded: base_side,
+                written: desired_side,
+                base: base_side,
+                declared: desired_side,
+                hints: &hints,
+                baseline: &baseline,
+            };
+            let diff_plan =
+                pbps_diff::diff(base_side, desired_side, &dialect, &hints).expect("diff");
+            let mut state = PlanState::default();
+            let rediff_diff =
+                |_also: &BTreeSet<ModuleId>| -> anyhow::Result<pbps_diff::order::DiffPlan> {
+                    anyhow::bail!("unexpected rediff")
+                };
+            let (mut scheduled, check) =
+                now(dialect.schedule(&mut state, &mut conn, diff_plan, frame, None, &rediff_diff))
+                    .expect("managed transitive readers woven around edit");
+            let ordered_check =
+                now(dialect.order_by_catalog(&mut state, &mut conn, &mut scheduled, frame))
+                    .expect("order_by_catalog");
+            #[cfg(debug_assertions)]
+            if !ordered_check.verified {
+                pbps_diff::order::shadow::observe_scheduled(
+                    base_side,
+                    desired_side,
+                    &dialect,
+                    &hints.annotations.modules(&desired),
+                    &scheduled,
+                    pbps_diff::order::shadow::Stage::Final,
+                    ordered_check.facts.as_ref(),
+                    &Default::default(),
+                )
+                .expect("the scheduled plan is observed");
+            }
+            assert_eq!(check.engine, "SQLite");
+            assert_eq!(check.status, "passed");
+            let order: Vec<(&str, String)> = scheduled
+                .changes
+                .iter()
+                .map(|p| {
+                    let Change::Module(m) = &p.change else {
+                        panic!("unexpected change {:?}", p.change);
+                    };
+                    match m {
+                        ModuleChange::DropModule { id, .. } => ("drop", id.shown().to_string()),
+                        ModuleChange::AlterModule { id, .. } => ("alter", id.shown().to_string()),
+                        ModuleChange::CreateModule { id, .. } => ("create", id.shown().to_string()),
+                    }
+                })
+                .collect();
+            assert_eq!(
+                order,
+                vec![
+                    ("drop", "main.u".to_owned()),
+                    ("drop", "main.w".to_owned()),
+                    ("alter", "main.v".to_owned()),
+                    ("create", "main.w".to_owned()),
+                    ("create", "main.u".to_owned()),
+                ]
+            );
+            // Lower through the real certified emitter and execute every statement on the file.
+            let certified = scheduled.ordered(pbps_model::PlanMode::Transactional, &dialect);
+            let lowered = crate::emission::Engine::lower(&dialect, &certified).expect("lower");
+            let c = sqlite_conn(&mut conn).expect("sqlite conn");
+            for stmt in lowered.statements() {
+                c.execute_batch(&stmt.sql).expect(&stmt.sql);
+            }
+            let rows = c.query("SELECT qty FROM u", &[]).expect("select u");
+            assert_eq!(rows[0].integer(0).expect("qty"), 20);
+        }
+    }
+
+    #[test]
+    fn schedule_refuses_unmanaged_readers_transitive_readers_triggers_unreadable_file_and_foreign_plans()
+     {
+        use pbps_model::{
+            Change, ModuleChange, ModuleId, ModuleKind, PartitionChange, Rebuild,
+            RebuildIdentities, RebuildPartitionedTable, RoleChange, RoleName, TypeValueChange,
+        };
+
+        let dialect = Sqlite::default();
+        let rediff =
+            |_also: &BTreeSet<ModuleId>| -> anyhow::Result<PlanningPlan<pbps_diff::order::Draft>> {
+                anyhow::bail!("unexpected rediff")
+            };
+        let v = ModuleId::Named(TableName::new("main", "v"));
+        let w = ModuleId::Named(TableName::new("main", "w"));
+
+        let run_err = |seed: &[&str],
+                       base: &Schema,
+                       desired: &Schema,
+                       changes: Vec<Change>,
+                       role_members: Option<&RoleMembers>|
+         -> String {
+            let (_tmp, mut conn) = TempDb::create();
+            for sql in seed {
+                now(conn.execute(sql)).expect(sql);
+            }
+            let ids = IdsFile::default();
+            let hints = pbps_model::Hints::default();
+            let baseline = StateSnapshot::new(
+                pbps_model::StateKind::Baseline,
+                base.clone(),
+                ids.clone(),
+                "test",
+            );
+            let base_side = pbps_diff::Side {
+                schema: base,
+                ids: &ids,
+            };
+            let desired_side = pbps_diff::Side {
+                schema: desired,
+                ids: &ids,
+            };
+            let frame = Frame {
+                label: "test.db",
+                recorded: base_side,
+                written: desired_side,
+                base: base_side,
+                declared: desired_side,
+                hints: &hints,
+                baseline: &baseline,
+            };
+            let mut state = PlanState::default();
+            let plan = pbps_diff::order::propose(change_set(changes));
+            now(dialect.schedule(&mut state, &mut conn, plan, frame, role_members, &rediff))
+                .expect_err("must refuse")
+                .to_string()
+        };
+
+        let mut base_v = Schema::default();
+        base_v
+            .modules
+            .insert(v.clone(), *view_module("SELECT a FROM t"));
+        let mut desired_v = Schema::default();
+        desired_v
+            .modules
+            .insert(v.clone(), *view_module("SELECT a + 1 AS a FROM t"));
+        let alter_v = vec![Change::Module(ModuleChange::AlterModule {
+            id: v.clone(),
+            module: view_module("SELECT a + 1 AS a FROM t"),
+        })];
+        let drop_v = vec![Change::Module(ModuleChange::DropModule {
+            id: v.clone(),
+            kind: ModuleKind::View,
+        })];
+
+        // 1. Direct unmanaged view reader refuses on both edit and drop.
+        for (what, desired, changes) in [
+            ("edit", &desired_v, alter_v.clone()),
+            ("drop", &Schema::default(), drop_v.clone()),
+        ] {
+            let err = run_err(
+                &[
+                    "CREATE TABLE t(a INTEGER)",
+                    "CREATE VIEW v AS SELECT a FROM t",
+                    "CREATE VIEW ext_reader AS SELECT a FROM v",
+                ],
+                &base_v,
+                desired,
+                changes,
+                None,
+            );
+            assert!(
+                err.contains("SQLite") && err.contains("main.v") && err.contains("ext_reader"),
+                "{what}: {err}"
+            );
+        }
+
+        // 2. Transitive unmanaged view reader (`ext_top -> managed w -> v`).
+        {
+            let mut base_vw = base_v.clone();
+            base_vw
+                .modules
+                .insert(w.clone(), *view_module("SELECT a FROM v"));
+            let mut desired_vw = desired_v.clone();
+            desired_vw
+                .modules
+                .insert(w.clone(), *view_module("SELECT a FROM v"));
+            let err = run_err(
+                &[
+                    "CREATE TABLE t(a INTEGER)",
+                    "CREATE VIEW v AS SELECT a FROM t",
+                    "CREATE VIEW w AS SELECT a FROM v",
+                    "CREATE VIEW ext_top AS SELECT a FROM w",
+                ],
+                &base_vw,
+                &desired_vw,
+                alter_v.clone(),
+                None,
+            );
+            assert!(
+                err.contains("SQLite") && err.contains("main.v") && err.contains("ext_top"),
+                "{err}"
+            );
+        }
+
+        // 3. Trigger reading `v` in its body refuses naming SQLite, `v` and trigger.
+        {
+            let err = run_err(
+                &[
+                    "CREATE TABLE t(a INTEGER)",
+                    "CREATE VIEW v AS SELECT a FROM t",
+                    "CREATE TRIGGER tr_body AFTER INSERT ON t BEGIN SELECT a FROM v; END",
+                ],
+                &base_v,
+                &desired_v,
+                alter_v.clone(),
+                None,
+            );
+            assert!(
+                err.contains("SQLite") && err.contains("main.v") && err.contains("tr_body"),
+                "{err}"
+            );
+        }
+
+        // 4. INSTEAD OF trigger on `v` refuses naming SQLite, `v` and trigger.
+        {
+            let err = run_err(
+                &[
+                    "CREATE TABLE t(a INTEGER)",
+                    "CREATE VIEW v AS SELECT a FROM t",
+                    "CREATE TRIGGER tr_instead INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES (NEW.a); END",
+                ],
+                &base_v,
+                &Schema::default(),
+                drop_v,
+                None,
+            );
+            assert!(
+                err.contains("SQLite") && err.contains("main.v") && err.contains("tr_instead"),
+                "{err}"
+            );
+        }
+
+        // 5. Foreign plans (roles, enum rebuild, partition rebuild, function drop) refuse naming SQLite.
+        {
+            let role_err = run_err(
+                &[],
+                &Schema::default(),
+                &Schema::default(),
+                vec![Change::Role(RoleChange::DropRole {
+                    uid: uid(pbps_model::UidKind::Role, "app"),
+                    name: RoleName::new("app"),
+                    members: Vec::new(),
+                })],
+                None,
+            );
+            assert!(
+                role_err.contains("SQLite") && role_err.contains("role"),
+                "{role_err}"
+            );
+
+            let enum_err = run_err(
+                &[],
+                &Schema::default(),
+                &Schema::default(),
+                vec![Change::TypeValue(TypeValueChange::EnumRebuild {
+                    uid: uid(pbps_model::UidKind::Type, "main.status"),
+                    name: pbps_model::TypeRef::new("main", "status").expect("type"),
+                    tmp: pbps_model::TypeRef::new("main", "status_tmp").expect("tmp"),
+                    step: pbps_model::EnumRebuildStep::Create {
+                        definition: Box::new(pbps_model::ManagedType::Enum {
+                            values: vec!["a".into()],
+                        }),
+                        removed: Vec::new(),
+                        ordinal: 0,
+                        over: None,
+                        why: None,
+                    },
+                })],
+                None,
+            );
+            assert!(
+                enum_err.contains("SQLite") && enum_err.contains("enum"),
+                "{enum_err}"
+            );
+
+            let part_err = run_err(
+                &[],
+                &Schema::default(),
+                &Schema::default(),
+                vec![Change::Partition(PartitionChange::RebuildPartitionedTable(
+                    Box::new(RebuildPartitionedTable {
+                        table: TableName::new("main", "p"),
+                        intent: Rebuild {
+                            source: RebuildIdentities {
+                                tables: BTreeMap::new(),
+                                columns: BTreeMap::new(),
+                            },
+                            replacement: RebuildIdentities {
+                                tables: BTreeMap::new(),
+                                columns: BTreeMap::new(),
+                            },
+                            replacement_root: uid(pbps_model::UidKind::Table, "main.p_new"),
+                            continues: BTreeMap::new(),
+                            target_checksum: "0".repeat(64),
+                            max_rows: 0,
+                            allowed_at: "2026-01-01T00:00:00Z".into(),
+                            reason: pbps_model::Reason::new("test").expect("reason"),
+                            operator: "test".into(),
+                            types: BTreeMap::new(),
+                            conversions: BTreeMap::new(),
+                            exclusions: BTreeMap::new(),
+                        },
+                        earlier: Vec::new(),
+                        before: BTreeMap::new(),
+                        after: BTreeMap::new(),
+                    }),
+                ))],
+                None,
+            );
+            assert!(
+                part_err.contains("SQLite") && part_err.contains("partitioned-table"),
+                "{part_err}"
+            );
+        }
+
+        // 6. Unreadable inventory (exclusive lock held elsewhere) is an error, never "no readers".
+        {
+            let (tmp, mut conn) = TempDb::create();
+            now(conn.execute("CREATE TABLE t(a INTEGER)")).expect("table");
+            now(conn.execute("CREATE VIEW v AS SELECT a FROM t")).expect("view");
+            let locker = pbps_db::sqlite::Connection::open(
+                tmp.path(),
+                pbps_db::sqlite::OpenMode::ExistingOnly,
+            )
+            .expect("second connection");
+            locker.execute("BEGIN EXCLUSIVE", &[]).expect("lock");
+            let ids = IdsFile::default();
+            let hints = pbps_model::Hints::default();
+            let baseline = StateSnapshot::new(
+                pbps_model::StateKind::Baseline,
+                base_v.clone(),
+                ids.clone(),
+                "test",
+            );
+            let base_side = pbps_diff::Side {
+                schema: &base_v,
+                ids: &ids,
+            };
+            let desired_side = pbps_diff::Side {
+                schema: &desired_v,
+                ids: &ids,
+            };
+            let frame = Frame {
+                label: "test.db",
+                recorded: base_side,
+                written: desired_side,
+                base: base_side,
+                declared: desired_side,
+                hints: &hints,
+                baseline: &baseline,
+            };
+            let mut state = PlanState::default();
+            let plan = pbps_diff::order::propose(change_set(alter_v));
+            let err = now(dialect.schedule(&mut state, &mut conn, plan, frame, None, &rediff))
+                .expect_err("locked file must fail schedule");
+            assert!(
+                state.inventory.is_none(),
+                "failed read must not cache: {err}"
+            );
+            locker.execute("ROLLBACK", &[]).expect("unlock");
         }
     }
 }

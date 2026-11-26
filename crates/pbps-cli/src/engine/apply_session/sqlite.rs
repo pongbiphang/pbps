@@ -9,9 +9,9 @@
 //! - *exists in `pbps-sqlite` or `pbps-db` already*: calls it in place on the
 //!   calling thread through `Conn::sqlite()` (DEC-2950.17);
 //! - *needs logic nobody has written yet* (`requirement`, `drop_blockers`,
-//!   `rename_report`, `check_module_dependency_facts`): refuses by name naming
-//!   SQLite and the unsupported operation, never returning an empty answer
-//!   that would read as "nothing blocks" or "nothing depends".
+//!   `rename_report`): refuses by name naming SQLite and the unsupported
+//!   operation, never returning an empty answer that would read as "nothing
+//!   blocks" or "nothing depends".
 
 use super::*;
 use crate::engine::plan_session::sqlite::{sqlite_conn, sqlite_has_no_roles};
@@ -667,22 +667,41 @@ impl ApplySession for Sqlite {
         });
         refuse_if(policies, "SQLite has no row-security policies")
     }
-    /// Needs logic nobody has written yet: `pbps-sqlite` has no view-dependents
-    /// reader. Passes when the plan drops or replaces no view/module, and
-    /// refuses by name whenever it does.
+    /// Reads `main.sqlite_schema` inside the apply's open transaction and
+    /// checks every view and trigger that may read a view dropped or replaced
+    /// by this plan, refusing any reader the plan does not remove first.
     async fn check_module_dependency_facts(
         &self,
         conn: &mut Conn,
         changes: &ChangeSet,
-        _names: pbps_model::plan_names::PlanNames<'_>,
-        _stored: &Schema,
-        _stored_ids: &IdsFile,
+        names: pbps_model::plan_names::PlanNames<'_>,
+        stored: &Schema,
+        stored_ids: &IdsFile,
     ) -> anyhow::Result<()> {
-        let _ = sqlite_conn(conn)?;
-        refuse_if(
-            !pbps_diff::order::deployment::dropped_modules(changes).is_empty(),
-            "SQLite does not support checking catalog dependents of dropped or replaced views yet",
-        )
+        let c = sqlite_conn(conn)?;
+        if crate::dependents::dropped_modules(changes).is_empty() {
+            return Ok(());
+        }
+        let inv = pbps_sqlite::catalog::inventory::read(c, &[])?;
+        let known = plan_session::sqlite::known_module_ids(changes, [stored]);
+        let found = plan_session::sqlite::module_dependents_from(&inv, changes, &known)?;
+        let partitions = crate::dependents::standing_partitions(stored, changes).at(
+            &names,
+            pbps_model::plan_names::At::Start,
+            pbps_model::plan_names::At::End,
+        );
+        let sources = pbps_model::physical_sources::PhysicalSources::of(names, stored, stored_ids)?;
+        let left = crate::dependents::unaccounted(changes, &found, &partitions, &sources);
+        if !left.is_empty() {
+            anyhow::bail!(
+                "module_dependents (SQLite): the database now holds dependents this plan does not \
+                 remove before dropping what they depend on, so dropping them would leave readers \
+                 broken or drop attached triggers:\n  {}\n\
+                 Plan again, so the plan accounts for them where the approver can see it.",
+                left.join("\n  ")
+            );
+        }
+        Ok(())
     }
     /// Does not exist on this engine in v0: managed rows and triggers are both
     /// refused by `pbps_sqlite::validate` as not built yet; refuses if a plan
@@ -1030,40 +1049,182 @@ mod tests {
                 && report_err.to_string().contains("rename impact"),
             "{report_err}"
         );
+    }
 
-        // 4. check_module_dependency_facts: passes when no view is dropped, refuses DropModule.
-        let empty_ids = IdsFile::default();
-        let empty_names = pbps_model::plan_names::PlanNames::of(&[], &empty_ids).expect("names");
-        now(dialect.check_module_dependency_facts(
-            &mut conn,
-            &ChangeSet::default(),
-            empty_names,
-            &Schema::default(),
-            &empty_ids,
-        ))
-        .expect("no dropped view");
-        let drop_view = ChangeSet {
-            changes: vec![PlannedChange::new(Change::Module(
-                ModuleChange::DropModule {
-                    id: ModuleId::Named(TableName::new("main", "v")),
-                    kind: ModuleKind::View,
-                },
-            ))],
-        };
-        let view_names =
-            pbps_model::plan_names::PlanNames::of(&drop_view.changes, &empty_ids).expect("names");
-        let mod_err = now(dialect.check_module_dependency_facts(
-            &mut conn,
-            &drop_view,
-            view_names,
-            &Schema::default(),
-            &empty_ids,
-        ))
-        .unwrap_err();
-        assert!(
-            mod_err.to_string().contains("SQLite") && mod_err.to_string().contains("views"),
-            "{mod_err}"
+    #[test]
+    fn check_module_dependency_facts_accepts_accounted_plans_and_refuses_post_plan_readers_and_unreadable_catalog()
+     {
+        let (tmp, mut conn) = TempDb::create();
+        let dialect = Sqlite::default();
+        for sql in [
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+            "CREATE VIEW v AS SELECT id, qty FROM items",
+            "CREATE VIEW u AS SELECT qty FROM v",
+        ] {
+            now(conn.execute(sql)).expect(sql);
+        }
+
+        let v_id = ModuleId::Named(TableName::new("main", "v"));
+        let u_id = ModuleId::Named(TableName::new("main", "u"));
+        let mut stored = Schema::default();
+        stored.modules.insert(
+            v_id.clone(),
+            pbps_model::Module {
+                kind: ModuleKind::View,
+                description: None,
+                definition: "SELECT id, qty FROM items".into(),
+                options: Default::default(),
+            },
         );
+        stored.modules.insert(
+            u_id.clone(),
+            pbps_model::Module {
+                kind: ModuleKind::View,
+                description: None,
+                definition: "SELECT qty FROM v".into(),
+                options: Default::default(),
+            },
+        );
+        let stored_ids = IdsFile::default();
+
+        // 1. Accounted edit: managed reader `u` is dropped before `v` and
+        //    restored after `v`. Passes inside BEGIN IMMEDIATE.
+        let edit_with_reader = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
+                    id: u_id.clone(),
+                    kind: ModuleKind::View,
+                })),
+                PlannedChange::new(Change::Module(ModuleChange::AlterModule {
+                    id: v_id.clone(),
+                    module: Box::new(pbps_model::Module {
+                        kind: ModuleKind::View,
+                        description: None,
+                        definition: "SELECT id, qty + 1 AS qty FROM items".into(),
+                        options: Default::default(),
+                    }),
+                })),
+                PlannedChange::new(Change::Module(ModuleChange::CreateModule {
+                    id: u_id.clone(),
+                    module: Box::new(stored.modules[&u_id].clone()),
+                })),
+            ],
+        };
+        let check_in_tx = |conn: &mut Conn, cs: &ChangeSet| {
+            let names =
+                pbps_model::plan_names::PlanNames::of(&cs.changes, &stored_ids).expect("names");
+            now(conn.begin(&pbps_sqlite::TRANSACTION)).expect("begin");
+            let res =
+                now(dialect.check_module_dependency_facts(conn, cs, names, &stored, &stored_ids));
+            now(conn.rollback(&pbps_sqlite::TRANSACTION)).expect("rollback");
+            res
+        };
+        check_in_tx(&mut conn, &edit_with_reader).expect("accounted rebuild passes");
+
+        // 2. Accounted drop: `u` dropped before `v`.
+        let drop_both = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
+                    id: u_id.clone(),
+                    kind: ModuleKind::View,
+                })),
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
+                    id: v_id.clone(),
+                    kind: ModuleKind::View,
+                })),
+            ],
+        };
+        check_in_tx(&mut conn, &drop_both).expect("accounted drop passes");
+
+        // Negative: wrong order (dropping `u` after `v`) refuses naming SQLite, `v` and `u`.
+        let wrong_order = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
+                    id: v_id.clone(),
+                    kind: ModuleKind::View,
+                })),
+                PlannedChange::new(Change::Module(ModuleChange::DropModule {
+                    id: u_id.clone(),
+                    kind: ModuleKind::View,
+                })),
+            ],
+        };
+        let order_err = check_in_tx(&mut conn, &wrong_order)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            order_err.contains("SQLite")
+                && order_err.contains("main.v")
+                && order_err.contains("main.u"),
+            "{order_err}"
+        );
+
+        // Negative: a view created after planning reading `v` (or transitively
+        // through `u`) refuses apply before any statement runs.
+        now(conn.execute("CREATE VIEW late_reader AS SELECT qty FROM u")).expect("late view");
+        let late_err = check_in_tx(&mut conn, &edit_with_reader)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            late_err.contains("SQLite")
+                && late_err.contains("late_reader")
+                && (late_err.contains("main.v") || late_err.contains("main.u")),
+            "{late_err}"
+        );
+        now(conn.execute("DROP VIEW late_reader")).expect("cleanup");
+
+        // Negative: a trigger reading `v` created after planning refuses apply.
+        now(conn
+            .execute("CREATE TRIGGER tr_late AFTER INSERT ON items BEGIN SELECT qty FROM v; END"))
+        .expect("late trigger");
+        let trig_err = check_in_tx(&mut conn, &edit_with_reader)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            trig_err.contains("SQLite")
+                && trig_err.contains("tr_late")
+                && trig_err.contains("main.v"),
+            "{trig_err}"
+        );
+        now(conn.execute("DROP TRIGGER tr_late")).expect("cleanup");
+
+        // Negative: an INSTEAD OF trigger on `v` created after planning refuses apply.
+        now(conn.execute(
+            "CREATE TRIGGER tr_instead INSTEAD OF INSERT ON v BEGIN INSERT INTO items(qty) VALUES (NEW.qty); END",
+        ))
+        .expect("instead trigger");
+        let instead_err = check_in_tx(&mut conn, &edit_with_reader)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            instead_err.contains("SQLite")
+                && instead_err.contains("tr_instead")
+                && instead_err.contains("main.v"),
+            "{instead_err}"
+        );
+        now(conn.execute("DROP TRIGGER tr_instead")).expect("cleanup");
+
+        // Negative: an unreadable catalog (exclusive lock held elsewhere) is an
+        // error, never "no readers".
+        let locker =
+            pbps_db::sqlite::Connection::open(tmp.path(), pbps_db::sqlite::OpenMode::ExistingOnly)
+                .expect("second connection");
+        locker.execute("BEGIN EXCLUSIVE", &[]).expect("lock");
+        let names =
+            pbps_model::plan_names::PlanNames::of(&drop_both.changes, &stored_ids).expect("names");
+        let lock_err = now(dialect.check_module_dependency_facts(
+            &mut conn,
+            &drop_both,
+            names,
+            &stored,
+            &stored_ids,
+        ))
+        .expect_err("locked file must error");
+        assert!(
+            !lock_err.to_string().is_empty(),
+            "expected lock error: {lock_err}"
+        );
+        locker.execute("ROLLBACK", &[]).expect("unlock");
     }
 
     #[test]

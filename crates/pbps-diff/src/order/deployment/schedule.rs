@@ -213,6 +213,14 @@ impl Refusal {
     fn module_passes(why: impl fmt::Display) -> Self {
         Self(format!("module_dependents (PostgreSQL): {why}"))
     }
+
+    fn module_passes_for(dialect: &dyn Dialect, why: impl fmt::Display) -> Self {
+        if dialect.name() == "sqlite" {
+            Self(format!("module_dependents (SQLite): {why}"))
+        } else {
+            Self::module_passes(why)
+        }
+    }
 }
 
 impl fmt::Display for Refusal {
@@ -507,9 +515,10 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
                 .map_err(Refusal::module_passes)?;
         }
         if let Some(found) = facts.module_dependents {
-            // Explicit SQL Server routine drops have the same DEFAULT obligations.
+            // Explicit SQL Server routine drops and SQLite view edits/drops
+            // weave their catalog dependents through the shared pass.
             added += weave(&mut cs, found, declared.schema, declared.sources, dialect)
-                .map_err(Refusal::module_passes)?;
+                .map_err(|why| Refusal::module_passes_for(dialect, why))?;
             // Normalization invalidates positional proof. Restore the weave's
             // edges together with the requirements of its restored holders:
             // moving a DEFAULT without its consumers can silently write NULL.
@@ -517,7 +526,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
             crate::order::row_security::module_constraints(
                 &mut handovers,
                 super::module_order(&cs, found, declared.schema, declared.sources, dialect)
-                    .map_err(Refusal::module_passes)?,
+                    .map_err(|why| Refusal::module_passes_for(dialect, why))?,
             )
             .map_err(Refusal)?;
             keep_handover_dependents(&cs, declared, dialect, cs.captured(), &mut handovers)?;

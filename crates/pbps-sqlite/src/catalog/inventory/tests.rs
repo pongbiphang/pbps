@@ -481,16 +481,19 @@ fn catalog_facts_decides_every_ascii_case_pair_with_zero_skipped_and_keeps_non_a
                 kind: EntryKind::Table,
                 name: "Foo".into(),
                 table: "Foo".into(),
+                sql: Some("CREATE TABLE Foo(id INTEGER)".into()),
             },
             SchemaEntry {
                 kind: EntryKind::Table,
                 name: "café".into(),
                 table: "café".into(),
+                sql: Some("CREATE TABLE \"café\"(id INTEGER)".into()),
             },
             SchemaEntry {
                 kind: EntryKind::View,
                 name: "unmanaged_v".into(),
                 table: "unmanaged_v".into(),
+                sql: Some("CREATE VIEW unmanaged_v AS SELECT 1".into()),
             },
         ],
         columns: BTreeMap::new(),
@@ -585,21 +588,27 @@ fn verify_names_catches_catalog_occupants_and_allows_freed_names_and_key_names()
                 kind: EntryKind::Table,
                 name: "existing".into(),
                 table: "existing".into(),
+                sql: Some("CREATE TABLE existing(id INTEGER)".into()),
             },
             SchemaEntry {
                 kind: EntryKind::Index,
                 name: "ix_owned".into(),
                 table: "existing".into(),
+                sql: Some("CREATE INDEX ix_owned ON existing(id)".into()),
             },
             SchemaEntry {
                 kind: EntryKind::Table,
                 name: "__pbps_state".into(),
                 table: "__pbps_state".into(),
+                sql: Some("CREATE TABLE __pbps_state(id INTEGER)".into()),
             },
             SchemaEntry {
                 kind: EntryKind::Trigger,
                 name: "tr_only".into(),
                 table: "existing".into(),
+                sql: Some(
+                    "CREATE TRIGGER tr_only AFTER INSERT ON existing BEGIN SELECT 1; END".into(),
+                ),
             },
         ],
         columns: [(
@@ -845,4 +854,373 @@ fn a_column_change_on_anything_but_an_ordinary_table_is_refused_by_name() {
         }]),
     )])
     .expect("an ordinary table passes");
+}
+
+/// Real-SQLite measurements on temporary files confirming how SQLite behaves
+/// when a view read by another view or trigger (or holding an INSTEAD OF
+/// trigger) is dropped or recreated.
+#[test]
+fn real_sqlite_file_measurements_confirm_view_drop_broken_view_and_trigger_rules() {
+    // 1. DROP VIEW v while view u reads v: DROP succeeds; SELECT from u fails;
+    //    recreating v with the column u reads restores u; recreating v without
+    //    that column leaves SELECT from u failing with no such column.
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch(
+            "CREATE TABLE t(a INTEGER, b INTEGER); \
+             INSERT INTO t VALUES (1, 2); \
+             CREATE VIEW v AS SELECT a, b FROM t; \
+             CREATE VIEW u AS SELECT b FROM v",
+        )
+        .expect("setup");
+        c.execute_batch("DROP VIEW v")
+            .expect("SQLite permits DROP VIEW v while u reads v");
+        let missing = c
+            .query("SELECT * FROM u", &[])
+            .expect_err("SELECT from u fails while v is gone")
+            .to_string();
+        assert!(missing.contains("no such table"), "{missing}");
+
+        c.execute_batch("CREATE VIEW v AS SELECT a, b FROM t")
+            .expect("recreate v with b");
+        let rows = c.query("SELECT * FROM u", &[]).expect("u works again");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].integer(0).expect("b"), 2);
+
+        c.execute_batch("DROP VIEW v; CREATE VIEW v AS SELECT a FROM t")
+            .expect("recreate v without b");
+        let bad_col = c
+            .query("SELECT * FROM u", &[])
+            .expect_err("SELECT from u fails when v lacks b")
+            .to_string();
+        assert!(bad_col.contains("no such column"), "{bad_col}");
+    }
+
+    // 2. A broken view anywhere in the file makes ALTER TABLE RENAME TO,
+    //    RENAME COLUMN and DROP COLUMN on an unrelated table fail.
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch(
+            "CREATE TABLE t(a INTEGER); \
+             CREATE TABLE unrelated(x INTEGER, y INTEGER); \
+             CREATE VIEW v AS SELECT a FROM t; \
+             CREATE VIEW u AS SELECT a FROM v; \
+             DROP VIEW v",
+        )
+        .expect("setup");
+        for stmt in [
+            "ALTER TABLE unrelated RENAME TO unrelated2",
+            "ALTER TABLE unrelated RENAME COLUMN x TO x2",
+            "ALTER TABLE unrelated DROP COLUMN y",
+        ] {
+            let err = c.execute_batch(stmt).expect_err(stmt).to_string();
+            assert!(
+                err.contains("error in view u") && err.contains("no such table"),
+                "{stmt}: {err}"
+            );
+        }
+    }
+
+    // 3. A trigger whose body reads v: DROP VIEW v succeeds at drop time;
+    //    firing the trigger fails; and the broken trigger also blocks
+    //    ALTER TABLE RENAME / DROP COLUMN on an unrelated table.
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch(
+            "CREATE TABLE t(a INTEGER); \
+             CREATE TABLE src(x INTEGER); \
+             CREATE TABLE log(v_val INTEGER); \
+             CREATE TABLE unrelated(p INTEGER, q INTEGER); \
+             CREATE VIEW v AS SELECT a FROM t; \
+             CREATE TRIGGER tr_reads_v AFTER INSERT ON src BEGIN \
+               INSERT INTO log SELECT a FROM v; \
+             END",
+        )
+        .expect("setup");
+        c.execute_batch("DROP VIEW v")
+            .expect("SQLite permits DROP VIEW v while trigger body reads v");
+        let fire_err = c
+            .execute_batch("INSERT INTO src VALUES (1)")
+            .expect_err("firing trigger fails when v is gone")
+            .to_string();
+        assert!(fire_err.contains("no such table"), "{fire_err}");
+        for stmt in [
+            "ALTER TABLE unrelated RENAME TO unrelated2",
+            "ALTER TABLE unrelated RENAME COLUMN p TO p2",
+            "ALTER TABLE unrelated DROP COLUMN q",
+        ] {
+            let err = c.execute_batch(stmt).expect_err(stmt).to_string();
+            assert!(
+                err.contains("error in trigger tr_reads_v") && err.contains("no such table"),
+                "{stmt}: {err}"
+            );
+        }
+    }
+
+    // 4. An INSTEAD OF trigger ON v: DROP VIEW v silently drops the trigger
+    //    from sqlite_schema alongside the view.
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch(
+            "CREATE TABLE t(a INTEGER); \
+             CREATE VIEW v AS SELECT a FROM t; \
+             CREATE TRIGGER tr_instead INSTEAD OF INSERT ON v BEGIN \
+               INSERT INTO t VALUES (NEW.a); \
+             END",
+        )
+        .expect("setup");
+        let before = c
+            .query(
+                "SELECT tbl_name FROM main.sqlite_schema WHERE type = 'trigger' AND name = 'tr_instead'",
+                &[],
+            )
+            .expect("before");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].text(0).expect("tbl"), "v");
+
+        c.execute_batch("DROP VIEW v")
+            .expect("SQLite permits DROP VIEW v with an INSTEAD OF trigger");
+        let after = c
+            .query(
+                "SELECT name FROM main.sqlite_schema WHERE type = 'trigger' AND name = 'tr_instead'",
+                &[],
+            )
+            .expect("after");
+        assert!(
+            after.is_empty(),
+            "SQLite silently dropped INSTEAD OF trigger with DROP VIEW v: {after:?}"
+        );
+    }
+}
+
+#[test]
+fn view_dependents_finds_direct_transitive_diamond_case_folded_and_trigger_readers() {
+    let mut db = Fresh::file();
+    let c = db.connection();
+    c.execute_batch(
+        "CREATE TABLE t(a INTEGER); \
+         CREATE TABLE log(x INTEGER); \
+         CREATE VIEW base_v AS SELECT a FROM t; \
+         CREATE VIEW MidView AS SELECT a FROM BASE_V; \
+         CREATE VIEW top_v AS SELECT a FROM midview; \
+         CREATE VIEW diamond_v AS SELECT m.a FROM base_v b JOIN MidView m ON b.a = m.a; \
+         CREATE VIEW ext_v AS SELECT a FROM base_v; \
+         CREATE VIEW unrelated_v AS SELECT a FROM t; \
+         CREATE TRIGGER tr_body AFTER INSERT ON t BEGIN INSERT INTO log SELECT a FROM BASE_V; END; \
+         CREATE TRIGGER tr_instead INSTEAD OF INSERT ON base_v BEGIN INSERT INTO t VALUES (NEW.a); END; \
+         CREATE TRIGGER base_v AFTER DELETE ON t BEGIN INSERT INTO log VALUES (OLD.a); END; \
+         PRAGMA writable_schema = ON; \
+         INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) VALUES \
+           ('table', 'missing_vtab', 'missing_vtab', 0, \
+            'CREATE VIRTUAL TABLE missing_vtab USING no_such_module_ever()'); \
+         PRAGMA writable_schema = OFF",
+    )
+    .expect("seed");
+
+    let inv = read(c, &[]).expect("inventory read must ignore missing-module virtual table");
+    let v_id = ModuleId::Named(TableName::new("main", "base_v"));
+    let mid_id = ModuleId::Named(TableName::new("main", "midview"));
+    let top_id = ModuleId::Named(TableName::new("main", "top_v"));
+    let diamond_id = ModuleId::Named(TableName::new("main", "diamond_v"));
+    let unrelated_id = ModuleId::Named(TableName::new("main", "unrelated_v"));
+    let known: BTreeSet<ModuleId> = [
+        v_id.clone(),
+        mid_id.clone(),
+        top_id.clone(),
+        diamond_id.clone(),
+        unrelated_id.clone(),
+    ]
+    .into_iter()
+    .collect();
+
+    let found = view_dependents(&inv, &[v_id.clone(), unrelated_id.clone()], &known)
+        .expect("view_dependents");
+
+    // Unreferenced view has an empty reader list.
+    assert!(
+        found[&unrelated_id].is_empty(),
+        "{:?}",
+        found[&unrelated_id]
+    );
+
+    let deps = &found[&v_id];
+    let names: Vec<&str> = deps.iter().map(|d| d.described.as_str()).collect();
+    assert!(names.contains(&"view main.MidView"), "{names:?}");
+    assert!(names.contains(&"view main.top_v"), "{names:?}");
+    assert!(names.contains(&"view main.diamond_v"), "{names:?}");
+    assert!(names.contains(&"view main.ext_v"), "{names:?}");
+    assert!(
+        names.contains(&"trigger main.tr_body on main.t"),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&"trigger main.tr_instead on main.base_v"),
+        "{names:?}"
+    );
+    // Negative: an unrelated view is not reported.
+    assert!(
+        !names.iter().any(|n| n.contains("unrelated_v")),
+        "{names:?}"
+    );
+    // The match is lexical over the whole statement, so a trigger that is
+    // itself named like the view is reported: the conservative side of the
+    // documented limit, pinned so that narrowing it is a deliberate change.
+    assert!(
+        names.contains(&"trigger main.base_v on main.t"),
+        "{names:?}"
+    );
+    // Deepest-first order: both `top_v` and `diamond_v` depend on `MidView`
+    // and must come before `MidView`.
+    let pos = |label: &str| names.iter().position(|n| *n == label).expect(label);
+    assert!(
+        pos("view main.top_v") < pos("view main.MidView"),
+        "{names:?}"
+    );
+    assert!(
+        pos("view main.diamond_v") < pos("view main.MidView"),
+        "{names:?}"
+    );
+    // Known ASCII case-folded view resolves to the declared ModuleId spelling.
+    let mid_dep = deps
+        .iter()
+        .find(|d| d.described == "view main.MidView")
+        .expect("mid");
+    assert_eq!(mid_dep.holds, Holds::Module(mid_id));
+    // Triggers are Unrepresentable, and INSTEAD OF names silent drop by SQLite.
+    let instead_dep = deps
+        .iter()
+        .find(|d| d.described == "trigger main.tr_instead on main.base_v")
+        .expect("instead");
+    assert!(
+        matches!(&instead_dep.holds, Holds::Unrepresentable(why) if why.contains("INSTEAD OF")),
+        "{instead_dep:?}"
+    );
+}
+
+#[test]
+fn view_dependents_treats_absent_view_null_sql_and_foreign_modules_as_errors() {
+    let v_id = ModuleId::Named(TableName::new("main", "v"));
+    let empty_known = BTreeSet::new();
+
+    // Absent root view is an error, never "no readers".
+    let empty_inv = Inventory::default();
+    let absent =
+        view_dependents(&empty_inv, std::slice::from_ref(&v_id), &empty_known).unwrap_err();
+    assert!(
+        absent.to_string().contains("SQLite") && absent.to_string().contains("main.v"),
+        "{absent}"
+    );
+
+    // NULL or empty stored SQL on any view or trigger is a BadRow error.
+    for (kind, sql) in [
+        (EntryKind::View, None),
+        (EntryKind::View, Some("   ".to_owned())),
+        (EntryKind::Trigger, None),
+    ] {
+        let inv = Inventory {
+            entries: vec![
+                SchemaEntry {
+                    kind: EntryKind::View,
+                    name: "v".into(),
+                    table: "v".into(),
+                    sql: Some("CREATE VIEW v AS SELECT 1".into()),
+                },
+                SchemaEntry {
+                    kind,
+                    name: "broken".into(),
+                    table: "t".into(),
+                    sql,
+                },
+            ],
+            columns: BTreeMap::new(),
+        };
+        let err = view_dependents(&inv, std::slice::from_ref(&v_id), &empty_known).unwrap_err();
+        assert!(
+            matches!(err, DbError::BadRow(_)) && err.to_string().contains("broken"),
+            "{err}"
+        );
+    }
+
+    // Foreign schema or non-view ModuleId refuses naming SQLite.
+    let inv = Inventory {
+        entries: vec![SchemaEntry {
+            kind: EntryKind::View,
+            name: "v".into(),
+            table: "v".into(),
+            sql: Some("CREATE VIEW v AS SELECT 1".into()),
+        }],
+        columns: BTreeMap::new(),
+    };
+    let foreign_schema = ModuleId::Named(TableName::new("other", "v"));
+    let schema_err = view_dependents(&inv, &[foreign_schema], &empty_known).unwrap_err();
+    assert!(
+        schema_err.to_string().contains("SQLite") && schema_err.to_string().contains("main"),
+        "{schema_err}"
+    );
+    let trigger_id = ModuleId::Trigger {
+        on: TableName::new("main", "t"),
+        name: "tr".into(),
+    };
+    let trig_err = view_dependents(&inv, &[trigger_id], &empty_known).unwrap_err();
+    assert!(trig_err.to_string().contains("SQLite"), "{trig_err}");
+}
+
+#[test]
+fn a_reader_is_found_whatever_its_ascii_case_and_an_attached_trigger_says_it_is_lost() {
+    let entry = |kind, name: &str, table: &str, sql: &str| SchemaEntry {
+        kind,
+        name: name.to_owned(),
+        table: table.to_owned(),
+        sql: Some(sql.to_owned()),
+    };
+    let inventory = Inventory {
+        entries: vec![
+            entry(
+                EntryKind::View,
+                "base_v",
+                "base_v",
+                "CREATE VIEW base_v AS SELECT a FROM t",
+            ),
+            entry(
+                EntryKind::View,
+                "shouting",
+                "shouting",
+                "CREATE VIEW shouting AS SELECT a FROM BASE_V",
+            ),
+            entry(
+                EntryKind::View,
+                "accented",
+                "accented",
+                "CREATE VIEW accented AS SELECT a FROM \"basé_v\"",
+            ),
+            entry(
+                EntryKind::Trigger,
+                "on_insert",
+                "BASE_V",
+                "CREATE TRIGGER on_insert INSTEAD OF INSERT ON BASE_V BEGIN SELECT 1; END",
+            ),
+        ],
+        columns: BTreeMap::new(),
+    };
+    let root = ModuleId::Named(TableName::new("main", "base_v"));
+    let found = view_dependents(&inventory, std::slice::from_ref(&root), &BTreeSet::new())
+        .expect("the inventory is readable");
+    let readers = &found[&root];
+    let described: Vec<&str> = readers.iter().map(|d| d.described.as_str()).collect();
+    assert!(described.contains(&"view main.shouting"), "{described:?}");
+    // Negative: folding is ASCII only, so another spelling is another name.
+    assert!(!described.contains(&"view main.accented"), "{described:?}");
+    let attached = readers
+        .iter()
+        .find(|d| d.described == "trigger main.on_insert on main.BASE_V")
+        .expect("the trigger on the view is a dependent");
+    assert!(
+        matches!(&attached.holds, Holds::Unrepresentable(why) if why.contains("dropped with it")),
+        "{:?}",
+        attached.holds
+    );
 }

@@ -180,6 +180,15 @@ impl Refusal {
     fn module_passes(why: impl fmt::Display) -> Self {
         Self(format!("module_dependents (PostgreSQL): {why}"))
     }
+
+    #[cfg(test)]
+    fn module_passes_for(dialect: &dyn Dialect, why: impl fmt::Display) -> Self {
+        if dialect.name() == "sqlite" {
+            Self(format!("module_dependents (SQLite): {why}"))
+        } else {
+            Self::module_passes(why)
+        }
+    }
 }
 
 impl fmt::Display for Refusal {
@@ -424,9 +433,10 @@ fn oracle_schedule(
         after_the_rows_that_leave(&mut cs, declared.schema).map_err(Refusal::module_passes)?;
         settle_public_execution(&mut cs, decisions);
     } else if let Some(found) = facts.module_dependents {
-        // Explicit SQL Server routine drops have the same DEFAULT obligations.
+        // Explicit SQL Server routine drops and SQLite view edits/drops weave
+        // their catalog dependents through the shared pass.
         added += weave(&mut cs, found, declared.schema, declared.sources, dialect)
-            .map_err(Refusal::module_passes)?;
+            .map_err(|why| Refusal::module_passes_for(dialect, why))?;
     }
     // The differ sorted the role drops before it could know who holds whom;
     // once the members are in, a role holding another dropped role goes
