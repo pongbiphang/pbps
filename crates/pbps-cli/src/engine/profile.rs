@@ -56,6 +56,14 @@ pub(crate) struct Profile {
         fn(gap: pbps_db::doctor::LockReadGap, how: &str, next: &str, principal: &str) -> LockRemedy,
     /// Read by [`permission_read_advice`].
     pub permission_read_advice: fn() -> String,
+    /// What `doctor` calls the subject whose permissions are checked
+    /// (`"account"` for server engines, `"process"` for SQLite).
+    pub permission_subject: &'static str,
+    /// What `doctor` advises checking when an environment cannot be reached.
+    pub unreachable_remedy: &'static str,
+    /// What `doctor` labels the engine's version line (`"server"` or
+    /// `"library"`).
+    pub version_label: &'static str,
     /// Read by [`online_depends_on_the_edition`].
     pub online_depends_on_the_edition: bool,
     /// Read by [`capabilities_unknown_message`], which passes the cause.
@@ -95,6 +103,9 @@ static MSSQL: Profile = Profile {
     lock_principal_placeholder: "database user",
     lock_remedy: mssql_lock_remedy,
     permission_read_advice: mssql_permission_read_advice,
+    permission_subject: "account",
+    unreachable_remedy: "check the variable named by `url_env:`, the host, and the firewall",
+    version_label: "server",
     online_depends_on_the_edition: true,
     capabilities_unknown_message: mssql_capabilities_unknown_message,
     impact_notes: mssql_impact_notes,
@@ -113,6 +124,9 @@ static POSTGRES: Profile = Profile {
     lock_principal_placeholder: "database role",
     lock_remedy: postgres_lock_remedy,
     permission_read_advice: postgres_permission_read_advice,
+    permission_subject: "account",
+    unreachable_remedy: "check the variable named by `url_env:`, the host, and the firewall",
+    version_label: "server",
     online_depends_on_the_edition: false,
     capabilities_unknown_message: postgres_capabilities_unknown_message,
     impact_notes: pbps_pg::impact::notes,
@@ -136,6 +150,9 @@ static SQLITE: Profile = Profile {
     lock_principal_placeholder: "operating-system user",
     lock_remedy: sqlite_lock_remedy,
     permission_read_advice: sqlite_permission_read_advice,
+    permission_subject: "process",
+    unreachable_remedy: "check the path in `url_env:` (or `--db`), that the file exists, and file and directory permissions",
+    version_label: "library",
     online_depends_on_the_edition: false,
     capabilities_unknown_message: sqlite_capabilities_unknown_message,
     impact_notes: sqlite_impact_notes,
@@ -397,6 +414,11 @@ mod tests {
                 permission_read_advice(driver),
                 (facts.permission_read_advice)()
             );
+            assert_eq!(permission_subject(driver), facts.permission_subject);
+            assert_eq!(unreachable_remedy(driver), facts.unreachable_remedy);
+            assert_eq!(version_label(driver), facts.version_label);
+            assert_eq!(has_resolver(driver), facts.owned_test.is_some());
+            assert!(has_resolver(driver));
             assert_eq!(
                 capabilities_unknown_message(driver, "boom"),
                 (facts.capabilities_unknown_message)("boom")
@@ -462,6 +484,13 @@ mod tests {
         assert_eq!(
             permission_read_advice(Driver::Sqlite),
             (facts.permission_read_advice)()
+        );
+        assert_eq!(permission_subject(Driver::Sqlite), "process");
+        assert_eq!(version_label(Driver::Sqlite), "library");
+        assert!(!has_resolver(Driver::Sqlite));
+        assert!(
+            unreachable_remedy(Driver::Sqlite).contains("path")
+                && !unreachable_remedy(Driver::Sqlite).contains("firewall")
         );
         assert!(permission_read_advice(Driver::Sqlite).contains(pbps_sqlite::state::STATE_TABLE));
         assert_eq!(

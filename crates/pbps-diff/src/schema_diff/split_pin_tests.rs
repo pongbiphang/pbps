@@ -1273,7 +1273,7 @@ fn pinned(error: &DiffError) -> (usize, &'static str) {
         ),
         DiffError::ConversionsUnsupported { .. } => (
             19,
-            r#"the identity file records 2 conversion(s), but this engine has no `USING` clause and converts a column's values itself, so nothing would run the expression. Remove the `conversions` entries from the identity file"#,
+            r#"the identity file records 2 conversion(s), but this engine has no `USING` clause for column type conversions, so nothing would run the expression. Remove the `conversions` entries from the identity file"#,
         ),
         DiffError::SequenceChangeUnsupported { .. } => (
             20,

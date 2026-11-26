@@ -174,7 +174,7 @@ enum Attempt {
 /// that name in any schema would answer in place of, with the file it names
 /// (see [`Connection::main_database_file`]). `Err(why)` is a name this platform
 /// cannot turn back into a path, which leaves the row alone.
-fn database_file(c: &Connection) -> Result<Result<Option<PathBuf>, RowOnly>, DbError> {
+pub(crate) fn database_file(c: &Connection) -> Result<Result<Option<PathBuf>, RowOnly>, DbError> {
     let bytes = c.main_database_file()?;
     if bytes.is_empty() {
         return Ok(Ok(None));

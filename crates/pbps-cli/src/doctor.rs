@@ -295,6 +295,16 @@ impl EnvDiagnosis {
     fn note(&mut self, cause: String) {
         append_cause(&mut self.detail, cause);
     }
+
+    /// Whether `doctor` could not finish checking this environment (any of the
+    /// seven unanswerable states/reads).
+    fn is_unanswerable(&self) -> bool {
+        matches!(self.state, "unreachable" | "unconfigured" | "lock-unknown")
+            || self.permissions_unknown
+            || matches!(self.ledger, LedgerCheck::Unreadable(_))
+            || self.server_capabilities_unknown.is_some()
+            || self.resolver_discovery_unknown.is_some()
+    }
 }
 
 /// One target named on the command line, resolved or not.
@@ -399,15 +409,16 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     // The fingerprint key is checked without a connection, for the requested
     // environment or, with no target, for every configured one: a `--db`
     // target names no environment and so no key.
-    findings.extend(keys::for_request(project, one.as_ref()));
+    let project_driver = db::driver_for(project.config.dialect);
+    let mut render_driver = project_driver;
+    findings.extend(keys::for_request(project, one.as_ref(), project_driver));
 
     let mut environments = Vec::new();
     if let Some(Requested { name, target }) = one {
         // The engine the remedies speak for: the one connected to, and the
         // project's own when no connection could even be formed.
-        let driver = target
-            .as_ref()
-            .map_or_else(|_| db::driver_for(project.config.dialect), |t| t.driver());
+        let driver = target.as_ref().map_or(project_driver, |t| t.driver());
+        render_driver = driver;
         let d = match target {
             Ok(target) => {
                 // Named by the environment when there is one, and by the
@@ -511,29 +522,43 @@ pub fn cmd_doctor(project: &Project, one: Option<Requested>, json: bool) -> anyh
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", render(&report));
+        print!("{}", render(&report, render_driver));
     }
     outcome(&report)
 }
 
-/// How many findings mean "I could not look", rather than "I looked and found".
+fn is_unanswerable_finding(f: &output::Finding) -> bool {
+    f.severity == output::Severity::Error
+        && matches!(
+            f.id.as_str(),
+            "environment.unreachable"
+                | "environment.unconfigured"
+                | "permission.unknown"
+                | "ledger.unknown"
+                | "state.lock-unknown"
+                | "server.capabilities-unknown"
+                | "resolver.discovery-unknown"
+        )
+}
+
+/// How many environments could not be checked (not how many findings).
 fn unanswerable(report: &output::Report<Diagnosis>) -> usize {
+    if let Some(diagnosis) = &report.data {
+        let count = diagnosis
+            .environments
+            .iter()
+            .filter(|env| env.is_unanswerable())
+            .count();
+        if count > 0 {
+            return count;
+        }
+    }
+    // No environment is marked, yet a finding says a check went unanswered:
+    // count the findings, so the exit code never reads that as "all checked".
     report
         .findings
         .iter()
-        .filter(|f| {
-            f.severity == output::Severity::Error
-                && matches!(
-                    f.id.as_str(),
-                    "environment.unreachable"
-                        | "environment.unconfigured"
-                        | "permission.unknown"
-                        | "ledger.unknown"
-                        | "state.lock-unknown"
-                        | "server.capabilities-unknown"
-                        | "resolver.discovery-unknown"
-                )
-        })
+        .filter(|f| is_unanswerable_finding(f))
         .count()
 }
 
@@ -1010,12 +1035,15 @@ async fn examine(
             d.edition = caps.edition;
         }
     }
-    match crate::engine::resolver_discovery(&mut conn).await {
-        Ok(discovery) => d.resolver = Some(discovery),
-        Err(error) => {
-            // Catalog diagnostics are not allowed to echo source supplied by
-            // the server. Preserve a source-free cause/code, as ledger does.
-            d.resolver_discovery_unknown = Some(crate::engine::ledger_safe_reason(&error.into()));
+    if crate::engine::has_resolver(driver) {
+        match crate::engine::resolver_discovery(&mut conn).await {
+            Ok(discovery) => d.resolver = Some(discovery),
+            Err(error) => {
+                // Catalog diagnostics are not allowed to echo source supplied by
+                // the server. Preserve a source-free cause/code, as ledger does.
+                d.resolver_discovery_unknown =
+                    Some(crate::engine::ledger_safe_reason(&error.into()));
+            }
         }
     }
     // Before the ledger is written to, the question `ensure_tables` refuses
@@ -1072,7 +1100,10 @@ async fn examine(
         // that matters is the worst answer this command can give.
         Err(e) => {
             d.permissions_unknown = true;
-            d.note(format!("could not read this account's permissions: {e}"));
+            d.note(format!(
+                "could not read this {}'s permissions: {e}",
+                crate::engine::permission_subject(driver)
+            ));
         }
     }
 
@@ -1189,7 +1220,7 @@ fn env_findings(
                     d.detail.as_deref().unwrap_or("cannot connect")
                 ),
             )
-            .remedy("check the variable named by `url_env:`, the host, and the firewall"),
+            .remedy(crate::engine::unreachable_remedy(driver)),
         ),
         "unconfigured" => out.push(output::Finding::error(
             "environment.unconfigured",
@@ -1340,12 +1371,13 @@ fn env_findings(
         ),
         LedgerCheck::Checked(_) | LedgerCheck::NotChecked => {}
     }
+    let subject = crate::engine::permission_subject(driver);
     if d.permissions_unknown {
         out.push(
             output::Finding::error(
                 "permission.unknown",
                 format!(
-                    "{}: this account's permissions could not be read, so whether it can deploy \
+                    "{}: this {subject}'s permissions could not be read, so whether it can deploy \
                      here is undetermined; {}",
                     d.environment,
                     crate::engine::permission_read_advice(driver)
@@ -1360,14 +1392,14 @@ fn env_findings(
     for gap in &d.missing_permissions {
         out.push(output::Finding::error(
             "permission.missing",
-            format!("{}: the account lacks {gap}", d.environment),
+            format!("{}: the {subject} lacks {gap}", d.environment),
         ));
     }
     // A warning: the account is ready for every other plan (#1644).
     for advice in &d.advised_permissions {
         out.push(output::Finding::warning(
             "permission.advised",
-            format!("{}: the account does not hold {advice}", d.environment),
+            format!("{}: the {subject} does not hold {advice}", d.environment),
         ));
     }
     for schema in &d.absent_schemas {
@@ -1416,7 +1448,7 @@ fn env_findings(
         );
     }
     out.extend(partition_findings(d));
-    if d.supports_online == Some(false) {
+    if d.supports_online == Some(false) && crate::engine::online_depends_on_the_edition(driver) {
         out.push(output::Finding::note(
             "edition.no-online",
             format!(
@@ -1609,7 +1641,7 @@ fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
     out
 }
 
-fn render(report: &output::Report<Diagnosis>) -> String {
+fn render(report: &output::Report<Diagnosis>, driver: pbps_db::Driver) -> String {
     let Some(d) = &report.data else {
         return String::new();
     };
@@ -1626,17 +1658,19 @@ fn render(report: &output::Report<Diagnosis>) -> String {
         if d.git { "yes" } else { "no" }
     ));
 
+    let version_label = crate::engine::version_label(driver);
+    let show_resolver = crate::engine::has_resolver(driver);
     if !d.environments.is_empty() {
         out.push_str("\nEnvironments\n");
         for e in &d.environments {
             out.push_str(&format!("  {:<14} {}\n", e.environment, e.state));
             if let Some(v) = &e.server_version {
-                out.push_str(&format!("                 server  {v}\n"));
+                out.push_str(&format!("                 {version_label:<7} {v}\n"));
             }
             if let Some(ed) = &e.edition {
                 out.push_str(&format!("                 edition {ed}\n"));
             }
-            if let Some(resolver) = &e.resolver {
+            if show_resolver && let Some(resolver) = &e.resolver {
                 render_resolver(&mut out, resolver);
             }
             if e.supports_create_or_alter == Some(false) {
@@ -2699,7 +2733,8 @@ mod tests {
         }
         let report = output::Report::<Diagnosis>::new("doctor", findings, None);
         // Two unknowns, each an unanswerable finding: the command could not
-        // answer, which is never the established difference of a `Found`.
+        // answer, which is never the established difference of a `Found`. This
+        // report carries no diagnosis, so the findings are what is counted.
         assert_eq!(unanswerable(&report), 2);
         let error = outcome(&report).unwrap_err();
         assert!(error.downcast_ref::<crate::Found>().is_none(), "{error}");
@@ -3362,5 +3397,212 @@ mod tests {
         let remedy = parent_findings(&d)[0].remedy.clone().unwrap();
         assert!(!remedy.contains("$c"), "{remedy}");
         assert!(!crate::report::has_bare_placeholder(&remedy), "{remedy}");
+    }
+
+    #[test]
+    fn unanswerable_counts_environments_not_findings_across_every_engine() {
+        let diag = |environments: Vec<EnvDiagnosis>| Diagnosis {
+            project_file: "pbps.yml".into(),
+            declarations: "schema".into(),
+            identity_dir: ".pbps/ids".into(),
+            dialect: "postgres",
+            tables: 0,
+            modules: 0,
+            git: true,
+            environments,
+        };
+        // One environment with two independent unanswerable failures counts as 1.
+        let make_one = || {
+            let mut one = EnvDiagnosis::unknown("local".into(), Some("local".into()), "ready");
+            one.permissions_unknown = true;
+            one.server_capabilities_unknown = Some("version probe failed".into());
+            one
+        };
+        let one = make_one();
+        let findings = env_findings(
+            &one,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| is_unanswerable_finding(f))
+                .count(),
+            2,
+            "fixture must produce two unanswerable findings on one environment"
+        );
+        let report = output::Report::new("doctor", findings, Some(diag(vec![one])));
+        assert_eq!(unanswerable(&report), 1);
+        let err = outcome(&report).unwrap_err().to_string();
+        assert!(
+            err.contains("1 environment(s) could not be checked"),
+            "{err}"
+        );
+
+        // Two unanswerable environments (with 3 total unanswerable findings) plus
+        // one healthy environment count as 2.
+        let one = make_one();
+        let two = EnvDiagnosis::unknown("staging".into(), Some("staging".into()), "unreachable");
+        let ready = EnvDiagnosis::unknown("prod".into(), Some("prod".into()), "ready");
+        let mut mixed_findings = env_findings(
+            &one,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        );
+        mixed_findings.extend(env_findings(
+            &two,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        ));
+        mixed_findings.extend(env_findings(
+            &ready,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        ));
+        let report =
+            output::Report::new("doctor", mixed_findings, Some(diag(vec![one, two, ready])));
+        assert_eq!(unanswerable(&report), 2);
+        let err = outcome(&report).unwrap_err().to_string();
+        assert!(
+            err.contains("2 environment(s) could not be checked"),
+            "{err}"
+        );
+
+        // Negative: an environment with a checked permission gap is exit 2 (Found),
+        // not an unanswerable environment.
+        let mut lacking = EnvDiagnosis::unknown("prod".into(), Some("prod".into()), "ready");
+        lacking
+            .missing_permissions
+            .push("WRITE on database directory".into());
+        let lacking_findings = env_findings(
+            &lacking,
+            false,
+            &pbps_sqlite::dialect::Sqlite::default(),
+            pbps_db::Driver::Sqlite,
+        );
+        let report = output::Report::new("doctor", lacking_findings, Some(diag(vec![lacking])));
+        assert_eq!(unanswerable(&report), 0);
+        assert!(
+            outcome(&report)
+                .unwrap_err()
+                .downcast_ref::<crate::Found>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn doctor_rendering_and_findings_use_the_sqlite_profile_without_server_or_resolver_noise() {
+        let mut env = EnvDiagnosis::unknown("local".into(), Some("local".into()), "ready");
+        env.server_version = Some("SQLite 3.54.1".into());
+        env.supports_online = Some(false);
+        env.supports_create_or_alter = None;
+        // Even if a discovery value were carried, an engine without a resolver
+        // omits the resolver-discovery block when rendered.
+        env.resolver = Some(pbps_db::engine::discovery_not_available("SQLite"));
+
+        let sqlite = pbps_sqlite::dialect::Sqlite::default();
+        let findings = env_findings(&env, true, &sqlite, pbps_db::Driver::Sqlite);
+        assert!(
+            findings.is_empty(),
+            "healthy SQLite env with supports_online=false must emit no edition/module findings: {findings:?}"
+        );
+
+        // Negative: SQL Server still emits `edition.no-online` when `supports_online` is false.
+        let mssql_findings = env_findings(&env, false, &pbps_mssql::Mssql, pbps_db::Driver::Mssql);
+        assert!(
+            mssql_findings.iter().any(|f| f.id == "edition.no-online"),
+            "{mssql_findings:?}"
+        );
+
+        let report = output::Report::new(
+            "doctor",
+            findings,
+            Some(Diagnosis {
+                project_file: "pbps.yml".into(),
+                declarations: "schema".into(),
+                identity_dir: ".pbps/ids".into(),
+                dialect: "sqlite",
+                tables: 1,
+                modules: 0,
+                git: true,
+                environments: vec![env],
+            }),
+        );
+        let rendered = render(&report, pbps_db::Driver::Sqlite);
+        assert!(
+            rendered.contains("                 library SQLite 3.54.1\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("server  SQLite"), "{rendered}");
+        assert!(!rendered.contains("resolver compatibility:"), "{rendered}");
+        assert!(!rendered.contains("no image suggestion:"), "{rendered}");
+        assert!(!rendered.contains("unknown binding-adapter"), "{rendered}");
+        assert!(
+            rendered.contains("Nothing to report; this project is ready."),
+            "{rendered}"
+        );
+
+        // Negative: a server engine still renders `server  ` and the resolver block.
+        let pg_rendered = render(&report, pbps_db::Driver::Postgres);
+        assert!(
+            pg_rendered.contains("                 server  SQLite 3.54.1\n"),
+            "{pg_rendered}"
+        );
+        assert!(
+            pg_rendered.contains("resolver compatibility: unverified"),
+            "{pg_rendered}"
+        );
+
+        // Unreachable SQLite file names the path, existence, and permissions —
+        // never host or firewall.
+        let unreachable =
+            EnvDiagnosis::unknown("local".into(), Some("local".into()), "unreachable");
+        let unreachable_findings =
+            env_findings(&unreachable, false, &sqlite, pbps_db::Driver::Sqlite);
+        let remedy = unreachable_findings[0].remedy.as_deref().unwrap();
+        assert!(
+            remedy.contains("path") && remedy.contains("exists") && remedy.contains("permissions"),
+            "{remedy}"
+        );
+        assert!(
+            !remedy.contains("host") && !remedy.contains("firewall"),
+            "{remedy}"
+        );
+        // Negative: server engines keep the host/firewall remedy.
+        let server_remedy = env_findings(
+            &unreachable,
+            false,
+            &pbps_pg::Postgres::new(),
+            pbps_db::Driver::Postgres,
+        )[0]
+        .remedy
+        .clone()
+        .unwrap();
+        assert!(
+            server_remedy.contains("host") && server_remedy.contains("firewall"),
+            "{server_remedy}"
+        );
+
+        // SQLite permission findings speak of "process", never "account".
+        let mut gap_env = EnvDiagnosis::unknown("local".into(), Some("local".into()), "ready");
+        gap_env
+            .missing_permissions
+            .push("WRITE on database directory `/ro` — journal".into());
+        let gap_findings = env_findings(&gap_env, false, &sqlite, pbps_db::Driver::Sqlite);
+        assert!(
+            gap_findings[0].message.contains("the process lacks"),
+            "{}",
+            gap_findings[0].message
+        );
+        assert!(
+            !gap_findings[0].message.contains("account"),
+            "{}",
+            gap_findings[0].message
+        );
     }
 }

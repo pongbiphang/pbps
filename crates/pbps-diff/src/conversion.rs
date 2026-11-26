@@ -121,8 +121,10 @@ pub fn record(
     if !dialect.records_conversions() {
         return Err(refused(
             column,
-            "this engine has no `USING` clause and converts a column's values itself \
-             (ADR-0012 section 5)",
+            format!(
+                "`{}` has no `USING` clause for column type conversions (ADR-0012 section 5)",
+                dialect.name()
+            ),
         ));
     }
     check_expression(column, using, dialect)?;
@@ -889,5 +891,27 @@ mod tests {
         let mut kept = ids.clone();
         prune(&mut kept, &schema("text"), &MinimalDialect);
         assert_eq!(kept, ids);
+
+        let err = record(
+            Side {
+                schema: &base,
+                ids: &ids,
+            },
+            &declared,
+            &ids,
+            &amount(),
+            "amount::bigint",
+            None,
+            &ctx(),
+            &MinimalDialect,
+        )
+        .unwrap_err();
+        assert!(
+            err.why.contains("has no `USING` clause")
+                && err.why.contains(MinimalDialect.name())
+                && !err.why.contains("converts a column's values itself"),
+            "{}",
+            err.why
+        );
     }
 }

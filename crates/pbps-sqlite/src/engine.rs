@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use pbps_db::catalog::{Pulled, RowsError};
-use pbps_db::doctor::{RunwayAsk, RunwayReport};
+use pbps_db::doctor::{Ask, Capabilities, Permissions, RunwayAsk, RunwayReport};
 use pbps_db::engine::{Engine, EngineFuture, Read};
 use pbps_db::ledger::{StateRevision, StoredEntry};
 use pbps_db::sqlite::Connection;
@@ -234,11 +234,40 @@ impl Engine for SqliteEngine {
         Box::pin(async move { Ok(format!("SQLite {}", file(conn)?.version()?)) })
     }
 
+    fn capabilities<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        _version: Option<&'a str>,
+    ) -> EngineFuture<'a, Result<Capabilities, DbError>> {
+        // SQLite has no editions, no online index operations (apply refuses
+        // `strategy: online`, DEC-2950.19), and no `CREATE OR ALTER` syntax
+        // (views are rewritten by drop and create). The library's version is
+        // still read from the connection so an unreadable or foreign
+        // connection never reads as known capabilities.
+        Box::pin(async move {
+            let _ = file(conn)?.version()?;
+            Ok(Capabilities {
+                edition: None,
+                supports_online: false,
+                supports_create_or_alter: None,
+            })
+        })
+    }
+
     fn ledger_problems<'a>(
         &'a self,
         conn: &'a mut Conn,
     ) -> EngineFuture<'a, Result<Vec<String>, DbError>> {
         Box::pin(async move { crate::state::ledger_problems(file(conn)?) })
+    }
+
+    fn permissions<'a>(
+        &'a self,
+        conn: &'a mut Conn,
+        _project_ids: &'a IdsFile,
+        _ask: &'a Ask<'a>,
+    ) -> EngineFuture<'a, Result<Permissions, DbError>> {
+        Box::pin(async move { crate::doctor::permissions(file(conn)?) })
     }
 
     fn partition_runway<'a>(

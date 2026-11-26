@@ -85,6 +85,14 @@ fn malformed_duplicate_unusable_or_postgres_database_lists_are_refused() {
             "{text}"
         );
     }
+    let pg_err = Config::parse_project("dialect: postgres\ndatabases: [a]", Path::new("pbps.yml"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        pg_err.contains("postgres projects use the single-database layout")
+            && !pg_err.contains("PostgreSQL"),
+        "{pg_err}"
+    );
 }
 
 #[test]

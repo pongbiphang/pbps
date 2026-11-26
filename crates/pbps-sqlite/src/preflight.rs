@@ -192,24 +192,50 @@ pub fn writable(c: &Connection) -> Result<(), DbError> {
     writable_within(c, BUSY_WAIT)
 }
 
+/// What the rolled-back write probe established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WriteProbe {
+    Writable,
+    ReadOnlyDirectory { code: u32 },
+    ReadOnly { code: u32 },
+    JournalOff(String),
+}
+
 /// [`writable`] with the wait given, so a test need not wait five seconds.
 pub(crate) fn writable_within(c: &Connection, wait: Duration) -> Result<(), DbError> {
+    match probe_writable_within(c, wait, &[])? {
+        WriteProbe::Writable => Ok(()),
+        WriteProbe::JournalOff(line) => Err(DbError::Refused(line)),
+        WriteProbe::ReadOnlyDirectory { code } => Err(refuse_readonly(code, true)),
+        WriteProbe::ReadOnly { code } => Err(refuse_readonly(code, false)),
+    }
+}
+
+/// Runs the rolled-back write probe plus `extra_writes` inside one rolled-back
+/// transaction, returning a typed classification.
+pub(crate) fn probe_writable_within(
+    c: &Connection,
+    wait: Duration,
+    extra_writes: &[&str],
+) -> Result<WriteProbe, DbError> {
     waiting(c, wait, || {
         // The probe is undone by a rollback, which is not reliable without a journal.
         if let Some(line) = journal_off(c)? {
-            return Err(DbError::Refused(line));
+            return Ok(WriteProbe::JournalOff(line));
         }
         let name = probe_name(c)?;
         // The apply's own framing: the write lock is taken at once, so a second
         // writer is named as busy and not as an unwritable file.
         let outside = !c.in_transaction();
-        if outside {
-            c.execute_batch("BEGIN IMMEDIATE")
-                .map_err(|e| unwritable(e, wait))?;
+        if outside && let Err(error) = c.execute_batch("BEGIN IMMEDIATE") {
+            return classify_write_error(error, wait);
         }
-        let tried = c.execute_batch(&format!(
-            "SAVEPOINT pbps_probe; CREATE TABLE main.{name} (x)"
-        ));
+        let tried = c.execute_batch("SAVEPOINT pbps_probe").and_then(|()| {
+            for sql in extra_writes {
+                c.execute_batch(sql)?;
+            }
+            c.execute_batch(&format!("CREATE TABLE main.{name} (x)"))
+        });
         // However it went, undone: inside the caller's transaction only the
         // savepoint, outside it the transaction this function opened. Its own
         // error cannot replace the one that caused it.
@@ -228,10 +254,12 @@ pub(crate) fn writable_within(c: &Connection, wait: Duration) -> Result<(), DbEr
             // fails too, and that stays the engine's error. In a
             // write-protected directory the journal fails first (measured), so
             // that refusal is not lost.
-            (Err(error), Ok(())) if is_full(&error) && at_the_page_limit(c)? => Ok(()),
-            (Err(error), _) => Err(unwritable(error, wait)),
+            (Err(error), Ok(())) if is_full(&error) && at_the_page_limit(c)? => {
+                Ok(WriteProbe::Writable)
+            }
+            (Err(error), _) => classify_write_error(error, wait),
             (Ok(()), Err(error)) => Err(busy(error, wait)),
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Ok(())) => Ok(WriteProbe::Writable),
         }
     })
 }
@@ -281,17 +309,8 @@ fn is_full(error: &DbError) -> bool {
 const READONLY: u32 = 8;
 const READONLY_DIRECTORY: u32 = 1544;
 
-fn unwritable(error: DbError, wait: Duration) -> DbError {
-    let Some(code) = error
-        .server_error_code()
-        .and_then(|code| code.parse::<u32>().ok())
-    else {
-        return error;
-    };
-    if code & 0xff != READONLY {
-        return busy(error, wait);
-    }
-    DbError::Refused(if code == READONLY_DIRECTORY {
+fn refuse_readonly(code: u32, directory: bool) -> DbError {
+    DbError::Refused(if directory {
         format!(
             "SQLite can open this database but cannot write it (code {code}): the directory \
              that holds the file is write-protected, so the journal beside it cannot be made. \
@@ -303,6 +322,23 @@ fn unwritable(error: DbError, wait: Duration) -> DbError {
              directory or the connection is read-only. The first statement of the apply would \
              fail the same way"
         )
+    })
+}
+
+fn classify_write_error(error: DbError, wait: Duration) -> Result<WriteProbe, DbError> {
+    let Some(code) = error
+        .server_error_code()
+        .and_then(|code| code.parse::<u32>().ok())
+    else {
+        return Err(error);
+    };
+    if code & 0xff != READONLY {
+        return Err(busy(error, wait));
+    }
+    Ok(if code == READONLY_DIRECTORY {
+        WriteProbe::ReadOnlyDirectory { code }
+    } else {
+        WriteProbe::ReadOnly { code }
     })
 }
 

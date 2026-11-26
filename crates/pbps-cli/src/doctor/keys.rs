@@ -9,10 +9,18 @@ use crate::output::Finding;
 enum Loaded {
     Key(KeyId),
     Finding(Finding),
+    /// The engine has no routines or resolver that need a fingerprint key, and
+    /// none was configured.
+    NotNeeded,
 }
 
-pub(super) fn for_request(project: &Project, one: Option<&Requested>) -> Vec<Finding> {
-    for_request_with(project, one, |name| load(project, name))
+pub(super) fn for_request(
+    project: &Project,
+    one: Option<&Requested>,
+    driver: pbps_db::Driver,
+) -> Vec<Finding> {
+    let needs_key = crate::engine::has_resolver(driver);
+    for_request_with(project, one, |name| load(project, name, needs_key))
 }
 
 fn for_request_with(
@@ -29,16 +37,19 @@ fn for_request_with(
 
 #[cfg(all(test, unix))]
 pub(super) fn fingerprint_key_findings(project: &Project, names: &[String]) -> Vec<Finding> {
-    classify(names, |name| load(project, name))
+    classify(names, |name| load(project, name, true))
 }
 
-fn load(project: &Project, name: &str) -> Loaded {
+fn load(project: &Project, name: &str, needs_key: bool) -> Loaded {
     let source = match project.fingerprint_key_source(name) {
         Ok(source) => source,
         Err(e) => {
             return Loaded::Finding(Finding::error("environment.fingerprint-key", e.to_string()));
         }
     };
+    if source.is_none() && !needs_key {
+        return Loaded::NotNeeded;
+    }
     let loaded =
         match source {
             None => return Loaded::Finding(
@@ -82,15 +93,16 @@ fn classify(names: &[String], mut load: impl FnMut(&str) -> Loaded) -> Vec<Findi
             groups.entry(id).or_default().insert(name);
         }
     }
-    observed.iter().map(|(name, loaded)| match loaded {
-        Loaded::Finding(finding) => finding.clone(),
-        Loaded::Key(id) if groups[id].len() > 1 => Finding::error(
+    observed.iter().filter_map(|(name, loaded)| match loaded {
+        Loaded::NotNeeded => None,
+        Loaded::Finding(finding) => Some(finding.clone()),
+        Loaded::Key(id) if groups[id].len() > 1 => Some(Finding::error(
             "environment.shared-fingerprint-key",
             format!("environment `{name}` shares fingerprint key {id} with environments {}; \
                      each environment needs an independent key (DEC-964.1)",
                     groups[id].iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")),
-        ).remedy("Deliver an independent fingerprint key to each environment; after rotating a key, regenerate plans sealed under its old identifier."),
-        Loaded::Key(id) => Finding::note("environment.fingerprint-key", format!("environment `{name}` has fingerprint key {id}")),
+        ).remedy("Deliver an independent fingerprint key to each environment; after rotating a key, regenerate plans sealed under its old identifier.")),
+        Loaded::Key(id) => Some(Finding::note("environment.fingerprint-key", format!("environment `{name}` has fingerprint key {id}"))),
     }).collect()
 }
 

@@ -547,7 +547,8 @@ mod tests {
             assert!(
                 err.contains("same_instance")
                     && err.contains("scratch")
-                    && err.contains("PostgreSQL"),
+                    && err.contains("remove it for postgres")
+                    && !err.contains("PostgreSQL"),
                 "{err}"
             );
             assert!(
@@ -558,6 +559,17 @@ mod tests {
                 .is_err()
             );
         }
+        // Any future non-SQL-Server dialect name travels through `as_str()`
+        // without naming PostgreSQL.
+        let future = ConfigError::InapplicableSameInstance {
+            resolver: "scratch".into(),
+            dialect: "sqlite",
+        }
+        .to_string();
+        assert!(
+            future.contains("remove it for sqlite") && !future.contains("PostgreSQL"),
+            "{future}"
+        );
         for value in ["sometimes", "null", "true"] {
             assert!(
                 parse(

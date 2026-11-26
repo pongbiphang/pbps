@@ -312,8 +312,8 @@ impl Connection {
         let shown = path.display().to_string();
         if shown.is_empty() || shown == ":memory:" {
             return Err(DbError::BadConnectionString(
-                "an empty path or `:memory:` is not a database file; \
-                 use `open_in_memory` for a private memory database"
+                "an empty path or `:memory:` is not a database file on disk; \
+                 pass the path to a SQLite database file instead"
                     .into(),
             ));
         }
@@ -325,8 +325,9 @@ impl Connection {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
         {
             return Err(DbError::BadConnectionString(format!(
-                "`{shown}` starts with `file:`, which SQLite would read as a URI; \
-                 write the path as `./{shown}`"
+                "`{shown}` starts with `file:`, which SQLite reads as a URI and pbps refuses; \
+                 pass a plain database file path instead (prefix a relative filename that \
+                 literally begins with `file:` with `./`)"
             )));
         }
         match std::fs::metadata(path) {
@@ -1044,9 +1045,16 @@ mod tests {
         for text in ["", ":memory:"] {
             let error = Connection::open(Path::new(text), OpenMode::CreateIfMissing)
                 .expect_err("must refuse");
+            let DbError::BadConnectionString(message) = error else {
+                panic!("expected BadConnectionString for {text:?}, got {error:?}");
+            };
             assert!(
-                matches!(error, DbError::BadConnectionString(_)),
-                "{text:?}: {error:?}"
+                message.contains("not a database file") && message.contains("pass the path"),
+                "{text:?}: {message}"
+            );
+            assert!(
+                !message.contains("open_in_memory"),
+                "CLI refusal must not name an internal Rust function: {message}"
             );
         }
         let dir = dir();
@@ -1057,15 +1065,30 @@ mod tests {
         );
         // With URI handling on, this would open a private memory database and
         // succeed; it is refused before SQLite sees it, and nothing is created.
-        let error = Connection::open(
-            Path::new("file:pbps_uri_probe?mode=memory"),
-            OpenMode::ExistingOnly,
-        )
-        .expect_err("a file: path must not be read as a URI");
-        assert!(
-            matches!(error, DbError::BadConnectionString(_)),
-            "{error:?}"
-        );
+        for uri in [
+            "file:pbps_uri_probe?mode=memory",
+            "file:/abs/path.db",
+            "FILE:/abs/upper.db",
+        ] {
+            let error = Connection::open(Path::new(uri), OpenMode::ExistingOnly)
+                .expect_err("a file: path must not be read as a URI");
+            let DbError::BadConnectionString(message) = error else {
+                panic!("expected BadConnectionString for {uri:?}, got {error:?}");
+            };
+            assert!(
+                message.contains("starts with `file:`")
+                    && message.contains("plain database file path"),
+                "{uri:?}: {message}"
+            );
+            assert!(
+                !message.contains(&format!("./{uri}")),
+                "must never suggest ./file:/abs/path: {message}"
+            );
+        }
+        // Negative: a real file whose relative name starts with `./file:` opens cleanly.
+        let literal = dir.path().join("file:literal.db");
+        let opened = Connection::open(&literal, OpenMode::CreateIfMissing);
+        assert!(opened.is_ok(), "{opened:?}");
     }
 
     #[test]

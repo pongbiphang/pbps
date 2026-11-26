@@ -1357,7 +1357,7 @@ pub fn changes(cs: &ChangeSet) -> String {
 
 pub fn required_rows(guard: &pbps_model::DropGuard) -> Vec<String> {
     guard.requirements.values().map(|r| format!(
-        "{} requires `{}` immediately before removal; the scan holds an exclusive table lock through the drop, so writers wait",
+        "{} requires `{}` immediately before removal; the scan holds an exclusive write lock through the drop, so writers wait",
         guard.table.shown(), Escaped(&r.predicate))).collect()
 }
 
@@ -4129,5 +4129,40 @@ mod role_of_tests {
             assert_eq!(role_of(&grant), Some(&"reader".into()));
             assert_eq!(role_of(&revoke), Some(&"writer".into()));
         }
+    }
+
+    #[test]
+    fn required_rows_describes_an_exclusive_write_lock_without_claiming_table_granularity() {
+        let table_uid = Uid::derived(UidKind::Table, "t", 0);
+        let mut requirements = std::collections::BTreeMap::new();
+        requirements.insert(
+            Uid::derived(UidKind::Column, "c", 0),
+            pbps_model::DropRequirement {
+                table_uid: table_uid.clone(),
+                predicate: "amount IS NULL".into(),
+                required_at: "2026-11-26".into(),
+                operator: "ci".into(),
+            },
+        );
+        let guard = pbps_model::DropGuard {
+            table_uid,
+            table: "main.t".parse().unwrap(),
+            detach_from: None,
+            requirements,
+        };
+        let lines = required_rows(&guard);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("exclusive write lock through the drop, so writers wait")
+                && !lines[0].contains("exclusive table lock"),
+            "{}",
+            lines[0]
+        );
+        // Negative: an empty guard produces no requirement lines.
+        let empty = pbps_model::DropGuard {
+            requirements: std::collections::BTreeMap::new(),
+            ..guard
+        };
+        assert!(required_rows(&empty).is_empty());
     }
 }

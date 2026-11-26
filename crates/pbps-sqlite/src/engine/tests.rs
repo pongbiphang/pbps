@@ -9,7 +9,9 @@ use std::future::Future;
 
 use futures_util::FutureExt;
 use pbps_db::catalog::RowsError;
-use pbps_db::doctor::RunwayAsk;
+use pbps_db::doctor::{
+    Ask, Capabilities, DataTables, DeclaredKeys, GrantTargets, ReferencedColumns, RunwayAsk,
+};
 use pbps_db::engine::{Engine, Read};
 use pbps_db::{Conn, DbError, Driver, LedgerError};
 use pbps_model::{IdsFile, RowScope, Schema, StateKind, StateSnapshot, TableName};
@@ -241,6 +243,43 @@ fn an_engine_without_partitions_reports_none_and_does_not_say_unknown() {
     };
     let report = now(ENGINE.partition_runway(&mut conn, &ask, &IdsFile::default())).expect("known");
     assert!(report.parents.is_empty());
-    // The questions SQLite has no answer to keep their stated refusals.
-    assert!(now(ENGINE.capabilities(&mut conn, None)).is_err());
+}
+
+#[test]
+fn capabilities_and_permissions_answer_through_the_engine_trait() {
+    let fresh = Fresh::file();
+    let mut conn = connect(&fresh);
+    let version = now(ENGINE.server_version(&mut conn)).expect("version");
+    let caps = now(ENGINE.capabilities(&mut conn, Some(&version))).expect("capabilities");
+    assert_eq!(
+        caps,
+        Capabilities {
+            edition: None,
+            supports_online: false,
+            supports_create_or_alter: None,
+        }
+    );
+    let referenced_columns = ReferencedColumns::new();
+    let granted = GrantTargets::default();
+    let data = DataTables::new();
+    let declared_keys = DeclaredKeys::new();
+    let ask = Ask {
+        managed_schemas: &[],
+        managed_tables: &[],
+        referenced: &[],
+        referenced_columns: &referenced_columns,
+        granted: &granted,
+        data: &data,
+        declared_keys: &declared_keys,
+    };
+    let held = now(ENGINE.permissions(&mut conn, &IdsFile::default(), &ask)).expect("permissions");
+    assert!(held.gaps.is_empty(), "{held:?}");
+    assert!(held.advised.is_empty(), "{held:?}");
+    assert!(held.absent_schemas.is_empty(), "{held:?}");
+    // Negative: the engine's answer is the file's, not an empty default. A
+    // connection that cannot write reports the gap.
+    now(conn.execute("PRAGMA query_only = ON")).expect("query_only");
+    let held = now(ENGINE.permissions(&mut conn, &IdsFile::default(), &ask)).expect("permissions");
+    assert_eq!(held.gaps.len(), 1, "{held:?}");
+    assert_eq!(held.gaps[0].permission, "WRITE");
 }
