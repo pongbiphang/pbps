@@ -4,9 +4,8 @@
 //! gates (`require_transactional_rebuilds`, `vet_plan_sites`, `support_rows`,
 //! `server_limits`), the 3 name-namespace methods
 //! (`refuse_occupied_relation_names`, `check_names_against_catalog`,
-//! `order_by_catalog`), and connected view-dependent scheduling (`schedule`);
-//! `check_final_order` keeps its refusing default until SQLite's drop-blocker
-//! pass is built.
+//! `order_by_catalog`), connected view-dependent scheduling (`schedule`), and
+//! the post-ordering drop-blocker and final-order checks (`check_final_order`).
 
 use super::*;
 use pbps_dialect::Dialect as _;
@@ -201,6 +200,39 @@ pub(in crate::engine) fn known_module_ids<'a>(
         }
     }
     known
+}
+
+/// Runs SQLite's catalog drop-blocker check inside the caller's transaction;
+/// shared by [`PlanSession::check_final_order`] and [`ApplySession::drop_blockers`].
+pub(in crate::engine) fn check_drop_blockers(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    ids: &IdsFile,
+    stored: &Schema,
+    stored_ids: &IdsFile,
+) -> anyhow::Result<ConnectedCheck> {
+    let c = sqlite_conn(conn)?;
+    if !inventory::has_drop_blocker_target(changes) {
+        return Ok(defaults::not_applicable(
+            "SQLite",
+            "drop_blockers",
+            "the plan drops and retypes nothing a dependency could block",
+        ));
+    }
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+    let sources = pbps_model::physical_sources::PhysicalSources::of(names, stored, stored_ids)?;
+    let inv = inventory::read_for_drops(c, &sources)?;
+    let reports = inventory::drop_blockers(&inv, &sources)?;
+    refuse_drop_reports("SQLite", &reports)?;
+    Ok(ConnectedCheck {
+        name: "drop_blockers",
+        engine: "SQLite",
+        status: "passed",
+        message: format!(
+            "{} table/column/index drop(s) checked against current SQLite catalog dependencies",
+            reports.len()
+        ),
+    })
 }
 
 fn ensure_inventory<'a>(
@@ -575,6 +607,89 @@ impl PlanSession for Sqlite {
         })
     }
 
+    /// Runs SQLite's five post-ordering checks inside the planning transaction:
+    /// `rebuilds`, `drop_blockers` (shared with [`ApplySession::drop_blockers`]),
+    /// `logical_slots`, `numbered_column_fills` and `data_writes`.
+    async fn check_final_order(
+        &self,
+        state: &PlanState,
+        conn: &mut Conn,
+        changes: &ChangeSet,
+        frame: Frame<'_>,
+    ) -> anyhow::Result<FinalOrderChecks> {
+        use pbps_model::{
+            Change, ColumnChange, ModuleChange as MC, ModuleKind, ModuleOptions, TableChange,
+            ValueSource,
+        };
+        let _ = sqlite_conn(conn)?;
+        for p in &changes.changes {
+            if let Change::Module(
+                MC::AlterModule { id, module } | MC::CreateModule { id, module },
+            ) = &p.change
+            {
+                let shown = id.shown();
+                anyhow::ensure!(
+                    module.kind == ModuleKind::View && module.options == ModuleOptions::default(),
+                    "SQLite only supports plain views, not {} (`{shown}`)",
+                    module.kind
+                );
+            } else if let Change::Module(MC::DropModule { id, kind }) = &p.change {
+                anyhow::ensure!(
+                    *kind == ModuleKind::View,
+                    "SQLite only supports views, not {kind} (`{}`)",
+                    id.shown()
+                );
+            }
+        }
+        let rebuilds = self.check_module_rebuilds(conn, changes, false).await?;
+        let drop_blockers = check_drop_blockers(
+            conn,
+            changes,
+            frame.written.ids,
+            frame.recorded.schema,
+            frame.recorded.ids,
+        )?;
+        let no_slots = "SQLite has no partitions or logical replication slots";
+        anyhow::ensure!(
+            !changes.changes.iter().any(|p| matches!(
+                p.change,
+                Change::Table(TableChange::CreateTable {
+                    beside_default: Some(_),
+                    ..
+                }) | Change::Partition(_)
+            )),
+            "{no_slots}"
+        );
+        let no_num = "SQLite has no identity or sequence columns and no logical decoding";
+        anyhow::ensure!(
+            !changes.changes.iter().any(|p| matches!(
+                &p.change,
+                Change::Column(ColumnChange::AddColumn { column, .. })
+                    if matches!(column.value_source, ValueSource::Identity(_) | ValueSource::Sequence(_))
+            )),
+            "{no_num}"
+        );
+        let _ = self
+            .prepare_data_writes(
+                conn,
+                &state.admission,
+                changes,
+                frame.baseline,
+                frame.written.ids,
+            )
+            .await?;
+        Ok(FinalOrderChecks {
+            rebuilds,
+            drop_blockers,
+            logical_slots: defaults::not_applicable("SQLite", "logical_slots", no_slots),
+            numbered_column_fills: defaults::not_applicable(
+                "SQLite",
+                "numbered_column_fills",
+                no_num,
+            ),
+        })
+    }
+
     /// Does not exist on this engine (stored routines and `USING` conversions)
     /// plus neutral drop-requirement vetting: SQLite has no stored routines a
     /// table expression can call, so a `DEFAULT`, a `CHECK` or a partial-index
@@ -839,8 +954,8 @@ mod tests {
                 .expect("ok")
                 .is_empty()
         );
-        // Unoverridden defaults stay refusing for plans that still need a
-        // later pass (here `check_final_order` on a table drop).
+        // `check_final_order` refuses a DropTable whose target is absent from
+        // SQLite's catalog (never answering "no blockers").
         let drop_table = ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
                 pbps_model::TableChange::DropTable {
@@ -875,7 +990,10 @@ mod tests {
         let state = PlanState::default();
         let refused =
             now(dialect.check_final_order(&state, &mut conn, &drop_table, frame)).unwrap_err();
-        assert!(refused.to_string().contains("sqlite"), "{refused}");
+        assert!(
+            refused.to_string().contains("SQLite") && refused.to_string().contains("main.t"),
+            "{refused}"
+        );
     }
 
     fn uid(kind: pbps_model::UidKind, name: &str) -> pbps_model::Uid {
@@ -2991,8 +3109,9 @@ mod tests {
             .expect("drop view with dropped managed reader passes every PlanSession position");
         }
 
-        // 11. Pin the positions that still refuse plans needing later PRs:
-        // - DropTable -> `check_final_order` (drop blockers)
+        // 11. Drop table, drop column, drop index, and edit view (alone and
+        //     with managed readers) now pass EVERY PlanSession position!
+        // - DropTable alone
         {
             let mut desired = base.clone();
             desired.tables.remove(&TableName::new("main", "parent"));
@@ -3001,22 +3120,61 @@ mod tests {
             desired_ids
                 .columns
                 .remove(&uid(pbps_model::UidKind::Column, "main.parent.id"));
-            let (pos, _) = run_all_positions(
+            run_all_positions(
                 &seed,
                 &base,
                 &base_ids,
                 &desired,
                 &desired_ids,
                 vec![Change::Table(TableChange::DropTable {
-                    uid: parent_uid,
+                    uid: parent_uid.clone(),
                     name: TableName::new("main", "parent"),
                     detach_from: None,
                 })],
             )
-            .unwrap_err();
-            assert_eq!(pos, "check_final_order");
+            .expect("drop table alone passes every PlanSession position");
         }
-        // - DropColumn -> `check_final_order` (drop blockers)
+        // - DropTable with managed reader view dropped first
+        {
+            let mut base_v = base.clone();
+            let v_id = ModuleId::Named(TableName::new("main", "v_parent"));
+            base_v
+                .modules
+                .insert(v_id.clone(), *view_module("SELECT id FROM parent"));
+            let mut desired = base.clone();
+            desired.tables.remove(&TableName::new("main", "parent"));
+            let mut desired_ids = base_ids.clone();
+            desired_ids.tables.remove(&parent_uid);
+            desired_ids
+                .columns
+                .remove(&uid(pbps_model::UidKind::Column, "main.parent.id"));
+            run_all_positions(
+                &[
+                    "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+                    "CREATE VIEW v_parent AS SELECT id FROM parent",
+                ],
+                &base_v,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                vec![
+                    Change::Module(ModuleChange::DropModule {
+                        id: v_id,
+                        kind: ModuleKind::View,
+                    }),
+                    Change::Table(TableChange::DropTable {
+                        uid: parent_uid.clone(),
+                        name: TableName::new("main", "parent"),
+                        detach_from: None,
+                    }),
+                ],
+            )
+            .expect(
+                "drop table with managed reader dropped first passes every PlanSession position",
+            );
+        }
+        // - DropColumn alone
         {
             let mut desired = base.clone();
             desired
@@ -3029,7 +3187,7 @@ mod tests {
             desired_ids
                 .columns
                 .remove(&uid(pbps_model::UidKind::Column, "main.items.qty"));
-            let (pos, _) = run_all_positions(
+            run_all_positions(
                 &seed,
                 &base,
                 &base_ids,
@@ -3040,11 +3198,89 @@ mod tests {
                     column: TableName::new("main", "items").column("qty"),
                 })],
             )
-            .unwrap_err();
-            assert_eq!(pos, "check_final_order");
+            .expect("drop column alone passes every PlanSession position");
         }
-        // - AlterModule (View) alone -> now passes `schedule` and `order_by_catalog`,
-        //   stopped at `check_final_order` (`defaults::module_rebuilds`).
+        // - DropColumn with managed reader view dropped first
+        {
+            let mut base_v = base.clone();
+            let v_id = ModuleId::Named(TableName::new("main", "v_qty"));
+            base_v
+                .modules
+                .insert(v_id.clone(), *view_module("SELECT qty FROM items"));
+            let mut desired = base.clone();
+            desired
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items")
+                .columns
+                .shift_remove("qty");
+            let mut desired_ids = base_ids.clone();
+            desired_ids
+                .columns
+                .remove(&uid(pbps_model::UidKind::Column, "main.items.qty"));
+            run_all_positions(
+                &[
+                    "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+                    "CREATE VIEW v_qty AS SELECT qty FROM items",
+                ],
+                &base_v,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                vec![
+                    Change::Module(ModuleChange::DropModule {
+                        id: v_id,
+                        kind: ModuleKind::View,
+                    }),
+                    Change::Column(ColumnChange::DropColumn {
+                        uid: uid(pbps_model::UidKind::Column, "main.items.qty"),
+                        column: TableName::new("main", "items").column("qty"),
+                    }),
+                ],
+            )
+            .expect(
+                "drop column with managed reader dropped first passes every PlanSession position",
+            );
+        }
+        // - DropIndex
+        {
+            let mut base_ix = base.clone();
+            base_ix
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items")
+                .indexes
+                .insert(
+                    "ix_qty".into(),
+                    Index {
+                        columns: vec![IndexColumn::column("qty")],
+                        include: Vec::new(),
+                        unique: false,
+                        filter: None,
+                        method: Default::default(),
+                        storage_parameters: Default::default(),
+                        filegroup: None,
+                    },
+                );
+            run_all_positions(
+                &[
+                    "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+                    "CREATE INDEX ix_qty ON items(qty)",
+                ],
+                &base_ix,
+                &base_ids,
+                &base,
+                &base_ids,
+                vec![Change::Index(IndexChange::DropIndex {
+                    table: TableName::new("main", "items"),
+                    name: "ix_qty".into(),
+                })],
+            )
+            .expect("drop index passes every PlanSession position");
+        }
+        // - AlterModule (View) alone
         {
             let mut base_v = base.clone();
             let v_id = ModuleId::Named(TableName::new("main", "v_edit"));
@@ -3055,7 +3291,7 @@ mod tests {
             desired_v
                 .modules
                 .insert(v_id.clone(), *view_module("SELECT 2"));
-            let (pos, _) = run_all_positions(
+            run_all_positions(
                 &[
                     "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
                     "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
@@ -3070,11 +3306,9 @@ mod tests {
                     module: view_module("SELECT 2"),
                 })],
             )
-            .unwrap_err();
-            assert_eq!(pos, "check_final_order");
+            .expect("edit view alone passes every PlanSession position");
         }
-        // - AlterModule (View) with managed reader -> `schedule` weaves the reader
-        //   around the edit and passes `order_by_catalog`, stopped at `check_final_order`.
+        // - AlterModule (View) with managed reader woven by `schedule`
         {
             let mut base_v = base.clone();
             let v_id = ModuleId::Named(TableName::new("main", "v_edit"));
@@ -3089,7 +3323,7 @@ mod tests {
             desired_v
                 .modules
                 .insert(v_id.clone(), *view_module("SELECT id + 1 AS id FROM items"));
-            let (pos, _) = run_all_positions(
+            run_all_positions(
                 &[
                     "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
                     "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
@@ -3105,8 +3339,88 @@ mod tests {
                     module: view_module("SELECT id + 1 AS id FROM items"),
                 })],
             )
+            .expect("edit view with managed reader passes every PlanSession position");
+        }
+
+        // 12. Pin what still refuses and at which position:
+        // - Rebuild-requiring changes (AlterColumnType, DropUnique, SetPrimaryKey { from: Some(_) })
+        //   -> `check_final_order` (drop_blockers).
+        {
+            let mut desired = base.clone();
+            desired
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items")
+                .columns
+                .get_mut("qty")
+                .expect("qty")
+                .ty = "text".parse().expect("type");
+            let (pos, err) = run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &base_ids,
+                vec![Change::Column(ColumnChange::AlterColumnType {
+                    uid: uid(pbps_model::UidKind::Column, "main.items.qty"),
+                    column: TableName::new("main", "items").column("qty"),
+                    from: "integer".parse().expect("type"),
+                    to: "text".parse().expect("type"),
+                    from_nullable: true,
+                    to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
+                    through_external_partitions: false,
+                    using: None,
+                })],
+            )
             .unwrap_err();
-            assert_eq!(pos, "check_final_order");
+            assert_eq!(pos, "check_final_order", "{err}");
+            assert!(err.contains("SQLite") && err.contains("rebuild"), "{err}");
+        }
+        // - Guarded drop (`drop_guard` requirement) -> `vet_plan_sites` (`ApplySession::requirement`).
+        {
+            let (_tmp, mut conn) = TempDb::create();
+            for sql in seed {
+                now(conn.execute(sql)).expect(sql);
+            }
+            let mut pc = pbps_model::PlannedChange::new(Change::Table(TableChange::DropTable {
+                uid: parent_uid.clone(),
+                name: TableName::new("main", "parent"),
+                detach_from: None,
+            }));
+            let mut requirements = BTreeMap::new();
+            requirements.insert(
+                parent_uid.clone(),
+                pbps_model::DropRequirement {
+                    table_uid: parent_uid.clone(),
+                    predicate: "id > 0".into(),
+                    required_at: "2026-01-01T00:00:00Z".into(),
+                    operator: "test".into(),
+                },
+            );
+            pc.drop_guard = Some(pbps_model::DropGuard {
+                table_uid: parent_uid.clone(),
+                table: TableName::new("main", "parent"),
+                detach_from: None,
+                requirements,
+            });
+            let mut after_ids = base_ids.clone();
+            after_ids.tables.remove(&parent_uid);
+            after_ids
+                .columns
+                .retain(|_, c| c.table != TableName::new("main", "parent"));
+            let names =
+                pbps_model::plan_names::PlanNames::of(std::slice::from_ref(&pc), &after_ids)
+                    .expect("names");
+            let err =
+                now(dialect.vet_plan_sites(&PlanState::default(), &mut conn, &names, &mut |_| {}))
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                err.contains("SQLite") && err.contains("drop-requirement"),
+                "{err}"
+            );
         }
     }
 
@@ -3632,5 +3946,230 @@ mod tests {
             );
             locker.execute("ROLLBACK", &[]).expect("unlock");
         }
+    }
+
+    #[test]
+    fn check_final_order_passes_for_clean_drops_and_view_edits_and_refuses_blockers_and_foreign_parts()
+     {
+        use pbps_model::{
+            Change, Column, ColumnChange, IndexChange, ModuleChange, ModuleId, ModuleKind,
+            ModuleOptions, RowChange, TableChange, ValueSource,
+        };
+
+        let (tmp, mut conn) = TempDb::create();
+        let dialect = Sqlite::default();
+        for sql in [
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE UNIQUE INDEX uq_k ON parent(k)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id), pk INTEGER REFERENCES parent(k))",
+            "CREATE TABLE solo (id INTEGER PRIMARY KEY, extra INTEGER)",
+            "CREATE INDEX ix_extra ON solo(extra)",
+            "CREATE VIEW v_solo AS SELECT extra FROM solo",
+        ] {
+            now(conn.execute(sql)).expect(sql);
+        }
+
+        let mut stored = Schema::default();
+        let mut stored_ids = IdsFile::default();
+        for (name, cols) in [
+            ("parent", &["id", "k"][..]),
+            ("child", &["id", "pid", "pk"][..]),
+            ("solo", &["id", "extra"][..]),
+        ] {
+            let tn = TableName::new("main", name);
+            stored.tables.insert(tn.clone(), table_with_cols(cols));
+            table_id(&mut stored_ids, name);
+            for &col in cols {
+                col_id(&mut stored_ids, name, col);
+            }
+        }
+        let run = |conn: &mut Conn, changes: Vec<Change>| {
+            let mut desired_ids = stored_ids.clone();
+            for ch in &changes {
+                if let Change::Table(TableChange::DropTable { uid, name, .. }) = ch {
+                    desired_ids.tables.remove(uid);
+                    desired_ids.columns.retain(|_, c| c.table != *name);
+                } else if let Change::Column(ColumnChange::DropColumn { uid, .. }) = ch {
+                    desired_ids.columns.remove(uid);
+                }
+            }
+            let cs = change_set(changes);
+            let hints = pbps_model::Hints::default();
+            let baseline = StateSnapshot::new(
+                pbps_model::StateKind::Baseline,
+                stored.clone(),
+                stored_ids.clone(),
+                "test",
+            );
+            let recorded = pbps_diff::Side {
+                schema: &stored,
+                ids: &stored_ids,
+            };
+            let written = pbps_diff::Side {
+                schema: &stored,
+                ids: &desired_ids,
+            };
+            let frame = Frame {
+                label: "test.db",
+                recorded,
+                written,
+                base: recorded,
+                declared: written,
+                hints: &hints,
+                baseline: &baseline,
+            };
+            now(dialect.check_final_order(&PlanState::default(), conn, &cs, frame))
+        };
+
+        // 1. View edit passes all five parts; rebuilds/slots/numbering/drop_blockers are not_applicable.
+        let edit_ok = run(
+            &mut conn,
+            vec![Change::Module(ModuleChange::AlterModule {
+                id: ModuleId::Named(TableName::new("main", "v_solo")),
+                module: view_module("SELECT id FROM solo"),
+            })],
+        )
+        .expect("view edit passes");
+        assert_eq!(edit_ok.rebuilds.status, "not_applicable");
+        assert_eq!(edit_ok.drop_blockers.status, "not_applicable");
+        assert_eq!(edit_ok.logical_slots.status, "not_applicable");
+        assert_eq!(edit_ok.numbered_column_fills.status, "not_applicable");
+
+        // 2. Unreferenced index drop, child-before-parent table drops, and reader-before-column drop pass.
+        let drops_ok = run(
+            &mut conn,
+            vec![
+                Change::Index(IndexChange::DropIndex {
+                    table: TableName::new("main", "solo"),
+                    name: "ix_extra".into(),
+                }),
+                Change::Module(ModuleChange::DropModule {
+                    id: ModuleId::Named(TableName::new("main", "v_solo")),
+                    kind: ModuleKind::View,
+                }),
+                Change::Column(ColumnChange::DropColumn {
+                    uid: uid(pbps_model::UidKind::Column, "main.solo.extra"),
+                    column: TableName::new("main", "solo").column("extra"),
+                }),
+                Change::Table(TableChange::DropTable {
+                    uid: uid(pbps_model::UidKind::Table, "main.child"),
+                    name: TableName::new("main", "child"),
+                    detach_from: None,
+                }),
+                Change::Table(TableChange::DropTable {
+                    uid: uid(pbps_model::UidKind::Table, "main.parent"),
+                    name: TableName::new("main", "parent"),
+                    detach_from: None,
+                }),
+            ],
+        )
+        .expect("accounted drops pass");
+        assert_eq!(drops_ok.drop_blockers.status, "passed");
+
+        // 3. Permitted-but-broken blockers refuse naming SQLite and both objects.
+        for (label, changes, expected) in [
+            (
+                "parent with child FK",
+                vec![Change::Table(TableChange::DropTable {
+                    uid: uid(pbps_model::UidKind::Table, "main.parent"),
+                    name: TableName::new("main", "parent"),
+                    detach_from: None,
+                })],
+                ("main.parent", "main.child"),
+            ),
+            (
+                "sole unique index behind FK",
+                vec![Change::Index(IndexChange::DropIndex {
+                    table: TableName::new("main", "parent"),
+                    name: "uq_k".into(),
+                })],
+                ("uq_k", "main.child"),
+            ),
+            (
+                "column read by view",
+                vec![Change::Column(ColumnChange::DropColumn {
+                    uid: uid(pbps_model::UidKind::Column, "main.solo.extra"),
+                    column: TableName::new("main", "solo").column("extra"),
+                })],
+                ("main.solo.extra", "v_solo"),
+            ),
+        ] {
+            let err = run(&mut conn, changes).expect_err(label).to_string();
+            assert!(
+                err.contains("SQLite") && err.contains(expected.0) && err.contains(expected.1),
+                "{label}: {err}"
+            );
+        }
+
+        // 4. Foreign inputs across all five parts refuse naming SQLite.
+        let mut opt_mod = view_module("SELECT 1");
+        opt_mod.options = ModuleOptions {
+            schemabinding: true,
+            ..Default::default()
+        };
+        let mut id_col = Column::new("integer".parse().expect("ty"));
+        id_col.value_source = ValueSource::Identity(pbps_model::Identity::new(1, 1));
+        for (label, ch) in [
+            (
+                "non-view module",
+                Change::Module(ModuleChange::DropModule {
+                    id: ModuleId::Named(TableName::new("main", "f")),
+                    kind: ModuleKind::Function,
+                }),
+            ),
+            (
+                "view options",
+                Change::Module(ModuleChange::AlterModule {
+                    id: ModuleId::Named(TableName::new("main", "v_solo")),
+                    module: opt_mod,
+                }),
+            ),
+            (
+                "beside_default partition",
+                Change::Table(TableChange::CreateTable {
+                    uid: uid(pbps_model::UidKind::Table, "main.p1"),
+                    name: TableName::new("main", "p1"),
+                    table: Box::new(table_with_cols(&["id"])),
+                    beside_default: Some(TableName::new("main", "p_def")),
+                    moves_at_most: None,
+                }),
+            ),
+            (
+                "identity column",
+                Change::Column(ColumnChange::AddColumn {
+                    uid: uid(pbps_model::UidKind::Column, "main.solo.seq"),
+                    table: TableName::new("main", "solo"),
+                    name: "seq".into(),
+                    column: Box::new(id_col),
+                }),
+            ),
+            (
+                "row write",
+                Change::Row(RowChange::SetEnsureKeys {
+                    table: TableName::new("main", "solo"),
+                    from: BTreeSet::new(),
+                    to: BTreeSet::new(),
+                }),
+            ),
+        ] {
+            let err = run(&mut conn, vec![ch]).expect_err(label).to_string();
+            assert!(err.contains("SQLite"), "{label}: {err}");
+        }
+
+        // 5. Unreadable (exclusively locked) catalog is an error, never "no blockers".
+        let locker =
+            pbps_db::sqlite::Connection::open(tmp.path(), pbps_db::sqlite::OpenMode::ExistingOnly)
+                .expect("second conn");
+        locker.execute("BEGIN EXCLUSIVE", &[]).expect("lock");
+        let lock_err = run(
+            &mut conn,
+            vec![Change::Index(IndexChange::DropIndex {
+                table: TableName::new("main", "solo"),
+                name: "ix_extra".into(),
+            })],
+        )
+        .expect_err("locked file must error");
+        assert!(!lock_err.to_string().is_empty(), "{lock_err}");
+        locker.execute("ROLLBACK", &[]).expect("unlock");
     }
 }

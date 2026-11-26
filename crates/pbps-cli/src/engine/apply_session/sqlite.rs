@@ -8,10 +8,10 @@
 //!   where the input can carry one;
 //! - *exists in `pbps-sqlite` or `pbps-db` already*: calls it in place on the
 //!   calling thread through `Conn::sqlite()` (DEC-2950.17);
-//! - *needs logic nobody has written yet* (`requirement`, `drop_blockers`,
-//!   `rename_report`): refuses by name naming SQLite and the unsupported
-//!   operation, never returning an empty answer that would read as "nothing
-//!   blocks" or "nothing depends".
+//! - *needs logic nobody has written yet* (`requirement`, `rename_report`):
+//!   refuses by name naming SQLite and the unsupported operation, never
+//!   returning an empty answer that would read as "nothing blocks" or
+//!   "nothing depends".
 
 use super::*;
 use crate::engine::plan_session::sqlite::{sqlite_conn, sqlite_has_no_roles};
@@ -480,19 +480,24 @@ impl ApplySession for Sqlite {
     ) -> anyhow::Result<ExternalRoleRenames> {
         plan_session::defaults::external_role_renames("SQLite", recorded, declared)
     }
-    /// Needs logic nobody has written yet: `pbps-sqlite` has no catalog
-    /// drop-blocker reader for tables, columns, keys or indexes. Passes when
-    /// the plan drops or retypes nothing a dependency could block, and refuses
-    /// by name whenever it does.
+    /// Exists in `pbps-sqlite` already: checks existing SQLite catalog drop
+    /// blockers inside the caller's transaction through the same function as
+    /// [`PlanSession::check_final_order`].
     async fn drop_blockers(
         &self,
         conn: &mut Conn,
         plan: &pbps_model::SavedPlan,
-        _stored: &Schema,
-        _stored_ids: &IdsFile,
+        stored: &Schema,
+        stored_ids: &IdsFile,
     ) -> anyhow::Result<()> {
-        let _ = sqlite_conn(conn)?;
-        plan_session::defaults::drop_blockers("SQLite", &plan.changes).map(|_| ())
+        plan_session::sqlite::check_drop_blockers(
+            conn,
+            &plan.changes,
+            &plan.ids,
+            stored,
+            stored_ids,
+        )
+        .map(|_| ())
     }
     /// Exists in `pbps-sqlite` already: delegates to the helper shared with
     /// [`PlanSession::server_limits`] at `Stage::Apply` (adding the
@@ -1017,31 +1022,7 @@ mod tests {
             "{req}"
         );
 
-        // 2. drop_blockers: passes when nothing is dropped, refuses a DropTable naming SQLite.
-        let empty = saved(Vec::new(), IdsFile::default());
-        now(dialect.drop_blockers(&mut conn, &empty, &Schema::default(), &IdsFile::default()))
-            .expect("nothing dropped");
-        let drop_table = saved(
-            vec![PlannedChange::new(Change::Table(TableChange::DropTable {
-                uid: uid(UidKind::Table, "main.t"),
-                name: TableName::new("main", "t"),
-                detach_from: None,
-            }))],
-            IdsFile::default(),
-        );
-        let drop_err = now(dialect.drop_blockers(
-            &mut conn,
-            &drop_table,
-            &Schema::default(),
-            &IdsFile::default(),
-        ))
-        .unwrap_err();
-        assert!(
-            drop_err.to_string().contains("SQLite") && drop_err.to_string().contains("depends"),
-            "{drop_err}"
-        );
-
-        // 3. rename_report
+        // 2. rename_report
         let target = RenameTarget::Table(TableName::new("main", "t"));
         let report_err = now(dialect.rename_report(&mut conn, &target)).unwrap_err();
         assert!(
@@ -1341,5 +1322,163 @@ mod tests {
             .expect("transactional ok");
         let staged_err = dialect.rebuild_mode(&alter_view, true).unwrap_err();
         assert!(staged_err.to_string().contains("SQLite"), "{staged_err}");
+    }
+
+    #[test]
+    fn drop_blockers_accepts_cleared_drops_and_refuses_post_plan_blockers_and_unreadable_file() {
+        let (tmp, mut conn) = TempDb::create();
+        let dialect = Sqlite::default();
+        for sql in [
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, k INTEGER)",
+            "CREATE UNIQUE INDEX uq_k ON parent(k)",
+            "CREATE TABLE solo (id INTEGER PRIMARY KEY, extra INTEGER)",
+            "CREATE INDEX ix_extra ON solo(extra)",
+        ] {
+            now(conn.execute(sql)).expect(sql);
+        }
+
+        let mut stored = Schema::default();
+        let mut stored_ids = IdsFile::default();
+        for (name, cols) in [("parent", &["id", "k"][..]), ("solo", &["id", "extra"][..])] {
+            let tn = TableName::new("main", name);
+            let mut tbl = pbps_model::Table::default();
+            for &c in cols {
+                tbl.columns.insert(
+                    c.into(),
+                    pbps_model::Column::new("integer".parse().expect("ty")),
+                );
+                stored_ids.columns.insert(
+                    uid(UidKind::Column, &format!("main.{name}.{c}")),
+                    tn.column(c),
+                );
+            }
+            stored.tables.insert(tn.clone(), tbl);
+            stored_ids
+                .tables
+                .insert(uid(UidKind::Table, &format!("main.{name}")), tn);
+        }
+
+        let check_in_tx = |conn: &mut Conn, changes: Vec<Change>| {
+            let mut plan_ids = stored_ids.clone();
+            for ch in &changes {
+                if let Change::Table(TableChange::DropTable { uid, name, .. }) = ch {
+                    plan_ids.tables.remove(uid);
+                    plan_ids.columns.retain(|_, c| c.table != *name);
+                } else if let Change::Column(pbps_model::ColumnChange::DropColumn { uid, .. }) = ch
+                {
+                    plan_ids.columns.remove(uid);
+                }
+            }
+            let plan = saved(
+                changes.into_iter().map(PlannedChange::new).collect(),
+                plan_ids,
+            );
+            now(conn.begin(&pbps_sqlite::TRANSACTION)).expect("begin");
+            let res = now(dialect.drop_blockers(conn, &plan, &stored, &stored_ids));
+            now(conn.rollback(&pbps_sqlite::TRANSACTION)).expect("rollback");
+            res
+        };
+
+        // 1. No-drop plan and unreferenced drops pass inside BEGIN IMMEDIATE.
+        check_in_tx(&mut conn, Vec::new()).expect("empty plan passes");
+        check_in_tx(
+            &mut conn,
+            vec![
+                Change::Index(pbps_model::IndexChange::DropIndex {
+                    table: TableName::new("main", "solo"),
+                    name: "ix_extra".into(),
+                }),
+                Change::Column(pbps_model::ColumnChange::DropColumn {
+                    uid: uid(UidKind::Column, "main.solo.extra"),
+                    column: TableName::new("main", "solo").column("extra"),
+                }),
+                Change::Table(TableChange::DropTable {
+                    uid: uid(UidKind::Table, "main.parent"),
+                    name: TableName::new("main", "parent"),
+                    detach_from: None,
+                }),
+            ],
+        )
+        .expect("unreferenced drops pass");
+
+        // 2. Post-plan inbound FK, unmanaged view, and trigger block at apply time naming SQLite and both objects.
+        now(conn.execute(
+            "CREATE TABLE late_child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id), pk INTEGER REFERENCES parent(k))",
+        ))
+        .expect("late child");
+        now(conn.execute("CREATE VIEW late_v AS SELECT extra FROM solo")).expect("late view");
+        now(conn.execute(
+            "CREATE TRIGGER late_tr AFTER INSERT ON solo BEGIN SELECT NEW.extra; END",
+        ))
+        .expect("late trigger");
+
+        let parent_err = check_in_tx(
+            &mut conn,
+            vec![Change::Table(TableChange::DropTable {
+                uid: uid(UidKind::Table, "main.parent"),
+                name: TableName::new("main", "parent"),
+                detach_from: None,
+            })],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            parent_err.contains("SQLite")
+                && parent_err.contains("main.parent")
+                && parent_err.contains("late_child"),
+            "{parent_err}"
+        );
+
+        let idx_err = check_in_tx(
+            &mut conn,
+            vec![Change::Index(pbps_model::IndexChange::DropIndex {
+                table: TableName::new("main", "parent"),
+                name: "uq_k".into(),
+            })],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            idx_err.contains("SQLite")
+                && idx_err.contains("uq_k")
+                && idx_err.contains("late_child"),
+            "{idx_err}"
+        );
+
+        let col_err = check_in_tx(
+            &mut conn,
+            vec![Change::Column(pbps_model::ColumnChange::DropColumn {
+                uid: uid(UidKind::Column, "main.solo.extra"),
+                column: TableName::new("main", "solo").column("extra"),
+            })],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            col_err.contains("SQLite")
+                && col_err.contains("main.solo.extra")
+                && col_err.contains("late_v")
+                && col_err.contains("late_tr"),
+            "{col_err}"
+        );
+
+        // 3. Unreadable (exclusively locked) file errors, never "no blockers".
+        let locker =
+            pbps_db::sqlite::Connection::open(tmp.path(), pbps_db::sqlite::OpenMode::ExistingOnly)
+                .expect("second conn");
+        locker.execute("BEGIN EXCLUSIVE", &[]).expect("lock");
+        let plan = saved(
+            vec![PlannedChange::new(Change::Index(
+                pbps_model::IndexChange::DropIndex {
+                    table: TableName::new("main", "solo"),
+                    name: "ix_extra".into(),
+                },
+            ))],
+            stored_ids.clone(),
+        );
+        let lock_err = now(dialect.drop_blockers(&mut conn, &plan, &stored, &stored_ids))
+            .expect_err("locked file must error");
+        assert!(!lock_err.to_string().is_empty(), "{lock_err}");
+        locker.execute("ROLLBACK", &[]).expect("unlock");
     }
 }

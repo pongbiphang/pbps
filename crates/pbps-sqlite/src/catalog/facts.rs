@@ -114,6 +114,19 @@ pub(crate) fn read(c: &Connection, table: &str) -> Result<Option<Facts>, DbError
             hidden: int(&r, table_xinfo::HIDDEN)?,
         });
     }
+    let (indexes, foreign) = (indexes(c, table)?, foreign(c, table)?);
+    Ok(Some(Facts {
+        columns,
+        indexes,
+        foreign,
+        without_rowid,
+        strict,
+    }))
+}
+
+/// The indexes of one table of `main`, by name, each with its key columns by
+/// `seqno`.
+pub(crate) fn indexes(c: &Connection, table: &str) -> Result<Vec<IndexRow>, DbError> {
     let mut indexes = Vec::new();
     for r in pragma::by_name(pragma::indexes(c, table)?, index_list::NAME)? {
         let name = text(&r, index_list::NAME)?;
@@ -137,6 +150,12 @@ pub(crate) fn read(c: &Connection, table: &str) -> Result<Option<Facts>, DbError
             keys,
         });
     }
+    Ok(indexes)
+}
+
+/// The foreign-key rows of one table of `main`, by `id` descending (the order
+/// the table's text declares them in) and then `seq`.
+pub(crate) fn foreign(c: &Connection, table: &str) -> Result<Vec<ForeignRow>, DbError> {
     let mut foreign = Vec::new();
     for r in pragma::sorted(pragma::foreign_keys(c, table)?, |r| {
         Ok((
@@ -154,13 +173,7 @@ pub(crate) fn read(c: &Connection, table: &str) -> Result<Option<Facts>, DbError
             on_delete: text(&r, foreign_key_list::ON_DELETE)?,
         });
     }
-    Ok(Some(Facts {
-        columns,
-        indexes,
-        foreign,
-        without_rowid,
-        strict,
-    }))
+    Ok(foreign)
 }
 
 fn action_word(action: Option<Reaction>) -> &'static str {
