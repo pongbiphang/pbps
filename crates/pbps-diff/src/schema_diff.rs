@@ -88,6 +88,7 @@ pub use constraints::adopts;
 use constraints::diff_constraints;
 #[cfg(test)]
 use constraints::diff_constraints_by;
+pub use constraints::may_adopt;
 use constraints::parameter_edit;
 use dependents::clear_external_partitions_after_loosening;
 use dependents::rebind_foreign_keys_to_a_new_occupant;
@@ -100,6 +101,7 @@ pub use exclusions::adopts_exclusion;
 use exclusions::diff_exclusions;
 use exclusions::exclusion_hazards;
 pub use exclusions::holds_key_with_equality;
+pub use exclusions::may_adopt_exclusion;
 pub use modules::ModuleDelta;
 use modules::diff_modules;
 pub use modules::module_delta;
@@ -112,6 +114,8 @@ use numbering::numbering_after_deletes;
 use numbering::numbering_put_on;
 use numbering::refuse_rows_referencing_late_inserts;
 use numbering::sequence_release_depths;
+use partitions::adoption::rebuild_adoptable_exclusions;
+use partitions::adoption::rebuild_adoptable_indexes;
 use partitions::attach::Attached;
 use partitions::attach::attached;
 use partitions::attach::diff_partition_columns;
@@ -601,6 +605,9 @@ pub(crate) fn diff_partial_rebuilding(
     clear_external_partitions_after_loosening(declared.schema, &mut changes);
     crate::enum_labels::rebuild_defaults(base, declared, &mut changes);
     recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
+    // After every pass that adds a parent's index, and before the foreign keys
+    // over the unique ones it drops are recreated.
+    rebuild_adoptable_indexes(base, declared, &renames, dialect, &mut changes);
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
     rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
     unlink_cycles_around_persistence_switches(declared.schema, &mut changes);
@@ -656,6 +663,9 @@ pub(crate) fn diff_partial_rebuilding(
         );
         changes.extend(stated);
     }
+    // After the hazards, whose restatement of a parent's exclusion can take a
+    // partition's own as any addition can.
+    rebuild_adoptable_exclusions(base, declared, &renames, dialect, &mut changes);
     // Descriptions are comments only where the engine holds them; elsewhere they stay the
     // free text they were (#2729).
     if dialect.holds_descriptions() {

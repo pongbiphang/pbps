@@ -3596,6 +3596,81 @@ mod tests {
         );
     }
 
+    /// An expression key may match a column key where this engine's scan says it may
+    /// read the column (#1671, DEC-1671.1): every spelling measured on 16.15 and 18.6 to
+    /// be stored as that column, and a call over it, which the text does not tell from
+    /// such a cast. Negatives: an expression that reads another column, one naming the
+    /// column only in a literal or a comment, and a quoted name in another case. Two
+    /// expressions match whatever their text.
+    #[test]
+    fn an_expression_key_matches_a_column_it_may_read() {
+        use pbps_model::{Index, IndexColumn, IndexKey};
+        let over = |key: IndexKey| Index {
+            columns: vec![IndexColumn {
+                key,
+                ..IndexColumn::column("m")
+            }],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        };
+        let dialect = crate::Postgres::new();
+        // Both ways round, as a parent and as an own.
+        let matches = |text: &str, column: &str| {
+            let expression = over(IndexKey::Expression(text.into()));
+            let column = over(IndexKey::Column(column.into()));
+            let forward = pbps_diff::schema_diff::may_adopt(&expression, &column, &dialect);
+            let back = pbps_diff::schema_diff::may_adopt(&column, &expression, &dialect);
+            assert_eq!(forward, back, "{text}");
+            forward
+        };
+        for (text, column) in [
+            ("(m)", "m"),
+            ("((m))", "m"),
+            ("(t.m)", "m"),
+            ("(m::integer)", "m"),
+            ("(s::text)", "s"),
+            ("(s collate \"C\")", "s"),
+            ("(\"Q\")", "Q"),
+            ("(M)", "m"),
+            ("(CAST(m AS integer))", "m"),
+            ("((m)::int4)", "m"),
+            ("((m::integer)::integer)", "m"),
+            ("((s::text) collate \"C\")", "s"),
+            ("((s collate \"C\")::text)", "s"),
+            ("(x.t.m)", "m"),
+            ("(\"x\".\"t\".\"m\")", "m"),
+            ("(m /* c */)", "m"),
+            ("(U&\"m\")", "m"),
+            ("(v::varchar(10))", "v"),
+            ("(int4(m))", "m"),
+            ("(text(s))", "s"),
+            ("(pg_catalog.int4(m))", "m"),
+            ("((t).m)", "m"),
+            ("(TREAT(m AS integer))", "m"),
+            ("lower(s)", "s"),
+        ] {
+            assert!(matches(text, column), "{text} may be {column}");
+        }
+        for (text, column) in [
+            ("m + 0", "s"),
+            ("upper('m')", "m"),
+            ("s /* m */", "m"),
+            ("\"M\"", "m"),
+        ] {
+            assert!(!matches(text, column), "{text} does not read {column}");
+        }
+        let expression = |text: &str| over(IndexKey::Expression(text.into()));
+        assert!(pbps_diff::schema_diff::may_adopt(
+            &expression("lower(s)"),
+            &expression("m + 0"),
+            &dialect
+        ));
+    }
+
     /// A partition's own exclusion is held to the parent's columns, and the engine takes one
     /// for its parent's clone when the partition is attached or the parent's is added after it,
     /// which then goes with the parent's (measured on 18.6, DEC-2448.7). So one equal to the

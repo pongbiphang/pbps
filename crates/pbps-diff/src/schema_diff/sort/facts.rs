@@ -1176,12 +1176,16 @@ impl SortFacts<'_> {
             }
             return (order_key(c), 2);
         }
-        // A partitioned parent's index first in its class, before any
-        // partition's own: built after one, it would take it as its clone
-        // (#1737 review, DEC-1688.1). First rather than the partition's own
-        // last, which would put it after a replica identity naming it. A
-        // parent's index reads only its columns, all of earlier classes.
-        if let Change::Index(IndexChange::AddIndex { table, .. }) = c
+        // A partitioned parent's index or exclusion first in its class, before
+        // any partition's own: built after one, it would take it as its clone
+        // (#1737 review, DEC-1688.1, DEC-1671.1). First rather than the
+        // partition's own last, which would put it after a replica identity
+        // naming it. A parent's reads only its columns and rows, all of
+        // earlier classes.
+        if let Change::Index(IndexChange::AddIndex { table, .. })
+        | Change::Constraint(ConstraintChange::SetExclusion {
+            table, to: Some(_), ..
+        }) = c
             && declared
                 .schema
                 .tables

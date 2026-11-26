@@ -1,5 +1,6 @@
 //! Exclusion constraints: their diff, the hazards a change carries, and when one adopts another.
 
+use super::constraints::may_share_key;
 use super::*;
 
 /// Whether `key` is held by `exclusion` as a plain column key excluded with
@@ -17,8 +18,9 @@ pub fn holds_key_with_equality(
 }
 
 /// Whether a parent's new exclusion can take a partition's own as its clone:
-/// the one predicate the differ, the attach path and validation share
-/// (DEC-2448.6). Measured on 18.6, on `ATTACH` and on a parent's `ADD` over a
+/// the predicate validation and the differ's refusal of an own the plan adds
+/// share (DEC-2448.6). What a plan can drop instead is asked of
+/// [`may_adopt_exclusion`] (DEC-1671.1). Measured on 18.6, on `ATTACH` and on a parent's `ADD` over a
 /// standing partition: the method, the keys in order with their classes,
 /// collations and operators, the `INCLUDE` columns and the predicate must
 /// match; the timing, the storage parameters and the name need not. As for
@@ -46,6 +48,24 @@ pub fn adopts_exclusion(
                     _ => true,
                 }
         })
+}
+
+/// Whether a parent's exclusion might take a partition's own as its clone, by
+/// a comparison looser than [`adopts_exclusion`]'s, as [`may_adopt`] is for an
+/// index (#1671, DEC-1671.1): the number of keys, and at each position the same
+/// column ([`may_share_key`]). Operators, method, predicate and `INCLUDE` are
+/// left out.
+pub fn may_adopt_exclusion(
+    parent: &pbps_model::ExclusionConstraint,
+    own: &pbps_model::ExclusionConstraint,
+    dialect: &(impl Dialect + ?Sized),
+) -> bool {
+    parent.keys.len() == own.keys.len()
+        && parent
+            .keys
+            .iter()
+            .zip(&own.keys)
+            .all(|(p, o)| may_share_key(&p.key.key, &o.key.key, dialect))
 }
 
 /// A table's exclusion constraints, by name (DEC-2448.3, DEC-2448.4).

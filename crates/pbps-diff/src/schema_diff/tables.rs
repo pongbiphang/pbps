@@ -491,20 +491,51 @@ fn diff_surviving_table<D: Dialect + ?Sized>(
                 .map(|(old, _, goal, pending)| (*old, *pending, *goal)),
         ) {
             Ok(Attached {
-                table,
+                mut table,
                 defaultless,
                 displaced,
+                exclusions,
                 released,
             }) => {
+                // Its own exclusions' retirements, as the base held them: asked
+                // of the table's original definition, as for a standing table
+                // (DEC-2448.7).
+                let retired = |key: &pbps_model::ObjectLocalName| {
+                    base_table
+                        .exclude
+                        .get(key)
+                        .is_some_and(|held| declared.ids.exclusion_retired(uid, key, held))
+                };
                 changes.extend(released);
-                // Gone before the attach, so the engine adopts the one
-                // index left for each of its parent's or builds it; one
-                // the declaration keeps as its own is added after.
+                // Gone before the attach, so the engine adopts at most the
+                // certain index left for one of its parent's and builds the
+                // rest; one the declaration keeps as its own is added after.
                 for name in displaced {
                     changes.push(Change::Index(IndexChange::DropIndex {
                         table: declared_name.clone(),
                         name,
                     }));
+                }
+                // The same for an exclusion the parent's might take
+                // (DEC-1671.1). One the declarations keep is added back after
+                // the attach by `diff_exclusions` below, as one they retire is
+                // dropped here; any other is left on the attached table, so that
+                // same pass refuses the drop for want of a recorded reason.
+                let held = renames.apply(base_table, base_name);
+                for name in exclusions {
+                    let Some(own) = held.exclude.get(&name) else {
+                        continue;
+                    };
+                    if declared_table.exclude.contains_key(&name) || retired(&name) {
+                        changes.push(Change::Constraint(ConstraintChange::SetExclusion {
+                            table: declared_name.clone(),
+                            name,
+                            from: Some(Box::new(own.clone())),
+                            to: None,
+                        }));
+                    } else if let Some(own) = base_table.exclude.get(&name) {
+                        table.exclude.insert(name, own.clone());
+                    }
                 }
                 changes.push(Change::Partition(PartitionChange::AttachPartition {
                     uid: uid.clone(),
@@ -540,15 +571,8 @@ fn diff_surviving_table<D: Dialect + ?Sized>(
                     &mut changes,
                     &mut errs,
                 );
-                // Its own exclusions, those the parent's did not take (DEC-2448.7),
-                // as the base held them: a retirement is asked of the table's
-                // original definition, as for a standing table.
-                let retired = |key: &pbps_model::ObjectLocalName| {
-                    base_table
-                        .exclude
-                        .get(key)
-                        .is_some_and(|held| declared.ids.exclusion_retired(uid, key, held))
-                };
+                // Its own exclusions: those the parent's cannot take, as the
+                // base held them, and the ones dropped above, added back.
                 diff_exclusions(
                     declared_name,
                     &renames.apply(&table, base_name),

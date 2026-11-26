@@ -8,11 +8,12 @@ use super::*;
 /// match; a key's direction, its class options (`opclass_parameters`) and
 /// the storage parameters need not (#1688, DEC-2449.2).
 ///
-/// An expression key or a predicate is a match whatever its text, as the
-/// attach path takes it (DEC-1545.1): the engine compares what each parses
-/// and binds to, so `n+1` and `n + 1` are one index to it (#1737 review).
-/// Which expressions those are is #1671's to rehearse. An expression key's
-/// class is not text, though: absent is the default on both sides, since a
+/// An expression key or a predicate is a match whatever its text: the engine
+/// compares what each parses and binds to, so `n+1` and `n + 1` are one index
+/// to it (#1737 review). The one caller left is the refusal of a partition's
+/// own index that the plan creates with the partition; what a plan can drop
+/// instead is asked of [`may_adopt`] (DEC-1671.1). An expression key's class is
+/// not text, though: absent is the default on both sides, since a
 /// declaration may not spell it and the catalog reads it back as none
 /// (DEC-2449.2), so two expression keys under different classes are told
 /// apart here, as two column keys are (DEC-2961.1).
@@ -29,6 +30,58 @@ pub fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
                 _ => true,
             }
         })
+}
+
+/// Whether a parent's index might take a partition's own as its clone, by a
+/// comparison looser than the engine's, so that no engine rule is predicted
+/// (#1671, DEC-1671.1). A plan drops every own one this matches before the
+/// parent's index is built or the table attached, and puts back what the
+/// declaration keeps, so the engine has nothing of the plan's to adopt.
+///
+/// It asks only what no adoption survives a difference in: uniqueness, the
+/// number of keys, and at each position the column ([`may_share_key`]). Method,
+/// direction, class, collation, options, predicate, `INCLUDE` and storage
+/// parameters are left out; the engine compares most of them, which only makes
+/// this wider.
+pub fn may_adopt(
+    parent: &pbps_model::Index,
+    own: &pbps_model::Index,
+    dialect: &(impl Dialect + ?Sized),
+) -> bool {
+    parent.unique == own.unique
+        && parent.columns.len() == own.columns.len()
+        && parent
+            .columns
+            .iter()
+            .zip(&own.columns)
+            .all(|(p, o)| may_share_key(&p.key, &o.key, dialect))
+}
+
+/// Whether two keys at one position could be one to the engine: the same
+/// column; two expressions, whatever their text; or a column and an expression
+/// that may read it.
+///
+/// The engine stores some expression keys as column keys: measured on 16.15 and
+/// 18.6, `((m))`, `(t.m)`, a cast of the column, `(s collate "C")`, `(int4(m))`
+/// and `((t).m)` among them (DEC-1671.1). Which text it would reduce so is not
+/// predicted. Every one names the column in its code, so the dialect's own
+/// column scan ([`Dialect::generation_may_read_column`]) finds it: it reads
+/// identifiers by the engine's rules, leaves literals and comments out, and
+/// over-approximates, counting a call or a field of the same name, which here
+/// only drops more.
+pub(super) fn may_share_key(
+    parent: &pbps_model::IndexKey,
+    own: &pbps_model::IndexKey,
+    dialect: &(impl Dialect + ?Sized),
+) -> bool {
+    use pbps_model::IndexKey::{Column, Expression};
+    match (parent, own) {
+        (Column(parent), Column(own)) => parent == own,
+        (Expression(_), Expression(_)) => true,
+        (Expression(text), Column(column)) | (Column(column), Expression(text)) => {
+            dialect.generation_may_read_column(text, column)
+        }
+    }
 }
 
 /// `Some(None)` keeps a part without an edit; `None` replaces it. Keeping

@@ -262,6 +262,8 @@ mod index_brin2449;
 mod index_brin2449_classes;
 #[path = "support/index_gist2448.rs"]
 mod index_gist2448;
+#[path = "support/loose_drop1671.rs"]
+mod loose_drop1671;
 #[path = "support/partition_trigger1811.rs"]
 mod partition_trigger1811;
 
@@ -31625,9 +31627,10 @@ fn parent_rename_flow(server: &str, slug: &str) {
 /// (#1688), on a tree holding rows: an index added, renamed (a drop and an
 /// add) and dropped, and a unique one over the key column, each reaching
 /// every partition as the engine's clone, verifying and replanning empty, the
-/// cost estimate naming the recursion. Refused at plan time by name, nothing
-/// changed: `strategy: online`, and a new index that would take a
-/// partition's own as its clone.
+/// cost estimate naming the recursion. A partition's own index that a new
+/// one might take as its clone is rebuilt around it and stays its own
+/// (DEC-1671.1). Refused at plan time by name, nothing changed:
+/// `strategy: online`.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_partitioned_parents_indexes_change_through_the_cli() {
@@ -31729,12 +31732,15 @@ fn parent_indexes_flow(server: &str, slug: &str) {
     );
     assert_eq!(clones_on("m"), 2);
     // Renamed: a drop and an add, and the add would take `ev_2024`'s own,
-    // which stands now, as its clone. Refused, then planned with the own
-    // one dropped in the same plan, which runs before the add.
+    // which stands now, as its clone. So the own one is dropped ahead of it
+    // and added again, and stays its own.
     edit("  ev_m:\n", "  ev_m2:\n");
-    refused("which can take app.ev_2024's `ev_2024_m`");
-    edit("    indexes:\n      ev_2024_m:\n        columns: [m]\n", "");
     applied("rename.json");
+    assert_eq!(
+        holds("SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.ev_2024_m'::regclass"),
+        0,
+        "the partition's own index is its own"
+    );
     assert_eq!(
         holds("SELECT count(*) FROM pg_class WHERE relname = 'ev_m2'"),
         1
@@ -31782,13 +31788,14 @@ fn parent_indexes_flow(server: &str, slug: &str) {
     edit("  ev_id:\n", "  ev_m:\n    columns: [m]\n  ev_id:\n");
     refused("with `strategy: online`");
     edit("\nstrategy: {online: true}\n", "\n");
-    // And a new index the partition `ev_2025`'s own would be taken into.
+    // And a new index the partition `ev_2025`'s own would be taken into: the
+    // own is rebuilt, and the partition holds it beside the parent's clone.
     edit(
         "  ev_m:\n    columns: [m]\n",
         "  ev_n:\n    columns: [\"n\"]\n",
     );
-    refused("which can take app.ev_2025's `ev_2025_n`");
-    assert_eq!(clones_on("n"), 0);
+    applied("rebuild.json");
+    assert_eq!(clones_on("n"), 2);
     assert_eq!(
         holds("SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.ev_2025_n'::regclass"),
         0,

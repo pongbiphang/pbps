@@ -171,6 +171,121 @@ fn meeting_addresses_follow_capability_and_uid() {
         }
     }
 }
+/// An attach that meets its parent's column rename (DEC-2296.12) finds the table's
+/// index over the new name, which the parent's index holds by the time of the attach:
+/// the loose match asks the parent's index as the plan found it and as it leaves it
+/// (DEC-1671.1). Negative: an index over a column the parent's covers under neither name
+/// stays the table's own.
+#[test]
+fn an_attach_meeting_a_parents_column_rename_matches_its_index_under_both_names() {
+    use pbps_model::{Column, IndexColumn, PartitionBound, PartitionBy, PartitionOf};
+    let p: TableName = "app.p".parse().unwrap();
+    let a: TableName = "app.a".parse().unwrap();
+    let index = |column: &str| Index {
+        columns: vec![IndexColumn::column(column)],
+        include: Vec::new(),
+        unique: false,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    let columns = |second: &str| -> Table {
+        Table {
+            columns: ["k", second]
+                .into_iter()
+                .map(|c| (c.into(), Column::new("integer".parse().unwrap())))
+                .collect(),
+            ..Default::default()
+        }
+    };
+    let parent = |second: &str| {
+        let mut t = columns(second);
+        t.partition_by = Some(PartitionBy {
+            columns: vec!["k".into()],
+            strategy: Default::default(),
+            external: false,
+        });
+        t.indexes.insert("p_n".into(), index(second));
+        t
+    };
+    // The table already spells the column as the plan leaves the parent's.
+    let mut ordinary = columns("m");
+    ordinary.indexes.insert("a_m".into(), index("m"));
+    ordinary.indexes.insert("a_m2".into(), index("m"));
+    ordinary.indexes.insert("a_k".into(), index("k"));
+    // The declarations keep all three, so only the attach's own rule drops one:
+    // an index they left out would be dropped whatever it matched.
+    let part = Table {
+        partition_of: Some(PartitionOf {
+            parent: p.clone(),
+            bound: PartitionBound::Default,
+            columns: Default::default(),
+        }),
+        indexes: ordinary.indexes.clone(),
+        ..Default::default()
+    };
+    let mut base = Schema::default();
+    base.tables.insert(p.clone(), parent("n"));
+    base.tables.insert(a.clone(), ordinary);
+    let mut goal = Schema::default();
+    goal.tables.insert(p.clone(), parent("m"));
+    goal.tables.insert(a.clone(), part);
+    let mut ids = IdsFile::default();
+    ids.tables.insert("t_aaaaaa".parse().unwrap(), p.clone());
+    ids.tables.insert("t_bbbbbb".parse().unwrap(), a.clone());
+    for (uid, column) in [
+        ("c_aaaaaa", p.column("k")),
+        ("c_bbbbbb", p.column("n")),
+        ("c_cccccc", a.column("k")),
+        ("c_dddddd", a.column("m")),
+    ] {
+        ids.columns.insert(uid.parse().unwrap(), column);
+    }
+    let mut after = ids.clone();
+    after
+        .columns
+        .insert("c_bbbbbb".parse().unwrap(), p.column("m"));
+    after.columns.remove(&"c_cccccc".parse().unwrap());
+    after.columns.remove(&"c_dddddd".parse().unwrap());
+    let planned = diff_partial(
+        Side {
+            schema: &base,
+            ids: &ids,
+        },
+        Side {
+            schema: &goal,
+            ids: &after,
+        },
+        &Engine {
+            enabled: true,
+            label: "postgres",
+        },
+        &Hints::default(),
+    );
+    assert!(planned.errors.is_empty(), "{:?}", planned.errors);
+    let steps: Vec<String> = planned
+        .changes
+        .changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::Index(IndexChange::DropIndex { name, .. }) = &c.change {
+                Some(format!("drop {}", name.shown()))
+            } else if let Change::Index(IndexChange::AddIndex { name, .. }) = &c.change {
+                Some(format!("add {}", name.shown()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        ["drop a_m", "drop a_m2", "add a_m", "add a_m2"],
+        "{:?}",
+        planned.changes
+    );
+}
+
 /// A text search object the declarations hold is compared with the target's by recorded
 /// identity (DEC-2728.2): one the target lacks is created, one the declarations gave up
 /// is dropped, and a change of a standing one's template is refused by name. An identical one

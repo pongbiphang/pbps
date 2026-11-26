@@ -1899,8 +1899,8 @@ mod expansion_oracle;
 /// first, but a partition's own index that calls a rebuilt function can still
 /// come ahead of the parent's restoration.
 ///
-/// An edge from the parent's index to each partition index it could adopt
-/// (`adopts`), and none to one it could not, which `settle` orders: the
+/// An edge from the parent's index to each partition index it might adopt
+/// (`may_adopt`, DEC-1671.1), and none to one it could not, which `settle` orders: the
 /// partition's index sinks to right after the parent's. What rests on it
 /// between them sinks with it, by the same edges [`rests_on`] reads: a
 /// foreign key on a unique one, a literal naming it, a replica identity on
@@ -1926,7 +1926,7 @@ fn oracle_before_its_partitions_indexes(
             .get(table)
             .and_then(|t| t.partition_of.as_ref())
             .is_some_and(|of| of.parent == *parent)
-            && pbps_diff::schema_diff::adopts(index, own)
+            && pbps_diff::schema_diff::may_adopt(index, own, dialect)
     };
     // Changes a partition's index may carry past the parent's: none creates
     // a table, a column or a module.
@@ -7883,8 +7883,9 @@ mod tests {
     }
 
     /// The same for an exclusion (DEC-2448.6): a parent's added exclusion goes ahead of a
-    /// partition's own it could take as its clone, by the engine's rule (the shape, not the
-    /// timing); an own of another shape, and a drop, keep their place.
+    /// partition's own it might take as its clone, by the loose match (the columns, not the
+    /// operator or the timing, DEC-1671.1); an own over another column, and a drop, keep
+    /// their place.
     #[test]
     #[allow(clippy::wildcard_enum_match_arm)]
     fn a_parents_new_exclusion_goes_ahead_of_the_partition_exclusions_it_could_take() {
@@ -7920,11 +7921,11 @@ mod tests {
                 ..Table::default()
             },
         );
-        let exclusion = |operator: &str, timing: pbps_model::ExclusionTiming| {
+        let exclusion_on = |column: &str, operator: &str, timing: pbps_model::ExclusionTiming| {
             Box::new(pbps_model::ExclusionConstraint {
                 method: pbps_model::IndexMethod::Gist,
                 keys: vec![pbps_model::ExclusionKey {
-                    key: pbps_model::IndexColumn::column("k"),
+                    key: pbps_model::IndexColumn::column(column),
                     operator: pbps_model::OperatorRef::symbol(operator).unwrap(),
                 }],
                 include: Vec::new(),
@@ -7933,6 +7934,7 @@ mod tests {
                 timing,
             })
         };
+        let exclusion = |operator: &str, timing| exclusion_on("k", operator, timing);
         let add = |table: &TableName, name: &str, x| {
             Change::Constraint(ConstraintChange::SetExclusion {
                 table: table.clone(),
@@ -7953,24 +7955,27 @@ mod tests {
                 .collect()
         };
         let immediate = pbps_model::ExclusionTiming::Immediate;
-        // The own of the same shape (another timing) is built after the parent's.
+        // The own of the same columns, under another timing or another operator, is
+        // built after the parent's.
+        for own in [
+            exclusion("=", pbps_model::ExclusionTiming::DeferrableDeferred),
+            exclusion("&&", immediate),
+        ] {
+            let mut cs = plan(vec![
+                add(&ev_1, "own", own),
+                add(&ev, "parent", exclusion("=", immediate)),
+            ]);
+            ahead(&mut cs, &s, pg().as_ref()).unwrap();
+            assert_eq!(names(&cs), ["parent", "own"]);
+            // Settled again, nothing moves.
+            let settled = cs.clone();
+            ahead(&mut cs, &s, pg().as_ref()).unwrap();
+            assert_eq!(cs, settled);
+        }
+        // Negative: another column is one the parent's could not take, which keeps
+        // its place.
         let mut cs = plan(vec![
-            add(
-                &ev_1,
-                "own",
-                exclusion("=", pbps_model::ExclusionTiming::DeferrableDeferred),
-            ),
-            add(&ev, "parent", exclusion("=", immediate)),
-        ]);
-        ahead(&mut cs, &s, pg().as_ref()).unwrap();
-        assert_eq!(names(&cs), ["parent", "own"]);
-        // Settled again, nothing moves.
-        let settled = cs.clone();
-        ahead(&mut cs, &s, pg().as_ref()).unwrap();
-        assert_eq!(cs, settled);
-        // Negative: another operator is another shape, which keeps its place.
-        let mut cs = plan(vec![
-            add(&ev_1, "own", exclusion("&&", immediate)),
+            add(&ev_1, "own", exclusion_on("m", "=", immediate)),
             add(&ev, "parent", exclusion("=", immediate)),
         ]);
         let before = cs.clone();
@@ -8013,10 +8018,10 @@ mod tests {
     }
 
     /// A partition's own exclusion that the plan drops or replaces, and that a parent's new
-    /// one could take, is removed before the parent's add, wherever the passes before left
+    /// one might take, is removed before the parent's add, wherever the passes before left
     /// them: the engine refuses the drop of a constraint the parent's add made an inherited
-    /// clone (measured on 18.7). The drop half of a redefinition counts, and the add half does
-    /// not. Negatives: an own of another shape, another table's, and one already ahead keep
+    /// clone (measured on 18.7). The drop half of a redefinition or a rebuild counts.
+    /// Negatives: an own over another column, another table's, and one already ahead keep
     /// their place.
     #[test]
     #[allow(clippy::wildcard_enum_match_arm)]
@@ -8048,11 +8053,11 @@ mod tests {
             },
         );
         s.tables.insert(other.clone(), Table::default());
-        let exclusion = |operator: &str| {
+        let exclusion_on = |column: &str, operator: &str| {
             Box::new(pbps_model::ExclusionConstraint {
                 method: pbps_model::IndexMethod::Gist,
                 keys: vec![pbps_model::ExclusionKey {
-                    key: pbps_model::IndexColumn::column("k"),
+                    key: pbps_model::IndexColumn::column(column),
                     operator: pbps_model::OperatorRef::symbol(operator).unwrap(),
                 }],
                 include: Vec::new(),
@@ -8061,6 +8066,7 @@ mod tests {
                 timing: pbps_model::ExclusionTiming::Immediate,
             })
         };
+        let exclusion = |operator: &str| exclusion_on("k", operator);
         let set = |table: &TableName, name: &str, from, to| {
             Change::Constraint(ConstraintChange::SetExclusion {
                 table: table.clone(),
@@ -8108,8 +8114,8 @@ mod tests {
         let settled = cs.clone();
         ahead(&mut cs, &s, pg().as_ref()).unwrap();
         assert_eq!(cs, settled);
-        // A redefinition under one name: its drop half goes first, its add half (another
-        // shape, which the parent's could not take) keeps its place after the parent's.
+        // A redefinition under one name: its drop half goes first, its add half keeps
+        // its place after the parent's.
         let mut cs = plan(vec![
             add(&ev, "parent", "="),
             remove(&ev_1, "own", "="),
@@ -8120,11 +8126,15 @@ mod tests {
             names(&cs),
             ["-app.ev_1.own", "+app.ev.parent", "+app.ev_1.own"]
         );
-        // Negative: an own of another shape, and a drop on a table that is no partition of
-        // the parent, keep their place.
+        // The loose match, not the engine's: one under another operator goes first too.
+        let mut cs = plan(vec![add(&ev, "parent", "="), remove(&ev_1, "own", "&&")]);
+        ahead(&mut cs, &s, pg().as_ref()).unwrap();
+        assert_eq!(names(&cs), ["-app.ev_1.own", "+app.ev.parent"]);
+        // Negative: an own over another column, and a drop on a table that is no
+        // partition of the parent, keep their place.
         let mut cs = plan(vec![
             add(&ev, "parent", "="),
-            remove(&ev_1, "own", "&&"),
+            set(&ev_1, "own", Some(exclusion_on("m", "=")), None),
             remove(&other, "zz", "="),
         ]);
         let before = cs.clone();
@@ -8286,6 +8296,16 @@ mod tests {
         let before = cs.clone();
         before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).unwrap();
         assert_eq!(cs, before);
+        // The loose match, not the engine's (DEC-1671.1): one under another method,
+        // with a predicate the parent's lacks, goes after the parent's too.
+        let mut loose = add(&ev_1, "own_k", "k", false);
+        if let Change::Index(IndexChange::AddIndex { index, .. }) = &mut loose {
+            index.method = pbps_model::IndexMethod::Brin;
+            index.filter = Some("k > 0".into());
+        }
+        let mut cs = plan(vec![loose, add(&ev, "ev_k", "k", false)]);
+        before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).unwrap();
+        assert_eq!(names(&cs), ["ev_k", "own_k"]);
         // A module between them is passed: the partition's index needs
         // nothing it brings, and what it needs ran before it already.
         let mut cs = plan(vec![

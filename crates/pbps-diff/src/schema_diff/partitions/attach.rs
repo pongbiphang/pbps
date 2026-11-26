@@ -1,5 +1,7 @@
 //! Attaching a table as a partition, and a standing partition's own defaults and NOT NULLs.
 
+use super::super::constraints::may_adopt;
+use super::super::exclusions::may_adopt_exclusion;
 use super::super::*;
 
 /// A table being attached as declared (#1545): itself as a partition the
@@ -8,11 +10,14 @@ use super::super::*;
 pub(in super::super) struct Attached {
     pub(in super::super) table: Table,
     pub(in super::super) defaultless: Vec<ColumnName>,
-    /// The table's indexes dropped before the attach: every one the engine
-    /// could adopt but for the one left to it.
+    /// The table's indexes dropped before the attach: every one a parent's
+    /// index might take as its clone, but for a certain one left to it.
     pub(in super::super) displaced: Vec<pbps_model::ObjectLocalName>,
+    /// The table's own exclusions a parent's might take, left out of `table`.
+    /// The caller drops each before the attach, or keeps it to be refused.
+    pub(in super::super) exclusions: Vec<pbps_model::ObjectLocalName>,
     /// The table's key and unique constraints dropped before the attach,
-    /// whose index a plain unique index of the parent's could take.
+    /// whose index an index of the parent's might take.
     pub(in super::super) released: Vec<Change>,
 }
 
@@ -30,6 +35,10 @@ pub(in super::super) struct Attached {
 ///   adopted as its clone, and the engine builds whichever is missing; a key
 ///   or a foreign key of its own would stay its own, which a partition does
 ///   not hold yet, while an index of its own stays as one;
+/// - which index or exclusion the engine adopts is not predicted: each of the
+///   table's that a parent's might take, by the loose [`may_adopt`] and
+///   [`may_adopt_exclusion`], is dropped before the attach, but for a lone
+///   certain index (DEC-1671.1);
 /// - its defaults stay, and none of the parent's is given to a column
 ///   without one.
 #[allow(clippy::too_many_arguments)]
@@ -341,28 +350,21 @@ pub(in super::super) fn attached(
                 })
                 .collect()
         };
-    // An index as the engine matches it to adopt it: storage parameters,
-    // a key's class options and sort order aside, measured on 16 and 18
-    // (`DESC` and `NULLS FIRST` adopted, another collation, operator class,
-    // `INCLUDE` or method not). A BRIN key's `values_per_range` of 32 under
-    // a parent's 16 is adopted all the same, and the clone keeps its 32
-    // (DEC-2449.2), so the options are not part of the match: left in, an
-    // own index declared over such a match would not be seen as adopted, and
-    // the attach would turn it into the parent's clone and leave the declared
-    // one absent.
-    let index = |t: &Table| -> BTreeMap<pbps_model::ObjectLocalName, Index> {
-        t.indexes
-            .iter()
-            .map(|(n, i)| {
-                let mut i = i.clone();
-                i.storage_parameters.clear();
-                for c in &mut i.columns {
-                    c.descending = false;
-                    c.opclass_parameters.clear();
-                }
-                (n.clone(), i)
-            })
-            .collect()
+    // An index as the engine matches it to adopt it, which the certain case
+    // below asks: storage parameters, a key's class options and sort order
+    // aside, measured on 16 and 18 (`DESC` and `NULLS FIRST` adopted, another
+    // collation, operator class, `INCLUDE` or method not). A BRIN key's
+    // `values_per_range` of 32 under a parent's 16 is adopted all the same,
+    // and the clone keeps its 32 (DEC-2449.2), so the options are not part of
+    // the match.
+    let comparable = |index: &Index| -> Index {
+        let mut index = index.clone();
+        index.storage_parameters.clear();
+        for c in &mut index.columns {
+            c.descending = false;
+            c.opclass_parameters.clear();
+        }
+        index
     };
     for name in unmatched(&unique(table), &unique(parent)) {
         what.push(format!(
@@ -382,24 +384,6 @@ pub(in super::super) fn attached(
         .filter(|(_, fk)| !parent.foreign_keys.values().any(|p| p == *fk))
         .map(|(name, fk)| (name.clone(), fk.clone()))
         .collect();
-    // An own exclusion the parent's can take is taken as its clone on `ATTACH`, keeping its
-    // name, and then goes with the parent's (measured on 18.6, DEC-2448.7): the attached
-    // partition would not hold what the declaration says it owns. Any other stays its own.
-    for (name, own) in &table.exclude {
-        if let Some((parents, _)) = parent
-            .exclude
-            .iter()
-            .find(|(_, p)| adopts_exclusion(p, own))
-        {
-            what.push(format!(
-                "its exclusion constraint `{name}` is its parent's `{parents}` in shape, which the \
-                 engine takes as the parent's clone when it attaches; drop it in an earlier plan \
-                 and let the attach build the clone",
-                name = name.shown(),
-                parents = parents.shown(),
-            ));
-        }
-    }
     let mut checks = table.checks.clone();
     for (name, p) in &parent_spelled.checks {
         checks.remove(name);
@@ -411,63 +395,35 @@ pub(in super::super) fn attached(
             ));
         }
     }
-    // Which of several matches the engine adopts is the first by oid, which
-    // no plan knows (`RelationGetIndexList`). So at most one is left for
-    // each of the parent's indexes, and one the declaration does not keep
-    // as its own; the others are dropped before the attach. An adopted
-    // index keeps its name as the clone, so one whose name the declaration
-    // gives an index of its own is never the one left (#1642 review).
-    let (own_indexes, parents_indexes) = (index(table), index(parent));
-    let mut taken: BTreeSet<&pbps_model::ObjectLocalName> = BTreeSet::new();
-    let mut displaced = Vec::new();
-    // An expression or a filter is matched by the engine on what it is
-    // bound to and how it parses, which its text does not say: `n+1` and
-    // `n + 1` are one, and in another schema the same text may call another
-    // function. So every such index is dropped before the attach, and one
-    // the declaration keeps added after it, in any schema (#1642 review).
-    for (name, index) in &table.indexes {
-        if index.filter.is_some()
-            || index
-                .columns
-                .iter()
-                .any(|c| matches!(c.key, pbps_model::IndexKey::Expression(_)))
-        {
-            taken.insert(name);
-            displaced.push(name.clone());
-        }
-    }
-    for definition in parents_indexes.values() {
-        let matches: Vec<&pbps_model::ObjectLocalName> = own_indexes
-            .iter()
-            .filter(|(n, d)| *d == definition && !taken.contains(n))
-            .map(|(n, _)| n)
-            .collect();
-        let left = matches
-            .iter()
-            .find(|n| !declared.indexes.contains_key(n.raw()))
-            .copied();
-        for n in matches {
-            taken.insert(n);
-            if Some(n) != left {
-                displaced.push(n.clone());
-            }
-        }
-    }
-    let indexes = table
+    // Which of several matches the engine adopts is the first by oid, and
+    // whether two expressions or predicates are one is its parse trees' to
+    // say: neither is in the model. So nothing is predicted. Every index of the
+    // table that one of the parent's might take (`may_adopt`, wider than the
+    // engine's comparison) is dropped before the attach, the engine builds the
+    // clone, and what the declaration keeps is added after it. One that no
+    // index of the parent's might take stays the table's own (DEC-1671.1).
+    //
+    // The parent's definition is the one it holds at the attach: as the plan
+    // found it and, where a column rename meets the attach (DEC-2296.12), as it
+    // leaves it.
+    let parents_indexes: Vec<Vec<&Index>> = parent
         .indexes
         .iter()
-        .filter(|(n, _)| !taken.contains(n))
-        .map(|(n, i)| (n.clone(), i.clone()))
+        .map(|(name, was)| {
+            let now = goal_parent
+                .and_then(|goal| goal.indexes.get(name))
+                .filter(|now| comparable(now) != comparable(was));
+            std::iter::once(was).chain(now).collect()
+        })
         .collect();
-    // A parent's plain index adopts a matching index whether or not a
-    // constraint stands on it, while a parent's key or unique constraint
-    // adopts only one that has one. Measured on 16 and 18, a parent's
-    // `UNIQUE INDEX (a)` made before its `UNIQUE (a)` takes the index of the
-    // table's `UNIQUE (a)`, the constraint stays the table's own, and the
-    // parent's constraint is built a clone beside it: a tree the reader
-    // refuses. Which comes first is the oid order no plan knows, so the
-    // table's key or unique constraint such an index could take is dropped
-    // before the attach, and the engine builds both clones (#1642 review).
+    let takes = |theirs: &[&Index], own: &Index| theirs.iter().any(|p| may_adopt(p, own, dialect));
+    // The index a key or unique constraint stands on. A parent's plain index
+    // adopts a matching one whether or not a constraint stands on it, while a
+    // parent's key or unique constraint adopts only one that has one. Measured
+    // on 16 and 18, a parent's `UNIQUE INDEX (a)` made before its `UNIQUE (a)`
+    // takes the index of the table's `UNIQUE (a)`, the constraint stays the
+    // table's own, and the parent's constraint is built a clone beside it: a
+    // tree the reader refuses (#1642 review).
     let backing = |columns: &[ColumnName]| Index {
         columns: columns
             .iter()
@@ -486,9 +442,87 @@ pub(in super::super) fn attached(
         storage_parameters: Default::default(),
         filegroup: None,
     };
-    let contested =
-        |columns: &[ColumnName]| parents_indexes.values().any(|i| *i == backing(columns));
+    let own_keys: Vec<Index> = table
+        .primary_key
+        .iter()
+        .map(|key| backing(&key.columns))
+        .chain(table.unique.values().map(|u| backing(&u.columns)))
+        .collect();
+    let candidates: Vec<Vec<&pbps_model::ObjectLocalName>> = parents_indexes
+        .iter()
+        .map(|theirs| {
+            table
+                .indexes
+                .iter()
+                .filter(|(_, own)| takes(theirs, own))
+                .map(|(n, _)| n)
+                .collect()
+        })
+        .collect();
+    let mut left: BTreeSet<&pbps_model::ObjectLocalName> = BTreeSet::new();
+    let mut displaced: BTreeSet<&pbps_model::ObjectLocalName> = BTreeSet::new();
+    for (theirs, mine) in parents_indexes.iter().zip(&candidates) {
+        // The one case with nothing to predict, kept as an adoption: a lone
+        // candidate for this index and for no other, equal to it, with no text
+        // for the engine to parse, and no constraint's index beside it. An
+        // adopted index keeps its name as the clone, so one whose name the
+        // declaration gives an index of its own is dropped too (#1642 review).
+        let certain = match (theirs.as_slice(), mine.as_slice()) {
+            ([theirs], [name]) => table
+                .indexes
+                .get(*name)
+                .is_some_and(|own| {
+                    comparable(own) == comparable(theirs)
+                        && own.filter.is_none()
+                        && own.columns.iter().all(|c| c.key.column().is_some())
+                        && candidates.iter().filter(|c| c.contains(name)).count() == 1
+                        && !declared.indexes.contains_key(name.raw())
+                        && !own_keys.iter().any(|key| may_adopt(theirs, key, dialect))
+                })
+                .then_some(*name),
+            _ => None,
+        };
+        match certain {
+            Some(name) => {
+                left.insert(name);
+            }
+            None => displaced.extend(mine),
+        }
+    }
+    let indexes = table
+        .indexes
+        .iter()
+        .filter(|(n, _)| !left.contains(n) && !displaced.contains(n))
+        .map(|(n, i)| (n.clone(), i.clone()))
+        .collect();
+    let displaced = displaced.into_iter().cloned().collect();
+    // An own exclusion the parent's might take is made its clone by `ATTACH`,
+    // keeping its name, and then goes with the parent's (measured on 18.6,
+    // DEC-2448.7), so it is dropped first like an index (DEC-1671.1).
+    let exclusions: Vec<pbps_model::ObjectLocalName> = table
+        .exclude
+        .iter()
+        .filter(|(_, own)| {
+            parent.exclude.iter().any(|(name, was)| {
+                may_adopt_exclusion(was, own, dialect)
+                    || goal_parent
+                        .and_then(|goal| goal.exclude.get(name))
+                        .is_some_and(|now| may_adopt_exclusion(now, own, dialect))
+            })
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    let exclude = table
+        .exclude
+        .iter()
+        .filter(|(n, _)| !exclusions.contains(n))
+        .map(|(n, x)| (n.clone(), x.clone()))
+        .collect();
     let mut released = Vec::new();
+    let contested = |columns: &[ColumnName]| {
+        let own = backing(columns);
+        parents_indexes.iter().any(|theirs| takes(theirs, &own))
+    };
     if let Some(key) = &table.primary_key
         && contested(&key.columns)
     {
@@ -591,7 +625,7 @@ pub(in super::super) fn attached(
         table: Table {
             checks,
             indexes,
-            exclude: table.exclude.clone(),
+            exclude,
             foreign_keys: own_foreign_keys,
             storage_parameters: table.storage_parameters.clone(),
             unlogged: table.unlogged,
@@ -604,6 +638,7 @@ pub(in super::super) fn attached(
         },
         defaultless,
         displaced,
+        exclusions,
         released,
     })
 }

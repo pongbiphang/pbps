@@ -3735,6 +3735,10 @@ the attach, and the pre-flight counts only one named as a row trigger of the
 parent that the plan does not drop first, which the engine refuses to attach
 over.*
 
+*Amended by [DEC-1671.1](#dec-1671-1): the three drop rules (every
+expression or filtered index, one left per index of the parent's, contested
+keys) and the refusal of an own exclusion give way to one loose drop.*
+
 <a id="dec-1680-1"></a>
 
 **DEC-1680.1. The rename search moves a module drop the computed edges ordered
@@ -4280,6 +4284,9 @@ partition's index is attached by hand, which is not one statement.
 Pinned by `a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken`
 and by the CLI's `a_partitioned_parents_indexes_change_through_the_cli`, on 18
 and on 16.
+
+*Amended by [DEC-1671.1](#dec-1671-1): a standing partition's own index that
+a new one might take is rebuilt around it, not refused.*
 
 <a id="dec-1689-1"></a>
 
@@ -10256,6 +10263,10 @@ and not `SCHEMA_VERSION`, no archive being added before the first release (DEC-2
 gains a section and keeps its numbers. No plan or state number, as DEC-2448.6 said: `DetachedKind` and
 `PartitionIndexDefinition` gain a variant each without one.
 
+*Amended by [DEC-1671.1](#dec-1671-1): a standing own exclusion is rebuilt
+around a parent's new one, and one an attach might make a clone is dropped
+before it.*
+
 <a id="dec-2961-1"></a>
 
 **DEC-2961.1. An expression key's operator class decides adoption, as a column key's does (#2961).**
@@ -10280,3 +10291,174 @@ a resolver and refuses them by name without one:
 - the expression itself and the predicate;
 - a column key against an expression key;
 - an expression key's collation, which the model does not hold (`IndexColumn::collation`).
+
+*Amended by [DEC-1671.1](#dec-1671-1): these cases are planned without a
+resolver, by dropping the own first; a rehearsal only saves the rebuild.*
+
+<a id="dec-1671-1"></a>
+
+**DEC-1671.1. A plan drops every own index, key and exclusion that a parent's
+might take, and predicts no adoption (#1671).**
+
+PostgreSQL adopts a table's own index, key or exclusion as the clone of a
+parent's when it attaches the table, and a standing partition's own when the
+parent gains one. It decides from facts the declared model does not hold:
+operator families and collation oids, parse trees, constraint kinds and the
+order the indexes were made in. #1642 predicted it, and each review round found
+another rule the prediction missed. The maintainer decided on 2026-11-26 that
+the plan predicts nothing and refuses nothing for it: it drops what might be
+adopted, lets the engine build the clones, and adds back what is declared. The
+resolver's rehearsal (the later parts of #1671) only saves the rebuild of an
+own the engine is shown to adopt. It is never needed to plan.
+
+**The loose match** is wider than the engine's comparison, so no rule of it is
+predicted.
+
+- `may_adopt`, a parent's index over an own one: the same uniqueness, the same
+  number of keys, and at each position the same column name, two expressions,
+  or a column and an expression that may read it. Method, direction, class,
+  collation, class options, predicate, `INCLUDE` and storage parameters are
+  ignored.
+- `may_adopt_exclusion`: the same number of keys, and the same rule at each
+  position. Operators, method, predicate and `INCLUDE` are ignored.
+
+It asks only what the engine asks too, where the model can answer: uniqueness,
+the number of keys, and which column a column key is. Two expressions match
+whatever their text, which only a parse could compare.
+
+**A column against an expression** matches where the expression may read the
+column, by the dialect's column scan
+(`Dialect::generation_may_read_column`), the one an exclusion's keys and an
+index's input columns are asked of. It reads identifiers by the engine's quoting
+and folding rules, a Unicode-escaped one as the name it spells, leaves literals
+and comments out, and over-approximates: a call or a field of the same name
+counts (DEC-1316.1). The engine stores some expression keys as column keys,
+measured on 16.15 and 18.6 on
+`t (m integer, s text, "Q" integer, v varchar(10))`, the same on both
+(`~/gate1671/m1671expr.sql`):
+
+| Expression key | Stored as | The scan against that column |
+|---|---|---|
+| `(m)`, `((m))`, `(t.m)`, `(x.t.m)`, `("x"."t"."m")`, `(M)` | the column `m` | matches |
+| `(m::integer)`, `(CAST(m AS integer))`, `((m)::int4)`, `((m::integer)::integer)` | the column `m` | matches |
+| `(s::text)`, `(v::varchar(10))` | the column | matches |
+| `(s collate "C")`, `((s::text) collate "C")`, `((s collate "C")::text)` | the column `s`, with the collation | matches |
+| `("Q")` | the column `Q` | matches |
+| `(int4(m))`, `(pg_catalog.int4(m))`, `(text(s))`, `(TREAT(m AS integer))`, `((t).m)`, `(U&"m")`, `(m /* c */)` | the column | matches |
+| `(m::bigint)`, `(m::bigint::integer)`, `(v::character varying)`, `(+m)`, `(coalesce(m))` | an expression | matches, over-approximating |
+
+Every spelling stored as a column names it in its code, so the scan is a
+superset of the engine's reading without predicting it. An expression that does
+not read the column, naming it only in a literal or a comment included, is no
+match, so one expression index of a parent's does not drop every own index of
+one key.
+
+**An attach.** For each index of the parent's, its candidates are the table's
+own indexes that `may_adopt` it.
+
+- **The certain case is kept**, since nothing in it is predicted: a lone
+  candidate, of no other index of the parent's, equal to it (storage
+  parameters, direction and class options aside, as DEC-1545.1 and DEC-2449.2
+  measured), with no expression and no predicate, under a name the declaration
+  gives no index of the partition's own, and with no key or unique constraint
+  that is a candidate too. It is left to be adopted under its name.
+- Every other candidate is dropped before the attach, and one the declaration
+  keeps is added after it.
+- An own index that is no parent's candidate stays the table's own, expression
+  and filtered indexes included, which DEC-1545.1 dropped whatever they were.
+- The table's primary key or unique constraint whose index (a plain unique
+  B-tree over its columns) some index of the parent's `may_adopt`s is dropped
+  before the attach. One that is not its parent's is still refused by name.
+- Where a column rename meets the attach (DEC-2296.12), the parent's index is
+  asked as the plan found it and as it leaves it, and one the rename touches is
+  never the certain case.
+- An own exclusion some exclusion of the parent's `may_adopt_exclusion`s is
+  dropped before the attach, where the declaration keeps it (it is added back,
+  as a replacement is, with no record) or where its retirement is recorded.
+  Otherwise it is left on the table for `diff_exclusions` to refuse: a drop
+  needs recorded intent, and this one is no way past that.
+- A foreign key into the table is already refused by name ("nothing references
+  a partition yet"), so an attach drops no key that one references.
+
+**A parent's new index or exclusion** over partitions standing on both sides of
+the plan: every own one of theirs that it might take, as the plan's renames
+spell it, is dropped and added again as declared, but for a referenced unique
+index (below). One the plan already drops or replaces is left as it is. One the declarations no longer hold is dropped by the
+ordinary comparison, or for an exclusion refused without its record. Indexes are
+rebuilt before the foreign keys over dropped unique ones are recreated.
+Exclusions are rebuilt after `exclusion_hazards`, whose restatement of a
+parent's exclusion around a column change is an addition too.
+
+**Order.** The drops sort in class 2, ahead of every addition. A parent's
+exclusion now sorts first in class 13 as its index does, so the order the
+resolver's schedule starts from has it ahead of the partitions'.
+`before_its_partitions_indexes` asks the loose match: a parent's addition goes
+ahead of every partition addition it might take, and after every removal of an
+own exclusion it might take.
+
+**Still refused**, where nothing can be moved out of the way:
+
+- an own index of a partition the plan creates, that the parent's new one
+  `adopts`: it is built with the partition, before the parent's;
+- an own exclusion the plan adds, on any partition, that the parent's new one
+  `adopts_exclusion` (DEC-2448.7; the order the engine would allow is #2992);
+- a declared own exclusion equal to its parent's, at load, as before: a
+  declaration error and no adoption question;
+- a standing own unique index a foreign key references, that the parent's new
+  one `adopts`, naming the key (below);
+- the partition-key rules, `strategy: online`, and a check under a name a
+  partition holds as its own.
+
+A partition declares no primary key, unique constraint or replica identity, so
+a parent's addition meets none (P1).
+
+**Cost.** Each own the engine would have adopted at an attach is built once more,
+as the engine's clone. Each own rebuilt around a parent's addition is built
+again beside the clone, among them owns the engine would have left standing:
+one under another method, predicate, class or `INCLUDE` list, any expression
+under a parent's expression, and a column a parent's expression reads. So
+`(lower(s))` over the parent rebuilds a partition's index on `s`: the price of
+not predicting that `(text(s))` is the column `s`. A column no expression of
+the parent's reads is left alone. The plan shows every drop under its usual
+risk.
+
+**A referenced own unique index is never rebuilt.** A foreign key may reference
+a standing partition's own unique index; no attach meets one, but a parent's
+addition does. Measured on 16.15 and 18.6 (`~/gate1671/m1671fk.sql`), the
+parent adding `UNIQUE INDEX (k)`:
+
+| Statements | Where the key ends |
+|---|---|
+| F1: drop the key, drop the own, add the parent's, add the own, add the key | on the parent's clone, the older index |
+| F2: add the parent's alone, over an equal own | the own is adopted, the key then on a clone |
+| F3: add the parent's alone, over an own with `INCLUDE (m)` | not adopted; the key stays on the own |
+
+A key on a clone is one the reader leaves out, so a rebuild (F1) writes a plan
+whose apply refuses and rolls back. So an own unique index, with no predicate
+and no expression, whose columns a declared foreign key into the partition
+names, in any order, is left as it stands. Where the parent's `adopts` it (F2)
+the add is refused by name, with the key, and otherwise (F3) it is planned.
+For a referenced own only, the exact predicate is therefore still trusted, as
+the remaining refusals trust it. Which of several such indexes a key is bound
+to is not in the model, so each is taken as referenced. A key the plan drops
+holds nothing, and its own is rebuilt.
+
+**Open: a foreign key the declarations do not hold.** The differ cannot see an
+unmanaged table's key into a partition, so it rebuilds the own it references.
+Measured on 16.15 and 18.6: a connected plan then refuses at its drop-blocker
+check, naming the key, and writes no plan. For an own the engine would not
+adopt (F3) that refuses a plan which, rebuilding nothing, would apply. Reading
+the catalog for it is not decided here.
+
+Amends DEC-1545.1's drop rules and its refusal of an own exclusion, the
+adoption refusals of DEC-1688.1 and DEC-2448.7 for standing owns, and
+DEC-2961.1's cases left to a resolver, which are now planned without one.
+
+Pinned by `an_attach_drops_each_own_index_and_key_a_parents_index_might_take`,
+`an_attach_meeting_a_parents_column_rename_matches_its_index_under_both_names`,
+`an_attached_tables_own_exclusion_the_parents_might_take_is_dropped_before_the_attach`,
+`a_partitioned_parents_indexes_change_and_a_partitions_own_is_not_taken`,
+`a_parents_new_exclusion_rebuilds_a_standing_own_and_refuses_one_the_plan_adds`,
+`an_expression_key_matches_a_column_it_may_read`,
+the ordering pass's tests in `dependents.rs`, and on 16 and 18 by
+`support/loose_drop1671.rs`.

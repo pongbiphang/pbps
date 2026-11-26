@@ -108,8 +108,8 @@ fn servers(mut check: impl FnMut(&str, bool)) {
 
 /// A GiST tree: a parent's index with clones on its partitions, a partition's own GiST index
 /// and the DEFAULT partition round-trip; a partition created with its own index is planned
-/// and applied; a parent's new index that a partition's own could be taken for is refused by
-/// name, and planned once the own one is dropped (DEC-1688.1, DEC-2448.6). On 16 and 18.
+/// and applied; a parent's new index that a partition's own could be taken for rebuilds the
+/// own around it, which stays the partition's own (DEC-1671.1, DEC-2448.6). On 16 and 18.
 #[test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 fn a_gist_partition_tree_reads_plans_and_keeps_a_partitions_own_index_its_own() {
@@ -175,8 +175,8 @@ fn a_gist_partition_tree_reads_plans_and_keeps_a_partitions_own_index_its_own() 
         );
         settled(&d, connection);
 
-        // A second parent index a partition's own could be taken for: refused by name,
-        // and nothing runs.
+        // A second parent index each partition's own could be taken for: each own
+        // goes ahead of it and comes back after.
         let with_parent = with_new.replacen(
             "indexes:\n  ev_span:",
             "indexes:\n  ev_span2:\n    method: gist\n    keys:\n      - expression: \
@@ -186,41 +186,34 @@ fn a_gist_partition_tree_reads_plans_and_keeps_a_partitions_own_index_its_own() 
         assert_ne!(with_parent, with_new, "{with_new}");
         std::fs::write(&path, &with_parent).unwrap();
         d.commit();
-        let refused = d.run(&["plan", "--db", connection]);
-        assert_ne!(code(&refused), 0, "{}", said(&refused));
-        assert!(
-            said(&refused).contains("which can take app.ev_1's `ev_1_own`"),
-            "{}",
-            said(&refused)
-        );
-        // Without the own ones it is planned, and every partition gets its clone.
-        let without_own = with_parent
-            .replacen(
-                "    indexes:\n      ev_1_own:\n        method: gist\n        keys:\n          - \
-                 expression: \"int4range(s, s + 5)\"\n",
-                "",
-                1,
-            )
-            .replacen(
-                "    indexes:\n      ev_2_own:\n        method: gist\n        keys:\n          - \
-                 expression: \"int4range(s, s + 7)\"\n",
-                "",
-                1,
-            );
-        assert_ne!(without_own, with_parent);
-        std::fs::write(&path, &without_own).unwrap();
-        d.commit();
         let (plan, script) = plan_sql(&d, connection);
-        assert!(
-            script.find("DROP INDEX").unwrap() < script.find("ev_span2").unwrap(),
-            "the own indexes go before the parent's is built: {script}"
-        );
+        for own in ["ev_1_own", "ev_2_own"] {
+            let at = |statement: String| {
+                script
+                    .find(&statement)
+                    .unwrap_or_else(|| panic!("missing {statement}: {script}"))
+            };
+            let dropped = at(format!("DROP INDEX \"app\".\"{own}\""));
+            let parent = at("CREATE INDEX \"ev_span2\"".to_owned());
+            let added = at(format!("CREATE INDEX \"{own}\""));
+            assert!(dropped < parent && parent < added, "{script}");
+        }
         succeeds(approved_apply(
             &d,
             connection,
             &plan,
             &["--allow", "destructive"],
         ));
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE c.relname IN ('ev_1_own', 'ev_2_own') AND NOT EXISTS \
+                   (SELECT 1 FROM pg_inherits h WHERE h.inhrelid = i.indexrelid)"
+            ),
+            2,
+            "each own is still its partition's own"
+        );
         assert_eq!(
             scalar(
                 connection,
@@ -703,9 +696,10 @@ fn a_partitions_own_exclusion_is_read_declared_created_replaced_and_dropped() {
 
 /// What the engine takes for its parent's clone it takes on `ATTACH` and when the parent's is
 /// added, and what it takes goes with the parent's exclusion (measured on 18.6, DEC-2448.7).
-/// So an own equal to the parent's is refused offline whatever its timing, an attach of a table
-/// whose own the parent's would take is refused by name, and an own that differs (here by its
-/// `include`) coexists with the clone: it attaches, stays the partition's own and re-plans clean.
+/// So an own equal to the parent's is refused offline whatever its timing; an attach of a table
+/// whose own the parent's might take drops it first, with its record (DEC-1671.1); and an own
+/// that differs (here by its `include`) coexists with the clone: it attaches, stays the
+/// partition's own and re-plans clean.
 #[test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 fn a_partitions_own_exclusion_the_parents_would_take_is_refused_and_one_it_would_not_stays() {
@@ -769,9 +763,9 @@ fn a_partitions_own_exclusion_the_parents_would_take_is_refused_and_one_it_would
     std::fs::write(&path, twin("", "        include: [note]\n")).unwrap();
     succeeds(d.run(&["validate"]));
 
-    // `late` holds an own the parent's would take: attached, the engine would make it the
-    // parent's clone. Declared as a partition without it, its drop needs its record; with the
-    // record, the attach is refused by name (the base still holds the own), and nothing ran.
+    // `late` holds an own the parent's would take: attached as it stands, the engine would
+    // make it the parent's clone. Declared as a partition without it, its drop needs its
+    // record; with the record it is dropped ahead of the attach, which builds the clone.
     std::fs::remove_file(&late).unwrap();
     let declared = tree.replacen(
         "  ev_rest: default",
@@ -779,6 +773,14 @@ fn a_partitions_own_exclusion_the_parents_would_take_is_refused_and_one_it_would
         1,
     );
     std::fs::write(&path, &declared).unwrap();
+    let refused = d.run(&["plan"]);
+    assert_ne!(code(&refused), 0, "{}", said(&refused));
+    assert!(
+        said(&refused).contains("pbps drop-exclusion app.late late_own --reason"),
+        "{}",
+        said(&refused)
+    );
+    assert_eq!(clones(connection), 2, "nothing ran");
     succeeds(d.run(&[
         "drop-exclusion",
         "app.late",
@@ -786,16 +788,26 @@ fn a_partitions_own_exclusion_the_parents_would_take_is_refused_and_one_it_would
         "--reason",
         "the clone replaces it",
     ]));
-    let refused = d.run(&["plan"]);
-    assert_ne!(code(&refused), 0, "{}", said(&refused));
+    d.commit();
+    let (plan, script) = plan_sql(&d, connection);
     assert!(
-        said(&refused)
-            .contains("its exclusion constraint `late_own` is its parent's `one_per_slot`"),
-        "{}",
-        said(&refused)
+        script.find("DROP CONSTRAINT \"late_own\"").unwrap()
+            < script.find("ATTACH PARTITION \"app\".\"late\"").unwrap(),
+        "{script}"
     );
-    assert_eq!(clones(connection), 2, "nothing ran");
-    let _ = (late_text, declared);
+    succeeds(approved_apply(&d, connection, &plan, BOTH));
+    assert_eq!(clones(connection), 3, "the engine built late's clone");
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE contype = 'x' \
+             AND conrelid = 'app.late'::regclass"
+        ),
+        1,
+        "the clone alone"
+    );
+    settled(&d, connection);
+    let _ = late_text;
 
     // An own that differs by its `include` attaches, keeps its own, and gains a clone.
     let (own, d, path, tree, late, late_text) = attach(
