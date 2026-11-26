@@ -181,6 +181,7 @@ async fn exercise_capture(connection: String) {
     );
     let snapshot = pbps_model::StateSnapshot::new(
         pbps_model::StateKind::Bootstrap,
+        "postgres",
         pbps_model::Schema::default(),
         pbps_model::IdsFile::default(),
         "capture-fixture",

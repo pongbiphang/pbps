@@ -434,6 +434,7 @@ const PROBE_STATE: &str = "SELECT TOP (0) id AS present FROM dbo.__pbps_state;";
 /// No savepoint: a failed statement here leaves the transaction as it was, so
 /// a tolerated failure needs nothing to rewind to.
 static LEDGER: LedgerSpec = LedgerSpec {
+    dialect: crate::types::DIALECT,
     probe_state: Cow::Borrowed(PROBE_STATE),
     select_latest: Cow::Borrowed(SELECT_LATEST),
     select_by_id: Cow::Borrowed(SELECT_BY_ID),

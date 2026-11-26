@@ -146,7 +146,8 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
             routines: Default::default(),
         });
     }
-    let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "fixture");
+    let mut state =
+        StateSnapshot::new(StateKind::Apply, "postgres", schema.clone(), ids, "fixture");
     state.declared = Declared::from_schema(&schema);
     state.plan_checksum = Some(plan.wire_fingerprint());
     (schema, plan, state)

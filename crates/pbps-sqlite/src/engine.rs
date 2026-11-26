@@ -90,6 +90,10 @@ impl Engine for SqliteEngine {
         "SQLite"
     }
 
+    fn dialect(&self) -> &'static str {
+        crate::types::DIALECT
+    }
+
     fn is_initialized<'a>(&'a self, conn: &'a mut Conn) -> EngineFuture<'a, Result<bool, DbError>> {
         Box::pin(async move { crate::state::is_initialized(file(conn)?) })
     }

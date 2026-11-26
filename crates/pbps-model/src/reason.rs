@@ -104,6 +104,7 @@ mod tests {
         assert_eq!(tombstone.reason, " ");
         let mut snapshot = crate::StateSnapshot::new(
             crate::StateKind::Baseline,
+            "postgres",
             crate::Schema::default(),
             crate::IdsFile::default(),
             "old-client",

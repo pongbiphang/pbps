@@ -8,10 +8,11 @@ use pbps_model::{IdsFile, StateKind, StateSnapshot};
 
 struct Project {
     root: PathBuf,
+    dialect: &'static str,
 }
 
 impl Project {
-    fn new(dialect: &str, dependency: bool) -> Self {
+    fn new(dialect: &'static str, dependency: bool) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
             "pbps-state-baseline-{}-{}",
@@ -20,7 +21,7 @@ impl Project {
         ));
         std::fs::create_dir_all(root.join("schema")).unwrap();
         std::fs::write(root.join("pbps.yml"), format!("dialect: {dialect}\n")).unwrap();
-        let p = Self { root };
+        let p = Self { root, dialect };
         p.git(&["init", "-q"]);
         p.git(&["config", "user.name", "Baseline test"]);
         p.git(&["config", "user.email", "baseline@example.com"]);
@@ -61,6 +62,7 @@ impl Project {
         let loaded = pbps_load::load_schema_dir(&self.root.join("schema")).unwrap();
         let mut snap = StateSnapshot::new(
             StateKind::Apply,
+            self.dialect,
             loaded.schema,
             IdsFile::default(),
             "baseline test",

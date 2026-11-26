@@ -404,7 +404,13 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                 .without_types(&scoped.missing_types);
             let mut snapshot = with_provenance(
                 project.root(),
-                StateSnapshot::new(StateKind::Apply, scoped.schema, held, &operator),
+                StateSnapshot::new(
+                    StateKind::Apply,
+                    crate::engine::of(conn.driver()).dialect(),
+                    scoped.schema,
+                    held,
+                    &operator,
+                ),
             );
             snapshot.baseline_evidence = scoped.baseline_evidence;
             snapshot.object_deps = loaded
@@ -677,7 +683,13 @@ pub fn cmd_baseline(
                     .without_types(&scoped.missing_types);
                 let mut snapshot = with_provenance(
                     project.root(),
-                    StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
+                    StateSnapshot::new(
+                        StateKind::Baseline,
+                        crate::engine::of(conn.driver()).dialect(),
+                        scoped.schema,
+                        held,
+                        &operator,
+                    ),
                 );
                 snapshot.baseline_evidence = scoped.baseline_evidence;
                 snapshot.object_deps = loaded

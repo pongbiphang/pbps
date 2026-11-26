@@ -220,14 +220,16 @@ fn optional_i32(row: &Row, column: &str) -> Result<Option<i32>, DbError> {
     row.try_get::<i32>(column)
 }
 
-/// One ledger row read whole: the stored text, then parsed.
-pub fn entry_from_row(row: &Row) -> Result<LedgerEntry, LedgerError> {
+/// One ledger row read whole: the stored text, then parsed for `expected_dialect`.
+pub fn entry_from_row(row: &Row, expected_dialect: &str) -> Result<LedgerEntry, LedgerError> {
     let stored = stored_entry_from_row(row)?;
     let id = stored.id;
-    stored.read().map_err(|error| LedgerError::BadEntry {
-        id,
-        message: error.to_string(),
-    })
+    stored
+        .read_for(expected_dialect)
+        .map_err(|error| LedgerError::BadEntry {
+            id,
+            message: error.to_string(),
+        })
 }
 
 /// One ledger row as stored, `state_json` not yet parsed.
@@ -502,6 +504,7 @@ mod tests {
     fn an_operator_is_cut_only_when_it_exceeds_the_columns_width() {
         let mut snapshot = StateSnapshot::new(
             pbps_model::StateKind::Apply,
+            "postgres",
             pbps_model::Schema::default(),
             pbps_model::IdsFile::default(),
             "😀".repeat(4),

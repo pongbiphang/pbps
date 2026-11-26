@@ -91,6 +91,7 @@ fn plan(deps: ObjectEdges, dropping: &[&str]) -> SavedPlan {
 fn recorded(deps: ObjectEdges) -> StateSnapshot {
     let mut state = StateSnapshot::new(
         StateKind::Apply,
+        "postgres",
         Schema::default(),
         IdsFile::default(),
         "operator",

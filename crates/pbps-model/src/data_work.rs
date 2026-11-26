@@ -115,11 +115,13 @@ mod tests {
     fn recorded() -> StateSnapshot {
         StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "deployer",
         )
         .recording_data_work(
+            "postgres",
             work(),
             "reporter".into(),
             Reason::new("backfill").unwrap(),
@@ -150,6 +152,7 @@ mod tests {
     fn data_work_upgrades_a_known_old_snapshot_without_rewriting_it() {
         let mut old = StateSnapshot::new(
             StateKind::Apply,
+            "postgres",
             Schema::default(),
             IdsFile::default(),
             "deployer",
@@ -163,6 +166,7 @@ mod tests {
         assert!(read.data_work.is_none());
         let new = read
             .recording_data_work(
+                "postgres",
                 work(),
                 "reporter".into(),
                 Reason::new("backfill").unwrap(),
@@ -229,7 +233,13 @@ mod tests {
         });
         assert!(
             staged
-                .recording_data_work(work(), "r".into(), Reason::new("why").unwrap(), None)
+                .recording_data_work(
+                    "postgres",
+                    work(),
+                    "r".into(),
+                    Reason::new("why").unwrap(),
+                    None
+                )
                 .is_err()
         );
     }

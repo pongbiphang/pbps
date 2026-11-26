@@ -330,8 +330,18 @@ fn consumer_retirements_name_snapshot_provenance_and_missing_revision_evidence()
         tables: [("app.t".parse().unwrap(), shape)].into(),
         ..Default::default()
     };
-    let mut snapshot =
-        pbps_model::StateSnapshot::new(pbps_model::StateKind::Baseline, schema, ids, "fixture");
+    let dialect = pbps_config::Project::discover(&d.dir)
+        .unwrap()
+        .config
+        .dialect
+        .as_str();
+    let mut snapshot = pbps_model::StateSnapshot::new(
+        pbps_model::StateKind::Baseline,
+        dialect,
+        schema,
+        ids,
+        "fixture",
+    );
     let source = d.dir.join("baseline.json");
     d.table(&COLUMNS.replace(
         "old: {type: integer}",

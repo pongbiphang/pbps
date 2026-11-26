@@ -170,7 +170,7 @@ pub(super) fn failed_apply_snapshot(
     // that row's version. Written under it, the row would hold `object_deps`
     // below the version that introduced the field, and every later read
     // refuses such a row (DEC-2469.7).
-    current.stamp();
+    current.stamp(crate::engine::of(driver).dialect());
     current.kind = StateKind::Failed;
     current.data_work = None;
     // The newest row's assertions passed for the plan that wrote it; this row
@@ -581,6 +581,7 @@ pub(super) async fn apply_under_lock<D: crate::engine::ApplySession>(
         }
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
+            dialect.name(),
             // An object is recorded when its identity is held and the database holds it,
             // and one the previous record holds keeps its recorded definition, as what the
             // read-back holds of it is not this plan's result (DEC-2855.1), except one the

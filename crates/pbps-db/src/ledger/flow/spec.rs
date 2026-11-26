@@ -26,6 +26,8 @@ pub type Statement = Cow<'static, str>;
 /// Every statement names its table qualified and binds every value; each
 /// engine's own tests assert that over [`LedgerSpec::statements`].
 pub struct LedgerSpec {
+    /// The dialect name of the engine that owns this ledger (`mssql`, `postgres`, …).
+    pub dialect: &'static str,
     /// Resolves the ledger and checks the permission to read it, returning no
     /// row. A statement and not a catalog question: on both engines only the
     /// statement separates "absent" from "there and unreadable".
@@ -120,6 +122,7 @@ impl LedgerSpec {
     #[must_use]
     pub fn statements(&self) -> SpecStatements {
         let LedgerSpec {
+            dialect: _,
             probe_state,
             select_latest,
             select_by_id,
@@ -308,6 +311,7 @@ mod tests {
 
     fn spec() -> LedgerSpec {
         LedgerSpec {
+            dialect: "postgres",
             probe_state: "state probe".into(),
             select_latest: "state latest".into(),
             select_by_id: "state by id".into(),

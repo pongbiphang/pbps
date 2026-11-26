@@ -82,7 +82,9 @@ pub async fn latest(
 ) -> Result<Option<LedgerEntry>, LedgerError> {
     require_initialized(conn, spec).await?;
     let rows = conn.query(&spec.select_latest).await?;
-    rows.first().map(entry_from_row).transpose()
+    rows.first()
+        .map(|row| entry_from_row(row, spec.dialect))
+        .transpose()
 }
 
 /// Commit evidence at or before the snapshot the caller already observed.
@@ -158,7 +160,9 @@ pub async fn history(
     let rows = conn
         .query_with(&spec.select_history, &[spec.row_limit.param(limit)])
         .await?;
-    rows.iter().map(entry_from_row).collect()
+    rows.iter()
+        .map(|row| entry_from_row(row, spec.dialect))
+        .collect()
 }
 
 /// The most recent `limit` rows as a timeline, newest first.
@@ -233,10 +237,10 @@ pub async fn timeline<S: LedgerSteps>(
                 for row in &rows {
                     let id: i64 = number(row, "id")?;
                     let state_json = text(row, "state_json")?;
-                    // `read_json`, the same reader the pre-migration timeline
-                    // used: version before shape, and the failure carried
-                    // rather than returned (DECISIONS 222).
-                    let state = StateSnapshot::read_json(&state_json)
+                    // `read_json_for_dialect`, the same reader the pre-migration timeline
+                    // used: version before shape, refusing a foreign dialect as corrupt,
+                    // and the failure carried rather than returned (DECISIONS 222).
+                    let state = StateSnapshot::read_json_for_dialect(&state_json, spec.dialect)
                         .map(|s| TimelineState::from_snapshot(&s));
                     legacy.insert(id, state);
                 }

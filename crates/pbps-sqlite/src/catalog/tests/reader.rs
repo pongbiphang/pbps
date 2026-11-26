@@ -190,6 +190,7 @@ fn the_real_ledger_and_the_engines_own_tables_are_not_the_files_schema_and_are_n
         fresh.connection(),
         &pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
+            crate::types::DIALECT,
             pbps_model::Schema::default(),
             pbps_model::IdsFile::default(),
             "op",

@@ -217,7 +217,8 @@ fn bootstrap_records_an_annotation_that_is_not_module_to_module() {
         "module::app.v".parse().unwrap(),
         ["table::app.t".parse().unwrap()].into(),
     )]);
-    let state = bootstrap_record(built(), IdsFile::default(), &loaded, "operator").unwrap();
+    let state =
+        bootstrap_record("postgres", built(), IdsFile::default(), &loaded, "operator").unwrap();
     assert_eq!(
         state.object_deps.to_deps(),
         loaded.hints.annotations.declared
@@ -225,13 +226,15 @@ fn bootstrap_records_an_annotation_that_is_not_module_to_module() {
     // Negative: no annotation records an empty list, and a duplicate owner,
     // which has no wire form, is refused by name.
     loaded.hints.annotations = Default::default();
-    let state = bootstrap_record(built(), IdsFile::default(), &loaded, "operator").unwrap();
+    let state =
+        bootstrap_record("postgres", built(), IdsFile::default(), &loaded, "operator").unwrap();
     assert!(state.object_deps.is_empty());
     loaded.hints.annotations.declared = pbps_model::object_ref::ObjectDeps(vec![
         ("module::app.v".parse().unwrap(), Default::default()),
         ("module::app.v".parse().unwrap(), Default::default()),
     ]);
-    let why = bootstrap_record(built(), IdsFile::default(), &loaded, "operator").unwrap_err();
+    let why =
+        bootstrap_record("postgres", built(), IdsFile::default(), &loaded, "operator").unwrap_err();
     assert!(why.to_string().contains("module::app.v"), "{why}");
 }
 
@@ -276,8 +279,10 @@ fn bootstrap_records_identified_types_created_on_an_empty_target() {
             checks.insert("positive".into(), "(VALUE > 0)".into());
         }
         let built = pbps_diff::scope(&read_back, &ids, &Default::default(), &Default::default());
-        let snapshot = bootstrap_record(built, ids.clone(), &loaded, "operator").unwrap();
+        let snapshot =
+            bootstrap_record("postgres", built, ids.clone(), &loaded, "operator").unwrap();
         assert_eq!(snapshot.kind, StateKind::Bootstrap);
+        assert_eq!(snapshot.dialect.as_deref(), Some("postgres"));
         assert_eq!(snapshot.ids, ids);
         assert_eq!(snapshot.schema, read_back);
         assert_eq!(
@@ -835,6 +840,7 @@ fn verify_keeps_the_recorded_entry_and_distinguishes_its_absence_from_emptiness(
         applied_at: "2026-10-13T00:00:00Z".into(),
         snapshot: pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Baseline,
+            "postgres",
             pbps_model::Schema::default(),
             pbps_model::IdsFile::default(),
             "operator",
@@ -2498,6 +2504,7 @@ fn a_baseline_refuses_handing_over_only_a_held_partition_a_drop_intent_names() {
             applied_at: "2026-10-18T06:00:00.000".into(),
             snapshot: pbps_model::StateSnapshot::new(
                 pbps_model::StateKind::Baseline,
+                "postgres",
                 schema,
                 ids,
                 "o",
@@ -7873,7 +7880,13 @@ fn a_module_still_to_be_dropped_stays_in_the_staged_scope() {
     };
     let mut schema = Schema::default();
     schema.modules.extend([module("dbo.a"), module("dbo.b")]);
-    let recorded = StateSnapshot::new(StateKind::Apply, schema, IdsFile::default(), "leon");
+    let recorded = StateSnapshot::new(
+        StateKind::Apply,
+        "mssql",
+        schema,
+        IdsFile::default(),
+        "leon",
+    );
     let dropping = pbps_model::ChangeSet {
         changes: ["dbo.a", "dbo.b"]
             .into_iter()

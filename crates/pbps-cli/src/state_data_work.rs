@@ -154,6 +154,7 @@ pub fn cmd_record(project: &Project, args: RecordDataWorkArgs) -> anyhow::Result
                 return Err(Found::new(format!("no retained successful apply matches expand checksum {}; apply that plan here before recording data work", work.expand_checksum)).into());
             }
             let snapshot = current.snapshot.recording_data_work(
+                engine::of(conn.driver()).dialect(),
                 work.clone(), operator, args.reason.clone(), db::git_sha(project.root()),
             ).map_err(|e| Found::new(e.to_string()))?;
             engine::record(&mut conn, &snapshot).await.map_err(anyhow::Error::from)

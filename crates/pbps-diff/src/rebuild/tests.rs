@@ -2470,7 +2470,13 @@ fn a_conversion_left_on_a_retired_column_makes_the_lineage_unreadable_by_name() 
 fn ledger_installation_retains_the_complete_recorded_link_and_refuses_unknown_lineage() {
     let chain = chained(7);
     let snapshot = |schema, ids| {
-        pbps_model::StateSnapshot::new(pbps_model::StateKind::Baseline, schema, ids, "operator")
+        pbps_model::StateSnapshot::new(
+            pbps_model::StateKind::Baseline,
+            "postgres",
+            schema,
+            ids,
+            "operator",
+        )
     };
     let first = snapshot(chain.base.0.clone(), chain.base.1.clone());
     let middle = snapshot(chain.middle.0.clone(), chain.middle.1.clone());

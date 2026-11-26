@@ -970,6 +970,7 @@ mod tests {
         let hints = pbps_model::Hints::default();
         let baseline = StateSnapshot::new(
             pbps_model::StateKind::Baseline,
+            pbps_sqlite::types::DIALECT,
             empty.clone(),
             empty_ids.clone(),
             "test",
@@ -1666,6 +1667,7 @@ mod tests {
         let hints = pbps_model::Hints::default();
         let baseline = StateSnapshot::new(
             pbps_model::StateKind::Baseline,
+            pbps_sqlite::types::DIALECT,
             base.clone(),
             base_ids.clone(),
             "test",
@@ -1879,6 +1881,7 @@ mod tests {
             let hints = pbps_model::Hints::default();
             let baseline = StateSnapshot::new(
                 pbps_model::StateKind::Baseline,
+                pbps_sqlite::types::DIALECT,
                 base.clone(),
                 base_ids.clone(),
                 "test",
@@ -2570,6 +2573,7 @@ mod tests {
         let hints = pbps_model::Hints::default();
         let baseline = StateSnapshot::new(
             pbps_model::StateKind::Baseline,
+            pbps_sqlite::types::DIALECT,
             base.clone(),
             base_ids.clone(),
             "test",
@@ -2638,6 +2642,7 @@ mod tests {
             let hints = pbps_model::Hints::default();
             let baseline = StateSnapshot::new(
                 pbps_model::StateKind::Baseline,
+                pbps_sqlite::types::DIALECT,
                 base.clone(),
                 base_ids.clone(),
                 "test",
@@ -3447,6 +3452,7 @@ mod tests {
             let hints = pbps_model::Hints::default();
             let baseline = StateSnapshot::new(
                 pbps_model::StateKind::Baseline,
+                pbps_sqlite::types::DIALECT,
                 base.clone(),
                 ids.clone(),
                 "test",
@@ -3568,6 +3574,7 @@ mod tests {
             let hints = pbps_model::Hints::default();
             let baseline = StateSnapshot::new(
                 pbps_model::StateKind::Baseline,
+                pbps_sqlite::types::DIALECT,
                 base.clone(),
                 ids.clone(),
                 "test",
@@ -3684,6 +3691,7 @@ mod tests {
             let hints = pbps_model::Hints::default();
             let baseline = StateSnapshot::new(
                 pbps_model::StateKind::Baseline,
+                pbps_sqlite::types::DIALECT,
                 base.clone(),
                 ids.clone(),
                 "test",
@@ -3915,6 +3923,7 @@ mod tests {
             let hints = pbps_model::Hints::default();
             let baseline = StateSnapshot::new(
                 pbps_model::StateKind::Baseline,
+                pbps_sqlite::types::DIALECT,
                 base_v.clone(),
                 ids.clone(),
                 "test",
@@ -3997,6 +4006,7 @@ mod tests {
             let hints = pbps_model::Hints::default();
             let baseline = StateSnapshot::new(
                 pbps_model::StateKind::Baseline,
+                pbps_sqlite::types::DIALECT,
                 stored.clone(),
                 stored_ids.clone(),
                 "test",
