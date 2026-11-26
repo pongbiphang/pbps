@@ -57,13 +57,32 @@ pub(crate) struct Unanswerable(pub Finding);
 impl Selection {
     /// Reads every file once and returns every problem found, not the first.
     /// `None` when no `--assert` was given, even if the variable is set.
+    #[cfg(test)]
     pub(crate) fn prepare(
+        project_root: &Path,
+        paths: &[PathBuf],
+        connection: Result<String, std::env::VarError>,
+    ) -> Result<Option<Self>, Vec<Finding>> {
+        Self::prepare_for(pbps_db::Driver::Postgres, project_root, paths, connection)
+    }
+
+    /// [`Self::prepare`] gated by `driver`: an engine without plan target
+    /// assertions is refused by name before `PBPS_ASSERTION_CONN` or any
+    /// assertion file is demanded.
+    pub(crate) fn prepare_for(
+        driver: pbps_db::Driver,
         project_root: &Path,
         paths: &[PathBuf],
         connection: Result<String, std::env::VarError>,
     ) -> Result<Option<Self>, Vec<Finding>> {
         if paths.is_empty() {
             return Ok(None);
+        }
+        if let Some(why) = crate::engine::unsupported_command_feature(
+            driver,
+            crate::engine::CommandFeature::TargetAssertions,
+        ) {
+            return Err(vec![Finding::error("plan.assertion.refused", why)]);
         }
         let mut problems = Vec::new();
         let connection = match connection {

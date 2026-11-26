@@ -504,3 +504,6 @@ mod comment_drift_tests;
 
 #[cfg(test)]
 mod checkpoint_edges_tests;
+
+#[cfg(test)]
+mod sqlite_commands_tests;

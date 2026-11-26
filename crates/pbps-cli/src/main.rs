@@ -250,13 +250,15 @@ struct PlanArgs {
 
     /// Select a named resolver for PostgreSQL target planning. When needed, it
     /// resolves bindings and publishes a plan for transactional apply, which
-    /// rechecks the saved evidence. SQL Server resolution is refused by name
+    /// rechecks the saved evidence. SQL Server resolution and SQLite are
+    /// refused by name
     #[arg(long, value_name = "PROFILE")]
     resolve_with: Option<String>,
 
-    /// Skip the rehearsal of a connected plan on the selected resolver's scratch,
-    /// and seal the plan as not rehearsed. Needs --db/--env; the same switch as
-    /// `rehearse: false` under an environment
+    /// Skip the rehearsal of a connected plan (on the selected resolver's
+    /// scratch, or in process for SQLite), and seal the plan as not rehearsed.
+    /// Needs --db/--env; the same switch as `rehearse: false` under an
+    /// environment
     #[arg(long)]
     no_rehearse: bool,
 
@@ -277,7 +279,7 @@ struct PlanArgs {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Test a candidate in an owned disposable PostgreSQL database; writes no plan file
+    /// Test a candidate in an owned disposable server database; writes no plan file
     #[command(args_conflicts_with_subcommands = true)]
     Test {
         #[arg(long, conflicts_with = "cleanup")]
@@ -641,6 +643,10 @@ enum Command {
         /// Write the CREATE script here (useful with no database at all)
         #[arg(long)]
         sql: Option<PathBuf>,
+
+        /// Create the SQLite database file if it does not exist yet
+        #[arg(long)]
+        create: bool,
     },
 
     /// Maintenance of the in-database state ledger
@@ -945,8 +951,7 @@ enum OutputFormat {
 /// for the other — see [`db::target`].
 #[derive(Args)]
 struct TargetArgs {
-    /// ADO.NET-style connection string, e.g.
-    /// "Server=host,1433;Database=app;User Id=u;Password=p;TrustServerCertificate=true"
+    /// Connection string (SQL Server / PostgreSQL) or SQLite database file path
     #[arg(long)]
     db: Option<String>,
 
@@ -1404,6 +1409,20 @@ fn run() -> anyhow::Result<()> {
                     &assertions,
                     json,
                 )?;
+                let driver = db::driver_for(project.config.dialect);
+                if let Err(finding) = refuse_plan_resolver(
+                    driver,
+                    &project,
+                    resolve_with.as_deref(),
+                    target.env.as_deref(),
+                ) {
+                    let report = output::Report::plain("plan", vec![finding]);
+                    if json {
+                        return report.emit_json();
+                    }
+                    eprint!("{}", output::human(&report.findings));
+                    return report.outcome();
+                }
                 let resolver_selection = match project
                     .config
                     .select_resolver(resolve_with.as_deref(), target.env.as_deref())
@@ -1428,8 +1447,11 @@ fn run() -> anyhow::Result<()> {
                     target.resolve(&project),
                 )?;
                 // Read and hashed before any connection: a missing variable or
-                // file stops here, naming what to fix (DEC-2401.4).
-                let selected = match plan_assert::Selection::prepare(
+                // file stops here, naming what to fix (DEC-2401.4). Engines
+                // without plan target assertions refuse before the variable is
+                // demanded.
+                let selected = match plan_assert::Selection::prepare_for(
+                    target.driver(),
                     project.root(),
                     &assertions,
                     std::env::var(plan_assert::CONNECTION_VARIABLE),
@@ -1752,6 +1774,10 @@ fn run() -> anyhow::Result<()> {
                     force,
                 },
         } => {
+            let driver = db::driver_for(project.config.dialect);
+            if !engine::has_resolver(driver) {
+                engine::refuse_externals_draft_unsupported(driver)?;
+            }
             let target = target.resolve(&project)?;
             externals_draft::cmd_externals(&project, &target, &schemas, out.as_deref(), force)
         }
@@ -1791,7 +1817,11 @@ fn run() -> anyhow::Result<()> {
             let target = target.resolve(&project)?;
             deploy::cmd_baseline(&project, &target, &reason)
         }
-        Command::Bootstrap { target, sql } => {
+        Command::Bootstrap {
+            target,
+            sql,
+            create,
+        } => {
             // The only command with an optional target: writing the script needs
             // no database, and on an air-gapped host there is not one to give.
             let target = match (&target.db, &target.env) {
@@ -1801,7 +1831,7 @@ fn run() -> anyhow::Result<()> {
             if let Some(path) = sql.as_deref() {
                 ids_store::refuse_output_inside(&project, path)?;
             }
-            deploy::cmd_bootstrap(&project, target.as_ref(), sql.as_deref())
+            deploy::cmd_bootstrap(&project, target.as_ref(), sql.as_deref(), create)
         }
         Command::State { command } => match command {
             StateCommand::RecordDataWork(args) => state_data_work::cmd_record(&project, *args),
@@ -1933,6 +1963,12 @@ fn cmd_pull(
     partitions_external: &[String],
     extensions: &[String],
 ) -> anyhow::Result<()> {
+    refuse_pull_flags(
+        db::driver_for(project.config.dialect),
+        data,
+        partitions_external,
+        extensions,
+    )?;
     // 1. Parsed before anything else: a misspelt table name is a fact about
     // the command line alone, and it should cost neither a look at the
     // project's rules and files nor a round trip to find out.
@@ -4742,6 +4778,10 @@ fn cmd_rebuild_table(
     max_rows: u64,
     reason: &pbps_model::Reason,
 ) -> anyhow::Result<()> {
+    engine::require_command_feature(
+        db::driver_for(project.config.dialect),
+        engine::CommandFeature::TableRebuild,
+    )?;
     let dialect = dialect(project)?;
     if !dialect.rebuilds_tables() {
         bail!("rebuild-table is only supported for PostgreSQL");
@@ -4796,6 +4836,10 @@ fn cmd_rebuild_table(
 /// database, and an environment that already applied the rewrite refuses by
 /// name at its next plan (DEC-2298.12).
 fn cmd_withdraw_rebuild(project: &Project, table: &TableName) -> anyhow::Result<()> {
+    engine::require_command_feature(
+        db::driver_for(project.config.dialect),
+        engine::CommandFeature::TableRebuild,
+    )?;
     let ids = read_ids(project)?;
     let updated = pbps_diff::rebuild::withdraw(&ids, table)?;
     write_ids(project, &updated)?;
@@ -4805,6 +4849,65 @@ fn cmd_withdraw_rebuild(project: &Project, table: &TableName) -> anyhow::Result<
          `git revert` of the approval commit does both.",
         table.shown()
     );
+    Ok(())
+}
+
+fn refuse_plan_resolver(
+    driver: pbps_db::Driver,
+    project: &Project,
+    resolve_with: Option<&str>,
+    env: Option<&str>,
+) -> Result<(), output::Finding> {
+    let requested = resolve_with.is_some()
+        || project.config.resolve_with.is_some()
+        || env
+            .and_then(|n| project.config.environments.get(n))
+            .is_some_and(|e| e.resolve_with.is_some());
+    if requested
+        && let Some(why) =
+            engine::unsupported_command_feature(driver, engine::CommandFeature::Resolver)
+    {
+        return Err(output::Finding::error("resolver.unsupported", why));
+    }
+    Ok(())
+}
+
+fn refuse_pull_flags(
+    driver: pbps_db::Driver,
+    data: &[String],
+    partitions_external: &[String],
+    extensions: &[String],
+) -> anyhow::Result<()> {
+    use engine::CommandFeature as F;
+    for (present, feature) in [
+        (!data.is_empty(), F::ManagedData),
+        (!partitions_external.is_empty(), F::Partitions),
+        (!extensions.is_empty(), F::Extensions),
+    ] {
+        if present {
+            engine::require_command_feature(driver, feature)?;
+        }
+    }
+    Ok(())
+}
+
+fn refuse_unsupported_intents(driver: pbps_db::Driver, intents: &[Intent]) -> anyhow::Result<()> {
+    use engine::CommandFeature as F;
+    for intent in intents {
+        let feature = match intent {
+            Intent::RenameColumn { .. }
+            | Intent::RenameTable { .. }
+            | Intent::DropColumn { .. }
+            | Intent::DropTable { .. } => continue,
+            Intent::RenameRole { .. } | Intent::DropRole { .. } => F::Roles,
+            Intent::RenameType { .. } | Intent::DropType { .. } => F::DeclaredTypes,
+            Intent::DropExtension { .. } => F::Extensions,
+            Intent::RenameSearch { .. } | Intent::DropSearch { .. } => F::TextSearch,
+            Intent::DropExclusion { .. } => F::ExclusionConstraints,
+            Intent::MoveRows { .. } => F::Partitions,
+        };
+        engine::require_command_feature(driver, feature)?;
+    }
     Ok(())
 }
 
@@ -4903,6 +5006,10 @@ fn cmd_convert(
 /// baseline as `convert` and `rebuild-table` do, at the revision `--since` names
 /// (DEC-2448.4).
 fn cmd_drop_exclusion(project: &Project, intent: Intent, since: String) -> anyhow::Result<()> {
+    refuse_unsupported_intents(
+        db::driver_for(project.config.dialect),
+        std::slice::from_ref(&intent),
+    )?;
     let dialect = dialect(project)?;
     let loaded = load(project, dialect.as_ref())?;
     if !loaded.intents.is_empty() {
@@ -4954,11 +5061,12 @@ fn cmd_intent_with(
     batch: IntentBatch,
     update: impl FnOnce(&mut pbps_diff::Resolution) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    let supplied = batch.into_vec();
+    refuse_unsupported_intents(db::driver_for(project.config.dialect), &supplied)?;
     let loaded = load(project, dialect(project)?.as_ref())?;
     let ids = read_ids(project)?;
     let annotation_count = loaded.intents.len();
     let mut intents = loaded.intents;
-    let supplied = batch.into_vec();
     intents.extend(supplied.iter().cloned());
 
     match pbps_diff::resolve_with_annotations(

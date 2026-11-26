@@ -76,13 +76,20 @@ pub(crate) fn cmd_bootstrap(
     project: &Project,
     target: Option<&Target>,
     sql_out: Option<&std::path::Path>,
+    create: bool,
 ) -> anyhow::Result<()> {
     let operator = crate::operator(project.root())?;
     let dialect = crate::dialect(project)?;
     let declarations = Declarations::read(project, dialect.as_ref())?;
-    if let Some(built) =
-        super::bootstrap(project, target, sql_out, declarations, dialect, &operator)?
-    {
+    if let Some(built) = super::bootstrap(
+        project,
+        target,
+        sql_out,
+        create,
+        declarations,
+        dialect,
+        &operator,
+    )? {
         println!(
             "Bootstrapped `{}`: {} table(s) created, recorded as entry #{}.",
             pbps_model::escape::Escaped(&built.target),

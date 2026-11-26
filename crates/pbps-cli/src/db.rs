@@ -117,13 +117,16 @@ pub const fn driver_for(dialect: DialectName) -> pbps_db::Driver {
 pub fn target(project: &Project, db: Option<&str>, env: Option<&str>) -> anyhow::Result<Target> {
     match (db, env) {
         (Some(_), Some(_)) => bail!("--db and --env name the same thing; pass one of them"),
-        (Some(conn), None) => Ok(Target {
-            label: redact(conn),
-            connection: conn.to_owned(),
-            environment: None,
-            driver: driver_for(project.config.dialect),
-            infrastructure_roles: Vec::new(),
-        }),
+        (Some(conn), None) => {
+            let driver = driver_for(project.config.dialect);
+            Ok(Target {
+                label: redact(driver, conn),
+                connection: conn.to_owned(),
+                environment: None,
+                driver,
+                infrastructure_roles: Vec::new(),
+            })
+        }
         (None, Some(name)) => Ok(Target {
             label: name.to_owned(),
             connection: project.connection_string(name)?,
@@ -133,7 +136,7 @@ pub fn target(project: &Project, db: Option<&str>, env: Option<&str>) -> anyhow:
         }),
         (None, None) => bail!(
             "this command needs a database: pass --db {} or --env {}",
-            crate::report::placeholder("connection string"),
+            crate::report::placeholder("connection string or SQLite path"),
             crate::report::placeholder("name from pbps.yml")
         ),
     }
@@ -147,7 +150,7 @@ pub fn target(project: &Project, db: Option<&str>, env: Option<&str>) -> anyhow:
 /// string is already the answer.
 pub fn target_from_connection(connection: &str, driver: pbps_db::Driver) -> Target {
     Target {
-        label: redact(connection),
+        label: redact(driver, connection),
         connection: connection.to_owned(),
         // A connection string names no environment, and there may be no
         // `pbps.yml` here at all.
@@ -166,7 +169,15 @@ pub fn target_from_connection(connection: &str, driver: pbps_db::Driver) -> Targ
 /// carries a password, so what identifies the target — server and database — is
 /// extracted and everything else is dropped. Anything unrecognizable degrades to
 /// a placeholder rather than being echoed on the chance it was harmless.
-pub fn redact(connection: &str) -> String {
+/// A file-based database's path holds no secret and is shown as given.
+pub fn redact(driver: pbps_db::Driver, connection: &str) -> String {
+    if crate::engine::connection_is_path(driver) {
+        return if connection.is_empty() {
+            "the database given on the command line".to_owned()
+        } else {
+            connection.to_owned()
+        };
+    }
     let mut server = None;
     let mut database = None;
     for part in connection.split(';') {
@@ -200,6 +211,42 @@ pub async fn connect(target: &Target) -> anyhow::Result<pbps_db::Conn> {
     pbps_db::Conn::connect(target.driver(), target.connection())
         .await
         .context("cannot connect to the database")
+}
+
+/// Opens a connection for `bootstrap`, creating the database file only when
+/// `create` is set and the engine supports it. On a missing file without
+/// `--create`, names the flag in the refusal.
+pub async fn connect_for_bootstrap(target: &Target, create: bool) -> anyhow::Result<pbps_db::Conn> {
+    if create {
+        crate::engine::require_command_feature(
+            target.driver(),
+            crate::engine::CommandFeature::DatabaseCreate,
+        )?;
+        return pbps_db::Conn::create(target.driver(), target.connection())
+            .context("cannot create the database");
+    }
+    match pbps_db::Conn::connect(target.driver(), target.connection()).await {
+        Ok(conn) => Ok(conn),
+        Err(error) => {
+            let missing_creatable = matches!(
+                &error,
+                pbps_db::DbError::Connect { reason, .. }
+                    if reason.kind() == std::io::ErrorKind::NotFound
+            ) && crate::engine::unsupported_command_feature(
+                target.driver(),
+                crate::engine::CommandFeature::DatabaseCreate,
+            )
+            .is_none();
+            if missing_creatable {
+                Err(anyhow::Error::new(error).context(
+                    "cannot connect to the database: the file does not exist; pass `--create` to \
+                     create a new database file",
+                ))
+            } else {
+                Err(anyhow::Error::new(error).context("cannot connect to the database"))
+            }
+        }
+    }
 }
 
 /// One runtime per command. The tool is a CLI, not a server; only the driver
@@ -254,26 +301,50 @@ mod tests {
     #[test]
     fn redaction_never_leaks_the_password() {
         let s = "Server=db.internal,1433;Database=app;User Id=deploy;Password=hunter2;TrustServerCertificate=true";
-        let label = redact(s);
-        assert_eq!(label, "db.internal,1433/app");
-        assert!(!label.contains("hunter2"));
-        assert!(!label.contains("deploy"));
+        for driver in [pbps_db::Driver::Mssql, pbps_db::Driver::Postgres] {
+            let label = redact(driver, s);
+            assert_eq!(label, "db.internal,1433/app");
+            assert!(!label.contains("hunter2"));
+            assert!(!label.contains("deploy"));
+        }
     }
 
     #[test]
     fn redaction_accepts_the_other_spellings() {
-        assert_eq!(
-            redact("Data Source=srv;Initial Catalog=db;Password=x"),
-            "srv/db"
-        );
-        assert_eq!(redact("SERVER=srv;PASSWORD=x"), "srv");
+        for driver in [pbps_db::Driver::Mssql, pbps_db::Driver::Postgres] {
+            assert_eq!(
+                redact(driver, "Data Source=srv;Initial Catalog=db;Password=x"),
+                "srv/db"
+            );
+            assert_eq!(redact(driver, "SERVER=srv;PASSWORD=x"), "srv");
+        }
     }
 
     /// An unparseable string must degrade to a placeholder, never be echoed:
     /// "I did not recognize it" is not a reason to assume it is harmless.
     #[test]
     fn an_unrecognized_string_is_not_echoed() {
-        let label = redact("this-is-not-a-connection-string-Password=hunter2");
-        assert!(!label.contains("hunter2"), "{label}");
+        for driver in [pbps_db::Driver::Mssql, pbps_db::Driver::Postgres] {
+            let label = redact(driver, "this-is-not-a-connection-string-Password=hunter2");
+            assert!(!label.contains("hunter2"), "{label}");
+        }
+    }
+
+    #[test]
+    fn sqlite_target_is_shown_as_its_path_and_empty_degrades_to_placeholder() {
+        assert_eq!(redact(pbps_db::Driver::Sqlite, "./app.db"), "./app.db");
+        assert_eq!(
+            redact(pbps_db::Driver::Sqlite, "/var/data/app.db"),
+            "/var/data/app.db"
+        );
+        assert_eq!(
+            target_from_connection("sub/local.db", pbps_db::Driver::Sqlite).label,
+            "sub/local.db"
+        );
+        // Negative: an empty path still degrades to the placeholder.
+        assert_eq!(
+            redact(pbps_db::Driver::Sqlite, ""),
+            "the database given on the command line"
+        );
     }
 }

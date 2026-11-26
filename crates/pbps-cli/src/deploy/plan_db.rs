@@ -155,6 +155,19 @@ pub(super) async fn plan_db_selected(
     owned: Option<&services::Progress>,
 ) -> anyhow::Result<services::PlanResult> {
     let quiet = owned.is_some();
+    if resolver_selection.is_some()
+        && let Some(why) = crate::engine::unsupported_command_feature(
+            target.driver(),
+            crate::engine::CommandFeature::Resolver,
+        )
+    {
+        let finding = crate::output::Finding::error("resolver.unsupported", why);
+        let report = crate::output::Report::plain("plan", vec![finding]);
+        if !json {
+            eprint!("{}", crate::output::human(&report.findings));
+        }
+        return Ok(services::PlanResult::Refused(report));
+    }
     pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
         let services::Declarations { mut loaded, ids } = declarations;
         refuse_invalid_declarations(&loaded, dialect.as_ref(), json)?;
@@ -965,8 +978,8 @@ pub(super) async fn plan_db_selected(
             hints: &hints,
             baseline: &entry.snapshot,
         };
-        conn.begin(&dialect.transaction_framing(&pin_zone(&conn)))
-            .await?;
+        let planning_framing = dialect.read_transaction_framing(&pin_zone(&conn));
+        conn.begin(&planning_framing).await?;
         let checks = async {
             // In the read-only planning transaction, with everything below.
             dialect
@@ -1073,9 +1086,7 @@ pub(super) async fn plan_db_selected(
             ))
         }
         .await;
-        let rollback = conn
-            .rollback(&dialect.transaction_framing(&pin_zone(&conn)))
-            .await;
+        let rollback = conn.rollback(&planning_framing).await;
         let (mut cs, rename_evidence, dependents, rebuilds, drop_blockers, logical_slots, fills) =
             checks?;
         rollback?;
@@ -1271,11 +1282,12 @@ pub(super) async fn plan_db_selected(
             }
             bail!("{refusal}");
         }
+        let warning_id = crate::engine::preflight_warning_id(conn.driver());
         for w in &verdict.warnings {
             if !json {
                 eprintln!("warning: {w}");
             }
-            findings.push(crate::output::Finding::warning("plan.edition", w));
+            findings.push(crate::output::Finding::warning(warning_id, w));
         }
 
         // What the plan is pinned to is wider than what the drift check
@@ -1414,8 +1426,9 @@ pub(super) async fn plan_db_selected(
             )
             .await?;
         // The rehearsal, last: it runs the plan as it will be written, on the
-        // scratch the resolver used or would have used (#2379).
-        let course = crate::rehearsal::connected::course(
+        // scratch the resolver used or would have used (#2379), or in process
+        // on a page copy for SQLite (DEC-2950.16).
+        let course = dialect.rehearsal_course(
             // An unavailable advisory scratch must not become a fatal retry
             // through the independent rehearsal (DEC-2309.1).
             scratch.is_some() && !domain_vet_unavailable,
@@ -1435,9 +1448,9 @@ pub(super) async fn plan_db_selected(
             );
         }
         let mut manifests = crate::rehearsal::connected::Manifests::new();
-        let rehearsal = match (course, scratch.as_mut()) {
-            (Course::Off, _) => Some(pbps_model::Rehearsal::Off),
-            (Course::Rehearse, Some(entry)) => {
+        let rehearsal = match course {
+            Course::Off => Some(pbps_model::Rehearsal::Off),
+            Course::Rehearse => {
                 let ordered = cs.clone().ordered(plan_mode(staged), dialect.as_ref());
                 let lowered = crate::statements(&ordered, &dialect)?;
                 let mut base_hints = hints.clone();
@@ -1447,8 +1460,14 @@ pub(super) async fn plan_db_selected(
                 if !staged {
                     reject_non_transactional(&lowered)?;
                 }
-                let verdict = crate::rehearsal::connected::run(
-                    entry,
+                let mut on_note = |note: String| {
+                    if !json {
+                        eprintln!("note: {note}");
+                    }
+                    findings.push(crate::output::Finding::note("rehearsal.note", note));
+                };
+                let verdict = dialect.rehearse_connected(
+                    scratch.as_mut(),
                     &mut conn,
                     target,
                     &crate::rehearsal::connected::Plan {
@@ -1464,25 +1483,21 @@ pub(super) async fn plan_db_selected(
                         statements: &lowered,
                         staged,
                     },
+                    &mut on_note,
                 )
-                .await;
-                // Confirmed gone before the plan goes on or is refused.
-                let released = entry.finish().await;
-                let verdict = verdict?;
-                if let Err(crate::resolution::Refused::Unanswerable(error)) = released {
-                    return Err(error);
-                }
+                .await?;
                 match verdict {
-                    crate::rehearsal::connected::Verdict::Sealed(record, sealed) => {
+                    Some(crate::rehearsal::connected::Verdict::Sealed(record, sealed)) => {
                         manifests = sealed;
                         Some(record)
                     }
-                    crate::rehearsal::connected::Verdict::Refused(finding) => {
+                    Some(crate::rehearsal::connected::Verdict::Refused(finding)) => {
                         return Ok(Connected::Refused { finding, findings });
                     }
+                    None => None,
                 }
             }
-            (Course::Rehearse | Course::Skip, _) => None,
+            Course::Skip => None,
         };
         if let Some(entry) = scratch.as_mut()
             && let Err(crate::resolution::Refused::Unanswerable(error)) = entry.finish().await

@@ -294,6 +294,7 @@ pub(super) fn bootstrap(
     project: &Project,
     target: Option<&Target>,
     sql_out: Option<&std::path::Path>,
+    create: bool,
     declarations: services::Declarations,
     dialect: crate::emission::SelectedDialect,
     operator: &str,
@@ -302,6 +303,7 @@ pub(super) fn bootstrap(
         project,
         target,
         sql_out,
+        create,
         declarations,
         dialect,
         operator,
@@ -320,15 +322,30 @@ pub(super) fn bootstrap(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn bootstrap_async(
     project: &Project,
     target: Option<&Target>,
     sql_out: Option<&std::path::Path>,
+    create: bool,
     declarations: services::Declarations,
     dialect: crate::emission::SelectedDialect,
     operator: &str,
     warnings: CatalogWarnings<'_>,
 ) -> anyhow::Result<services::Bootstrap> {
+    if create {
+        let driver = target
+            .map(Target::driver)
+            .unwrap_or_else(|| db::driver_for(project.config.dialect));
+        crate::engine::require_command_feature(
+            driver,
+            crate::engine::CommandFeature::DatabaseCreate,
+        )?;
+        anyhow::ensure!(
+            target.is_some(),
+            "--create creates a database file, so it needs a target: pass --db or --env"
+        );
+    }
     pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
         let services::Declarations { mut loaded, ids } = declarations;
         refuse_invalid_declarations(&loaded, dialect.as_ref(), false)?;
@@ -359,7 +376,7 @@ pub(super) async fn bootstrap_async(
         // declared text, as it always has.
         if let Some(target) = target {
             loaded.schema = Box::pin(async {
-                let mut conn = db::connect(target).await?;
+                let mut conn = db::connect_for_bootstrap(target, create).await?;
                 dialect = dialect.planning_dialect(&mut conn).await?;
                 bootstrap_type_pins(
                     &dialect,

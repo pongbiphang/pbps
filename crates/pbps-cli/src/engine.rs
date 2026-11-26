@@ -136,6 +136,7 @@ mod of_tests {
 // one `Profile` per engine, read by the functions below that need no connection
 // (#2798).
 mod profile;
+pub(crate) use profile::CommandFeature;
 // What `pbps test` needs of an engine that owns its scratch server, where the
 // answer is a value; selected by `require_owned_test` (#2798).
 mod owned_test;
@@ -1846,6 +1847,32 @@ pub const fn version_label(driver: Driver) -> &'static str {
 /// Whether this engine has a target resolver / owned scratch server (`Profile::owned_test`).
 pub const fn has_resolver(driver: Driver) -> bool {
     profile::profile(driver).owned_test.is_some()
+}
+
+pub fn unsupported_command_feature(
+    driver: Driver,
+    feature: CommandFeature,
+) -> Option<&'static str> {
+    (profile::profile(driver).unsupported_command)(feature)
+}
+
+pub fn require_command_feature(driver: Driver, feature: CommandFeature) -> anyhow::Result<()> {
+    if let Some(why) = unsupported_command_feature(driver, feature) {
+        anyhow::bail!("{why}");
+    }
+    Ok(())
+}
+
+pub const fn preflight_warning_id(driver: Driver) -> &'static str {
+    profile::profile(driver).preflight_warning_id
+}
+
+pub const fn checks_empty_plan_under_lock(driver: Driver) -> bool {
+    profile::profile(driver).checks_empty_plan_under_lock
+}
+
+pub const fn connection_is_path(driver: Driver) -> bool {
+    profile::profile(driver).connection_is_path
 }
 
 /// Whether `strategy: online` depends on something only a connection can read.

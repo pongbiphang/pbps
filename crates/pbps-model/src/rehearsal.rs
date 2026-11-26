@@ -47,6 +47,17 @@ pub enum Rehearsal {
         /// refused, not read as either answer.
         authorization: AuthorizationRehearsal,
     },
+    /// The plan's statements ran in order on an in-process copy of the
+    /// database's pages (SQLite, DEC-2950.16), and the result matched the
+    /// declarations, up to the spellings listed.
+    InProcess {
+        /// The linked library that ran the rehearsal (e.g. `SQLite 3.54.1`).
+        library: crate::Text,
+        /// Differences that are only the engine's normalization showing
+        /// through, each as the engine stored it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        spelling: Vec<crate::Text>,
+    },
     /// The operator turned the rehearsal off for this run or environment.
     /// Never read as "rehearsed".
     Off,
@@ -85,6 +96,7 @@ impl Rehearsal {
                         AuthorizationRehearsal::NotRehearsed { reason } if reason.raw().is_empty()
                     )
             }
+            Rehearsal::InProcess { library, .. } => !library.raw().is_empty(),
             Rehearsal::Off => true,
         }
     }
@@ -320,5 +332,44 @@ mod tests {
                 Err(crate::resolver::EvidenceError::Incomplete)
             );
         }
+    }
+
+    #[test]
+    fn in_process_rehearsal_round_trips_and_requires_a_library_name() {
+        let bare = Rehearsal::InProcess {
+            library: "SQLite 3.54.1".into(),
+            spelling: Vec::new(),
+        };
+        let spelt = Rehearsal::InProcess {
+            library: "SQLite 3.54.1".into(),
+            spelling: vec!["check c on main.t".into()],
+        };
+        for record in [&bare, &spelt] {
+            let json = serde_json::to_value(record).unwrap();
+            assert_eq!(serde_json::from_value::<Rehearsal>(json).unwrap(), *record);
+            let plan = plan_with(Some(record.clone()));
+            let back: crate::SavedPlan =
+                serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+            assert_eq!(back, plan);
+            back.validate_analysis().unwrap();
+        }
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            json!({"in_process": {"library": "SQLite 3.54.1"}})
+        );
+        assert_ne!(
+            plan_with(Some(bare)).wire_fingerprint(),
+            plan_with(Some(spelt)).wire_fingerprint()
+        );
+        // Negative: an empty library name is incomplete and refused by plan validation.
+        let empty = Rehearsal::InProcess {
+            library: "".into(),
+            spelling: Vec::new(),
+        };
+        assert!(!empty.is_complete());
+        assert_eq!(
+            plan_with(Some(empty)).validate_analysis(),
+            Err(crate::resolver::EvidenceError::Incomplete)
+        );
     }
 }

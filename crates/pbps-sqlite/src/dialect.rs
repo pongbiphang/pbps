@@ -218,6 +218,11 @@ impl Dialect for Sqlite {
         TRANSACTION
     }
 
+    /// `BEGIN`; holds a read snapshot without taking the write lock.
+    fn read_transaction_framing(&self, _zone: &SessionZone) -> TransactionFraming {
+        crate::READ
+    }
+
     /// None: a built-in SQLite expression cannot write, so a probe needs no
     /// transaction of its own to undo one.
     fn probe_framing(&self) -> Option<TransactionFraming> {
@@ -332,6 +337,11 @@ mod tests {
             TypeChangeRisk::Incompatible
         );
         assert_eq!(d.transaction_framing(&SessionZone::utc()), TRANSACTION);
+        assert_eq!(d.read_transaction_framing(&SessionZone::utc()), crate::READ);
+        assert_ne!(
+            d.read_transaction_framing(&SessionZone::utc()),
+            d.transaction_framing(&SessionZone::utc())
+        );
         assert_eq!(d.probe_framing(), None);
         assert_eq!(d.batch_separator(), None);
         assert!(

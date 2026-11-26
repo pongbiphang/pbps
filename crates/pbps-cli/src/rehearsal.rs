@@ -647,6 +647,9 @@ async fn run_statements(
     framed: Option<(&dyn Dialect, &SessionZone, bool)>,
     failed: impl Fn(usize, &str, &pbps_db::DbError) -> anyhow::Error,
 ) -> anyhow::Result<()> {
+    if statements.is_empty() {
+        return Ok(());
+    }
     let framing = framed.and_then(|(dialect, zone, transactional)| {
         transactional.then(|| dialect.transaction_framing(zone))
     });
