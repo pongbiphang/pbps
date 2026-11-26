@@ -101,7 +101,7 @@ fn name(qualified: &str) -> TableName {
 
 #[test]
 fn a_trigger_handover_is_pending_only_before_the_shared_schedule() {
-    use super::shadow::{Stage, judge_slots};
+    use super::shadow::{Stage, Verdict, Waiver, judge_slots};
     use pbps_model::{CheckConstraint, Module, ModuleId, ModuleKind};
     let trigger = ModuleId::Trigger {
         on: name("app.t"),
@@ -139,7 +139,7 @@ fn a_trigger_handover_is_pending_only_before_the_shared_schedule() {
     };
     let ops = Operations::of_plan(&plan.logical, ModuleEdits::Rebuilt);
     let dialect = Slotted { exact: true };
-    let (lines, failed) = judge_slots(
+    let findings = judge_slots(
         ops.as_slice(),
         &owners,
         before,
@@ -147,17 +147,26 @@ fn a_trigger_handover_is_pending_only_before_the_shared_schedule() {
         None,
         Stage::BeforeSchedule,
     );
-    assert!(!failed, "{lines:?}");
+    assert!(!findings.fails(), "{findings:?}");
     assert!(
-        lines
+        findings
+            .0
             .iter()
-            .any(|line| line.starts_with("scheduled slot held ")),
-        "{lines:?}"
+            .any(|f| f.line.starts_with("scheduled slot held ")
+                && f.verdict == Verdict::Waived(Waiver::Scheduled)),
+        "{findings:?}"
     );
     for stage in [Stage::Differ, Stage::Final] {
+        let findings = judge_slots(ops.as_slice(), &owners, before, &dialect, None, stage);
         assert!(
-            judge_slots(ops.as_slice(), &owners, before, &dialect, None, stage).1,
+            findings.fails(),
             "an unsatisfied handover is enforced after scheduling"
+        );
+        assert!(
+            findings
+                .0
+                .iter()
+                .any(|f| f.line.starts_with("slot held ") && f.verdict == Verdict::Fail)
         );
     }
     let ordered = crate::order::reordered_operations(&ops, &[1, 0]);
@@ -170,7 +179,7 @@ fn a_trigger_handover_is_pending_only_before_the_shared_schedule() {
             None,
             Stage::Final
         )
-        .1
+        .fails()
     );
 }
 
@@ -325,6 +334,46 @@ fn a_rename_into_a_name_still_held_is_refused() {
     let (wrong, _, effect_violations) = plan.run(&[1, 0], &exact, None);
     assert_eq!(held(&wrong), ["held app.b", "edge app.b"], "{wrong:?}");
     assert_eq!(effect_violations, 0, "the guard: only the slots see it");
+}
+
+#[test]
+fn a_lasting_slot_collision_is_waived_but_a_late_release_fails() {
+    use super::shadow::{Stage, Verdict, Waiver, judge_slots};
+    let plan = Plan::new(
+        &[("a", "app.a"), ("b", "app.b")],
+        &[("a", "app.b")],
+        vec![
+            drop_table("b", "app.b"),
+            rename_table("a", "app.a", "app.b"),
+        ],
+    );
+    let names = PlanNames::of(&plan.logical, &plan.after_ids).unwrap();
+    let owners = PlanOwners::new(names, &plan.before_ids, &plan.after_ids);
+    let before = Snapshot {
+        schema: &plan.before,
+        ids: &plan.before_ids,
+    };
+    let logical = Operations::of_plan(&plan.logical, ModuleEdits::InPlace);
+    let ops = crate::order::reordered_operations(&logical, &[1, 0]);
+    let exact = Slotted { exact: true };
+    let judge = |ops| judge_slots(ops, &owners, before, &exact, None, Stage::Final);
+    let lasting = judge(&ops.as_slice()[..1]);
+    assert!(!lasting.fails(), "{lasting:?}");
+    assert!(
+        lasting
+            .0
+            .iter()
+            .any(|f| f.line.starts_with("slot contested ")
+                && f.verdict == Verdict::Waived(Waiver::Contested))
+    );
+
+    let late = judge(ops.as_slice());
+    assert!(late.fails(), "{late:?}");
+    assert!(
+        late.0
+            .iter()
+            .any(|f| f.line.starts_with("slot held ") && f.verdict == Verdict::Fail)
+    );
 }
 
 /// A move to another schema passes through its old name there between its
@@ -1218,7 +1267,7 @@ impl pbps_model::operation::Owners for Unreadable<'_> {
 
 #[test]
 fn an_unreadable_baseline_name_reaches_the_catalog_and_replay_refusals_with_its_name() {
-    use super::shadow::{Stage, judge_slots};
+    use super::shadow::{Stage, Verdict, judge_slots};
     use pbps_model::operation::{OwnerError, Spelling};
     let plan = Plan::new(&[("t", "app.t")], &[], vec![drop_table("t", "app.t")]);
     let names = PlanNames::of(&plan.logical, &plan.after_ids).unwrap();
@@ -1256,7 +1305,7 @@ fn an_unreadable_baseline_name_reaches_the_catalog_and_replay_refusals_with_its_
         verify(ops.as_slice(), &slots, &dialect, None, &owners, before).err(),
         Some(broken.clone())
     );
-    let (lines, failed) = judge_slots(
+    let findings = judge_slots(
         ops.as_slice(),
         &owners,
         before,
@@ -1264,10 +1313,13 @@ fn an_unreadable_baseline_name_reaches_the_catalog_and_replay_refusals_with_its_
         None,
         Stage::Final,
     );
-    assert!(failed, "{lines:?}");
+    assert!(findings.fails(), "{findings:?}");
     assert!(
-        lines.iter().any(|line| line.contains("app.t")),
-        "the failing line names the table: {lines:?}"
+        findings
+            .0
+            .iter()
+            .any(|f| f.line.contains("app.t") && f.verdict == Verdict::Fail),
+        "the failing line names the table: {findings:?}"
     );
 
     // A table the project does not declare is no refusal: it holds no name.
