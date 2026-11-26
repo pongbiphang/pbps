@@ -1,17 +1,13 @@
 //! SQLite's apply session (#2950).
 //!
-//! Every required method of [`ApplySession`] falls into one of three kinds,
+//! Every required method of [`ApplySession`] falls into one of two kinds,
 //! named in its doc comment:
 //! - *does not exist on this engine* (no roles, routines, user-defined types,
 //!   extensions, partitions, temporal tables, or row security): returns the
 //!   true constant for SQLite plans, and refuses a non-empty foreign request
 //!   where the input can carry one;
 //! - *exists in `pbps-sqlite` or `pbps-db` already*: calls it in place on the
-//!   calling thread through `Conn::sqlite()` (DEC-2950.17);
-//! - *needs logic nobody has written yet* (`requirement`):
-//!   refuses by name naming SQLite and the unsupported operation, never
-//!   returning an empty answer that would read as "nothing blocks" or
-//!   "nothing depends".
+//!   calling thread through `Conn::sqlite()` (DEC-2950.17).
 
 use super::*;
 use crate::engine::plan_session::sqlite::{sqlite_conn, sqlite_has_no_roles};
@@ -73,20 +69,18 @@ impl ApplySession for Sqlite {
         let _ = sqlite_conn(conn)?;
         Ok(None)
     }
-    /// Needs logic nobody has written yet: `pbps-sqlite` evaluates drop
-    /// requirements at apply time, but has no binder that extracts which
-    /// columns a predicate reads. Refused by name rather than answered empty.
+    /// Exists in `pbps-sqlite` already: vets `predicate` against `table`
+    /// through SQLite's authorizer without reading a row, returning the
+    /// table's ordinary columns that `predicate` reads.
     async fn requirement(
         &self,
-        _conn: &mut Conn,
+        conn: &mut Conn,
         _admission: &RoutineAdmission,
-        _table: &TableName,
-        _predicate: &str,
+        table: &TableName,
+        predicate: &str,
     ) -> anyhow::Result<BTreeSet<pbps_model::ColumnName>> {
-        anyhow::bail!(
-            "SQLite does not support binding drop-requirement predicates to their referenced \
-             columns yet"
-        )
+        let c = sqlite_conn(conn)?;
+        pbps_sqlite::drop_requirements::vet(c, table, predicate).map_err(anyhow::Error::msg)
     }
     /// Exists in `pbps-sqlite` already: evaluates the statement's drop guard
     /// in place via `pbps_sqlite::drop_requirements::check`.
@@ -1006,19 +1000,50 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_step_b_methods_refuse_naming_sqlite_and_what_is_unsupported() {
+    fn requirement_vets_predicates_and_returns_canonical_columns_on_a_real_sqlite_file() {
         let (_tmp, mut conn) = TempDb::create();
+        now(conn.execute(
+            "CREATE TABLE items (Id INTEGER PRIMARY KEY, Qty INTEGER, Note TEXT, \
+             DoubleQty INTEGER GENERATED ALWAYS AS (Qty * 2) VIRTUAL)",
+        ))
+        .expect("table");
+        now(conn.execute("CREATE VIEW v_items AS SELECT Id, Qty FROM items")).expect("view");
         let dialect = Sqlite::default();
         let admission = RoutineAdmission::default();
+        let table = TableName::new("main", "items");
 
-        // 1. requirement (only remaining unimplemented Step B method on ApplySession)
-        let req =
-            now(dialect.requirement(&mut conn, &admission, &TableName::new("main", "t"), "x > 0"))
-                .unwrap_err();
-        assert!(
-            req.to_string().contains("SQLite") && req.to_string().contains("drop-requirement"),
-            "{req}"
+        let cols = now(dialect.requirement(
+            &mut conn,
+            &admission,
+            &table,
+            "qty >= 0 AND note LIKE 'ok%'",
+        ))
+        .expect("valid predicate passes");
+        assert_eq!(
+            cols,
+            BTreeSet::from([
+                pbps_model::ColumnName::new("Qty"),
+                pbps_model::ColumnName::new("Note"),
+            ])
         );
+
+        // Negative cases: unknown column, double-quoted typo, function call, subquery,
+        // bound parameter, generated column, view, and absent table all refuse.
+        for (target, pred, expected) in [
+            (&table, "missing > 0", "SQLite code 1"),
+            (&table, "\"missing\" = 'x'", "SQLite code 1"),
+            (&table, "random() > 0", "calls function `random`"),
+            (&table, "(SELECT 1) = 1", "subquery"),
+            (&table, "qty = ?", "bound parameter"),
+            (&table, "DoubleQty > 0", "virtual generated column"),
+            (&TableName::new("main", "v_items"), "Id > 0", "view"),
+            (&TableName::new("main", "gone"), "1 = 1", "does not exist"),
+        ] {
+            let err = now(dialect.requirement(&mut conn, &admission, target, pred))
+                .expect_err(pred)
+                .to_string();
+            assert!(err.contains(expected), "{pred}: {err}");
+        }
     }
 
     #[test]

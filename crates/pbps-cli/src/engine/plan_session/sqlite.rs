@@ -696,7 +696,8 @@ impl PlanSession for Sqlite {
     /// `WHERE` predicate has nothing to vet. A recorded `USING` conversion is
     /// refused by name via [`ApplySession::conversions`]. Any `drop_guard`
     /// runs through [`vet_drop_requirements`] and [`ApplySession::requirement`],
-    /// which refuses by name until SQLite's predicate binder is built.
+    /// binding each predicate through SQLite's authorizer and refusing plans
+    /// that drop, rename or retype a column a requirement reads.
     async fn vet_plan_sites(
         &self,
         state: &PlanState,
@@ -1473,7 +1474,8 @@ mod tests {
     }
 
     #[test]
-    fn vet_plan_sites_accepts_table_expressions_and_refuses_using_and_guarded_drops() {
+    fn vet_plan_sites_accepts_table_expressions_and_guarded_drops_and_refuses_using_and_referenced_column_edits()
+     {
         use pbps_model::{
             Change, CheckConstraint, Column, ColumnChange, ConstraintChange, DropGuard,
             DropRequirement, Index, IndexChange, IndexColumn, PlannedChange, Table, TableChange,
@@ -1481,6 +1483,10 @@ mod tests {
         };
 
         let (_tmp, mut conn) = TempDb::create();
+        now(conn.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, active INTEGER NOT NULL, note TEXT)",
+        ))
+        .expect("seed items");
         let dialect = Sqlite::default();
         let state = PlanState::default();
         let table_name = TableName::new("main", "items");
@@ -1575,42 +1581,126 @@ mod tests {
             "{using_err}"
         );
 
-        // Negative: a guarded drop does not pass unvetted; it reaches
-        // `ApplySession::requirement`, which refuses naming SQLite.
-        let mut requirements = BTreeMap::new();
-        requirements.insert(
-            t_uid.clone(),
-            DropRequirement {
-                table_uid: t_uid.clone(),
-                predicate: "active = 0".into(),
-                required_at: "2026-01-01T00:00:00Z".into(),
-                operator: "test".into(),
-            },
-        );
+        // Positive: a valid guarded drop passes `vet_plan_sites`.
+        let one_guard = |owner: &pbps_model::Uid, predicate: &str| DropGuard {
+            table_uid: t_uid.clone(),
+            table: table_name.clone(),
+            detach_from: None,
+            requirements: [(
+                owner.clone(),
+                DropRequirement {
+                    table_uid: t_uid.clone(),
+                    predicate: predicate.into(),
+                    required_at: "2026-01-01T00:00:00Z".into(),
+                    operator: "test".into(),
+                },
+            )]
+            .into(),
+        };
         let mut guarded = PlannedChange::new(Change::Table(TableChange::DropTable {
             uid: t_uid.clone(),
             name: table_name.clone(),
             detach_from: None,
         }));
-        guarded.drop_guard = Some(DropGuard {
-            table_uid: t_uid,
-            table: table_name,
-            detach_from: None,
-            requirements,
-        });
+        guarded.drop_guard = Some(one_guard(&t_uid, "active = 0"));
         let guard_cs = ChangeSet {
             changes: vec![guarded],
         };
         let guard_ids = crate::plan_fixture::ids(&guard_cs);
         let guard_names =
             pbps_model::plan_names::PlanNames::of(&guard_cs.changes, &guard_ids).expect("names");
-        let guard_err =
-            now(dialect.vet_plan_sites(&state, &mut conn, &guard_names, &mut |_| {})).unwrap_err();
-        assert!(
-            guard_err.to_string().contains("SQLite")
-                && guard_err.to_string().contains("drop-requirement"),
-            "{guard_err}"
+        now(dialect.vet_plan_sites(&state, &mut conn, &guard_names, &mut |_| {}))
+            .expect("valid guarded drop passes vet_plan_sites");
+
+        // Negative: a guarded drop whose predicate reads a column this plan drops,
+        // renames, or retypes is refused with the split-plan remedy (even when the
+        // predicate spells the column in another ASCII case).
+        let active_uid = uid(pbps_model::UidKind::Column, "main.items.active");
+        let note_uid = uid(pbps_model::UidKind::Column, "main.items.note");
+        let mut base_ids = IdsFile::default();
+        base_ids.tables.insert(t_uid.clone(), table_name.clone());
+        base_ids.columns.insert(
+            uid(pbps_model::UidKind::Column, "main.items.id"),
+            table_name.column("id"),
         );
+        base_ids
+            .columns
+            .insert(active_uid.clone(), table_name.column("active"));
+        base_ids
+            .columns
+            .insert(note_uid.clone(), table_name.column("note"));
+
+        let mut drop_note = PlannedChange::new(Change::Column(ColumnChange::DropColumn {
+            uid: note_uid.clone(),
+            column: table_name.column("note"),
+        }));
+        drop_note.drop_guard = Some(one_guard(&note_uid, "ACTIVE = 0"));
+
+        for (label, extra, after_ids) in [
+            (
+                "drop referenced column",
+                Change::Column(ColumnChange::DropColumn {
+                    uid: active_uid.clone(),
+                    column: table_name.column("active"),
+                }),
+                {
+                    let mut ids = base_ids.clone();
+                    ids.columns.remove(&note_uid);
+                    ids.columns.remove(&active_uid);
+                    ids
+                },
+            ),
+            (
+                "rename referenced column",
+                Change::Column(ColumnChange::RenameColumn {
+                    uid: active_uid.clone(),
+                    table: table_name.clone(),
+                    from: "active".into(),
+                    to: "is_active".into(),
+                    table_was: None,
+                }),
+                {
+                    let mut ids = base_ids.clone();
+                    ids.columns.remove(&note_uid);
+                    ids.columns
+                        .insert(active_uid.clone(), table_name.column("is_active"));
+                    ids
+                },
+            ),
+            (
+                "retype referenced column",
+                Change::Column(ColumnChange::AlterColumnType {
+                    uid: active_uid.clone(),
+                    column: table_name.column("active"),
+                    from: "integer".parse().expect("type"),
+                    to: "text".parse().expect("type"),
+                    from_nullable: false,
+                    to_nullable: false,
+                    from_collation: None,
+                    to_collation: None,
+                    through_external_partitions: false,
+                    using: None,
+                }),
+                {
+                    let mut ids = base_ids.clone();
+                    ids.columns.remove(&note_uid);
+                    ids
+                },
+            ),
+        ] {
+            let cs = ChangeSet {
+                changes: vec![drop_note.clone(), PlannedChange::new(extra)],
+            };
+            let names =
+                pbps_model::plan_names::PlanNames::of(&cs.changes, &after_ids).expect(label);
+            let err = now(dialect.vet_plan_sites(&state, &mut conn, &names, &mut |_| {}))
+                .expect_err(label)
+                .to_string();
+            assert!(
+                err.contains("names a column changed by this plan; split the plan"),
+                "{label}: {err}"
+            );
+        }
     }
 
     fn int_col() -> pbps_model::Column {
@@ -2622,19 +2712,19 @@ mod tests {
 
         // Run every PlanSession position in `plan_db.rs` order and return
         // `Ok(())` or `Err((position_name, error_message))`.
-        let run_all_positions = |seed_sql: &[&str],
-                                 base: &Schema,
-                                 base_ids: &IdsFile,
-                                 desired: &Schema,
-                                 desired_ids: &IdsFile,
-                                 changes: Vec<Change>|
+        let run_all_planned = |seed_sql: &[&str],
+                               base: &Schema,
+                               base_ids: &IdsFile,
+                               desired: &Schema,
+                               desired_ids: &IdsFile,
+                               changes: Vec<pbps_model::PlannedChange>|
          -> Result<(), (&'static str, String)> {
             let (_tmp, mut conn) = TempDb::create();
             for sql in seed_sql {
                 now(conn.execute(sql)).expect(sql);
             }
             let scoped = scoped_of(base, base_ids);
-            let mut plan = pbps_diff::order::propose(change_set(changes));
+            let mut plan = pbps_diff::order::propose(ChangeSet { changes });
             let hints = pbps_model::Hints::default();
             let baseline = StateSnapshot::new(
                 pbps_model::StateKind::Baseline,
@@ -2724,6 +2814,22 @@ mod tests {
             now(dialect.server_limits(&mut conn, &plan))
                 .map_err(|e| ("server_limits", e.to_string()))?;
             Ok(())
+        };
+        let run_all_positions = |seed_sql: &[&str],
+                                 base: &Schema,
+                                 base_ids: &IdsFile,
+                                 desired: &Schema,
+                                 desired_ids: &IdsFile,
+                                 changes: Vec<Change>|
+         -> Result<(), (&'static str, String)> {
+            run_all_planned(
+                seed_sql,
+                base,
+                base_ids,
+                desired,
+                desired_ids,
+                change_set(changes).changes,
+            )
         };
 
         // Shared baseline with parent & items tables.
@@ -3037,7 +3143,7 @@ mod tests {
                 &desired,
                 &desired_ids,
                 vec![Change::Column(ColumnChange::RenameColumn {
-                    uid: qty_uid,
+                    uid: qty_uid.clone(),
                     table: TableName::new("main", "items"),
                     from: "qty".into(),
                     to: "amount".into(),
@@ -3378,49 +3484,121 @@ mod tests {
             assert_eq!(pos, "check_final_order", "{err}");
             assert!(err.contains("SQLite") && err.contains("rebuild"), "{err}");
         }
-        // - Guarded drop (`drop_guard` requirement) -> `vet_plan_sites` (`ApplySession::requirement`).
+        // - Guarded drops (`drop-table` with one requirement, `drop-table` with several
+        //   requirements, and `drop-column`) now pass every PlanSession position.
         {
-            let (_tmp, mut conn) = TempDb::create();
-            for sql in seed {
-                now(conn.execute(sql)).expect(sql);
-            }
-            let mut pc = pbps_model::PlannedChange::new(Change::Table(TableChange::DropTable {
-                uid: parent_uid.clone(),
-                name: TableName::new("main", "parent"),
-                detach_from: None,
-            }));
-            let mut requirements = BTreeMap::new();
-            requirements.insert(
-                parent_uid.clone(),
-                pbps_model::DropRequirement {
-                    table_uid: parent_uid.clone(),
-                    predicate: "id > 0".into(),
-                    required_at: "2026-01-01T00:00:00Z".into(),
-                    operator: "test".into(),
-                },
-            );
-            pc.drop_guard = Some(pbps_model::DropGuard {
-                table_uid: parent_uid.clone(),
-                table: TableName::new("main", "parent"),
-                detach_from: None,
-                requirements,
-            });
-            let mut after_ids = base_ids.clone();
-            after_ids.tables.remove(&parent_uid);
-            after_ids
+            let mk_guard =
+                |table_uid: &pbps_model::Uid, table: &str, reqs: &[(&pbps_model::Uid, &str)]| {
+                    pbps_model::DropGuard {
+                        table_uid: table_uid.clone(),
+                        table: TableName::new("main", table),
+                        detach_from: None,
+                        requirements: reqs
+                            .iter()
+                            .map(|(u, pred)| {
+                                (
+                                    (*u).clone(),
+                                    pbps_model::DropRequirement {
+                                        table_uid: table_uid.clone(),
+                                        predicate: (*pred).into(),
+                                        required_at: "2026-01-01T00:00:00Z".into(),
+                                        operator: "test".into(),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    }
+                };
+            let mut desired_drop_items = base.clone();
+            desired_drop_items
+                .tables
+                .remove(&TableName::new("main", "items"));
+            let mut after_drop_items_ids = base_ids.clone();
+            after_drop_items_ids.tables.remove(&items_uid);
+            after_drop_items_ids
                 .columns
-                .retain(|_, c| c.table != TableName::new("main", "parent"));
-            let names =
-                pbps_model::plan_names::PlanNames::of(std::slice::from_ref(&pc), &after_ids)
-                    .expect("names");
-            let err =
-                now(dialect.vet_plan_sites(&PlanState::default(), &mut conn, &names, &mut |_| {}))
-                    .unwrap_err()
-                    .to_string();
-            assert!(
-                err.contains("SQLite") && err.contains("drop-requirement"),
-                "{err}"
-            );
+                .retain(|_, c| c.table != TableName::new("main", "items"));
+
+            for (label, reqs) in [
+                ("one requirement", vec![(&items_uid, "qty >= 0")]),
+                (
+                    "several requirements",
+                    vec![
+                        (&items_uid, "qty >= 0"),
+                        (&qty_uid, "id > 0 AND qty IS NOT NULL"),
+                    ],
+                ),
+            ] {
+                let mut pc =
+                    pbps_model::PlannedChange::new(Change::Table(TableChange::DropTable {
+                        uid: items_uid.clone(),
+                        name: TableName::new("main", "items"),
+                        detach_from: None,
+                    }));
+                pc.drop_guard = Some(mk_guard(&items_uid, "items", &reqs));
+                run_all_planned(
+                    &seed,
+                    &base,
+                    &base_ids,
+                    &desired_drop_items,
+                    &after_drop_items_ids,
+                    vec![pc],
+                )
+                .unwrap_or_else(|e| panic!("guarded drop-table ({label}) failed: {e:?}"));
+            }
+
+            let mut desired_drop_qty = base.clone();
+            desired_drop_qty
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items")
+                .columns
+                .shift_remove("qty");
+            let mut after_drop_qty_ids = base_ids.clone();
+            after_drop_qty_ids.columns.remove(&qty_uid);
+            let mut drop_col =
+                pbps_model::PlannedChange::new(Change::Column(ColumnChange::DropColumn {
+                    uid: qty_uid.clone(),
+                    column: TableName::new("main", "items").column("qty"),
+                }));
+            drop_col.drop_guard = Some(mk_guard(
+                &items_uid,
+                "items",
+                &[(&qty_uid, "id > 0 AND qty = 0")],
+            ));
+            run_all_planned(
+                &seed,
+                &base,
+                &base_ids,
+                &desired_drop_qty,
+                &after_drop_qty_ids,
+                vec![drop_col],
+            )
+            .expect("guarded drop-column passes every PlanSession position");
+
+            // Negative: a guarded drop whose predicate calls a disallowed function fails at `vet_plan_sites`.
+            let mut bad_guard =
+                pbps_model::PlannedChange::new(Change::Table(TableChange::DropTable {
+                    uid: items_uid.clone(),
+                    name: TableName::new("main", "items"),
+                    detach_from: None,
+                }));
+            bad_guard.drop_guard = Some(mk_guard(
+                &items_uid,
+                "items",
+                &[(&items_uid, "random() > 0")],
+            ));
+            let (pos, err) = run_all_planned(
+                &seed,
+                &base,
+                &base_ids,
+                &desired_drop_items,
+                &after_drop_items_ids,
+                vec![bad_guard],
+            )
+            .unwrap_err();
+            assert_eq!(pos, "vet_plan_sites", "{err}");
+            assert!(err.contains("calls function `random`"), "{err}");
         }
     }
 
