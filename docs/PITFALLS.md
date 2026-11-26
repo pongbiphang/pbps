@@ -2226,6 +2226,25 @@ Three traps sat inside the fix, and each of them is a measurement:
   referencing side has to follow those columns by name: a partition can number
   its columns differently from the root it inherits them from.
 
+## What the engine makes for a declared object, read as somebody else's
+
+The resolver's closing check admitted a record the plan did not seal only where
+the declarations named its owner. An `ATTACH`, a partition's creation or a
+parent's new key makes the engine keep indexes, constraints, triggers and their
+dependency rows on a partition, which no declaration names, so such a resolved
+plan was refused at apply as if another session had made them (#3075).
+Its names were the engine's too: a copy the scratch named otherwise was looked
+for and not found.
+
+**The shape:** ownership proved only from what the declarations name, for an
+engine that makes objects of its own for them.
+
+**The rule.** What the engine ties to a declared object by a dependency of its
+own belongs to what that dependency says, and nothing recorded under a name the
+engine chose may be required under that name. Measure which dependency ties it
+on both engines (DEC-3075.1), and keep a negative that an undeclared object on
+the same table still refuses.
+
 ## YAML and file-format traps
 
 A PostgreSQL policy target `public` is the scalar target for every role. Inside

@@ -155,6 +155,9 @@ pub(super) fn classify(
         .map_err(|_| Uncovered::class("recorded-uid", "recorded managed identities are invalid"))?;
     let mut owned = BTreeMap::new();
     let mut inherited_columns = BTreeSet::new();
+    // Each declared partition's relation, which the engine's own copies on it
+    // are tied to.
+    let mut partitions = BTreeMap::new();
     // Asked once per declared table and column (#1870).
     let recorded_names = recorded.ids.index();
     // Each declared `serial`'s exact sequence, by the column that owns it
@@ -244,6 +247,39 @@ pub(super) fn classify(
                         }
                     }
                 }
+                // A check an ancestor declares is on the partition under the
+                // same name, made there or taken from the table by `ATTACH`;
+                // no dependency ties the two, only the name and the count of
+                // parents it is inherited from (DEC-3075.1).
+                let inherited_checks: BTreeSet<_> = chain
+                    .iter()
+                    .skip(1)
+                    .flat_map(|(_, ancestor)| ancestor.checks.keys())
+                    .filter(|check| !table.checks.contains_key(*check))
+                    .collect();
+                for object in capture.inputs.keys().filter(|object| {
+                    object.class == "pg_constraint" && object.signature.get(1) == Some(&table_id)
+                }) {
+                    if !inherited_checks
+                        .iter()
+                        .any(|check| object.name == [check.raw()])
+                        || property(capture, object, "contype")? != Some("c")
+                    {
+                        continue;
+                    }
+                    let parents = capture
+                        .inputs
+                        .get(object)
+                        .and_then(|input| input.properties.get("coninhcount"))
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            Uncovered::object(object, "declared check's inheritance is unreadable")
+                        })?;
+                    if parents > 0 {
+                        assign(&mut owned, object.clone(), table_owner.clone())?;
+                    }
+                }
+                partitions.insert(table_id.clone(), table_owner.clone());
             }
         }
         // A policy is an exact declared child of this UID-proven table,
@@ -633,6 +669,17 @@ pub(super) fn classify(
         }
     }
 
+    // What the engine keeps on a partition for one of an ancestor's objects,
+    // by the dependency that ties it to that partition.
+    let on_partition: BTreeMap<_, _> = capture
+        .inputs
+        .keys()
+        .filter(|id| id.class == "pg_depend" && id.name == ["S"])
+        .filter_map(|id| match id.signature.as_slice() {
+            [made, partition] => Some((made, partitions.get(partition)?)),
+            _ => None,
+        })
+        .collect();
     // Only measured, kind-specific internal edges inherit root authority.
     // A normal reference never does, and automatic links need an independently
     // declared exact surface above. Repeated passes cover row type -> array.
@@ -644,16 +691,29 @@ pub(super) fn classify(
             else {
                 continue;
             };
-            if !matches!(kind.as_str(), "i" | "a")
+            if !matches!(kind.as_str(), "i" | "a" | "P")
                 || owned.contains_key(made)
                 || !capture.inputs.contains_key(made)
             {
                 continue;
             }
-            let Some(owner) = owned.get(maker).cloned() else {
+            let Some(mut owner) = owned.get(maker).cloned() else {
                 continue;
             };
-            let allowed = if kind == "a" {
+            let allowed = if kind == "P" {
+                // A partition's copy of a declared index, key, foreign key or
+                // trigger is the partition's, whether the engine built it or
+                // took one the table already had: `P` ties it to what it
+                // copies, `S` to the partition (DEC-3075.1). Which index an
+                // `ATTACH` takes is read from the engine, never predicted.
+                match on_partition.get(made) {
+                    Some(partition) => {
+                        owner = (*partition).clone();
+                        true
+                    }
+                    None => false,
+                }
+            } else if kind == "a" {
                 // PostgreSQL 18's not-null constraint has an automatic edge
                 // to the exact independently qualified column, including a
                 // partition's inherited user column (DEC-1566.1), and a
@@ -693,6 +753,25 @@ pub(super) fn classify(
                         made.signature.get(1) == Some(maker)
                     }
                     ("pg_attrdef", "column", Surface::Column(_)) => true,
+                    // The copy of a foreign key that stands for one partition
+                    // of the table it references, on the referencing table: it
+                    // comes and goes with that partition (DEC-3075.1).
+                    ("pg_constraint", "pg_constraint", Surface::Table(_)) => {
+                        let referenced = capture
+                            .inputs
+                            .get(made)
+                            .and_then(|input| input.properties.get("confrelid"))
+                            .and_then(|value| {
+                                serde_json::from_value::<ObjectIdentity>(value.clone()).ok()
+                            });
+                        match referenced.as_ref().and_then(|table| partitions.get(table)) {
+                            Some(partition) => {
+                                owner = partition.clone();
+                                true
+                            }
+                            None => false,
+                        }
+                    }
                     _ => false,
                 }
             };

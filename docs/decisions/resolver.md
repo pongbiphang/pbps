@@ -1353,6 +1353,10 @@ The authorization condition covers only the deployer's schema authorization,
 which is what name lookup depends on; an object grant does not change a
 binding.
 
+*Amended by [DEC-3075.1](#dec-3075-1): the copies PostgreSQL keeps on a
+partition for an ancestor's declared objects belong to that partition, and are
+sealed without bindings.*
+
 <a id="dec-1498-1"></a>
 
 **DEC-1498.1. The resolver's ordering graph tells tables apart by recorded UID, and an observation keeps each side under its own spelling.**
@@ -7071,3 +7075,74 @@ Rejected:
 - **Comparing the engine's sentences.** A finding was the plan's when its words differed from the words before. The words quote names a plan may change (measured: `foreign key mismatch - "c" referencing "p"` becomes `referencing "p2"` after a rename of the parent) and are the engine's to reword, so no translation of them is complete. What failed before the plan and fails after it is not the plan's, whatever the two sentences say (#3016). The cost: a thing already broken that a plan breaks in another way is not charged to the plan; it did not work before either, and `Resolution::failing` of the resolution from before names everything that was already broken, as a note.
 - **Reading a question that could not be asked before the plan as one that resolved.** A key check that fails counts no orphan row, and a view whose columns cannot be read has no update to compile; a plan that mends what stood in the way had what was there all along counted for the first time, and a valid plan was refused (three review findings of one shape, #3021). A question has three answers: the pass records `Unknown` for what it could not ask, `new_since` charges a plan only for what was asked before it, and `not_compared` names the rest as a note. The cost: a new break on something that could not be asked before the plan is a note and not a refusal.
 - **A silent downgrade above the limit.** A rehearsal that says "converged" about a smaller thing than was asked is the failure this tool exists to prevent.
+
+<a id="dec-3075-1"></a>
+
+**DEC-3075.1. What PostgreSQL keeps on a partition for an ancestor's declared
+object belongs to the partition, and binds nothing of its own (#3075; amends
+DEC-1274.1 and DEC-614.2).**
+
+**Context.** The closing check admits a record the seal does not hold only
+where a change of the plan owns it, and ownership is proved from the
+declarations (DEC-614.2). A partition declares none of the copies the engine
+keeps on it: its indexes, keys, foreign keys and row triggers copied from its
+parent, and its inherited checks. So a resolved plan that attached a partition
+under such a parent was refused at apply, while the same plan with no resolver
+applied.
+
+Measured on 16.15 and 18.6, alike on both, with an expression index on the
+parent so that the resolver settles each plan; "before" is the base commit:
+
+| Plan | Without the resolver | Resolved, before | Resolved, after |
+|---|---|---|---|
+| attach: bare table, own index taken, own expression index, keys and foreign keys, a referenced parent, a copy's name already held on the target | applies | refused at apply | applies |
+| create a partition | applies | refused at apply | applies |
+| add a parent's index, or its unique constraint and foreign key | applies | refused at apply | applies |
+| drop a parent's index | applies | the closing read fails | applies |
+| detach, or drop, a partition | applies | refused at planning | applies |
+| add a parent's index whose copy takes a name another copy has | applies | refused at apply | refused at apply |
+
+**Decision.** In PostgreSQL's ownership classification, a record on a declared
+partition belongs to that partition's table surface when the engine shows it
+stands there for an ancestor's declared object:
+
+- an index, a key, a foreign key or a trigger with the dependency `P` on a
+  declared object and `S` on the partition, whether the engine built it or
+  took one the table had. Which one it takes is read, never predicted;
+- a check the partition inherits (`coninhcount` above zero) under the name of
+  one an ancestor declares and the partition does not;
+- on a referencing table, the copy of a declared foreign key that stands for one
+  partition of the referenced table: an internal dependency on that key, and
+  `confrelid` naming the partition.
+
+Their internal and metadata rows follow by the existing rules. No model rule
+changes: the copies are then in the inventories of the transitions that touch
+the partition, are rereadable or vanishable as its other records are, and a
+change of the parent's carries them as references through the dependency that
+ties each to the object it copies.
+
+A record the engine keeps as a copy (`P`) is sealed without bindings. Its
+expression is its original's, which the original's record holds. Its name is the
+engine's to choose, or the one the table's own object had, so a binding kept
+under it was looked for under another name: measured, an attach whose copy's
+name an unmanaged relation held on the target alone failed its closing read.
+
+Nothing nobody declared is credited: an index with no `P`, a copy of an
+undeclared index, and a copy on a table that is no declared partition stay
+unqualified. Live on 16 and 18, an index made on the attached table is refused,
+before apply by the drift check and during it by the read-back; a statistics
+object made there during apply fails the closing read. The closing rule's own
+refusal of an unowned record is pinned by the unit tests.
+
+A resolved plan sealed by an earlier build, over a standing copy that binds
+something, is refused at its opening check, since the copy no longer carries
+bindings: plan it again. No format number moves (DEC-2412.3).
+
+**Open.** A parent's new index whose copy takes the name another of its copies
+has on a partition. The engine named the two the other way round on scratch, so
+the new copy's dependency and inheritance rows arrive under names no transition
+lists, on a partition no change of the plan touches. Refused as before.
+
+Pinned by `partition_copy_tests.rs` (pbps-pg),
+`an_attached_tables_copies_are_the_attachs_and_an_unrelated_index_is_not`, and
+on 16 and 18 by `support/resolved_attach3075.rs`.

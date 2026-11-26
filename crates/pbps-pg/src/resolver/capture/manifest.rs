@@ -554,6 +554,7 @@ pub(super) fn finish(
             return Err(Uncovered::object(&object, "duplicate dependency identity"));
         }
     }
+    unbind_partition_copies(&mut inputs);
     Ok(CapturedInputs {
         session: read.session,
         baseline: read.baseline,
@@ -566,6 +567,31 @@ pub(super) fn finish(
         limitations: prepared.limitations,
         dropped: read.dropped,
     })
+}
+
+/// Takes the bindings off every copy the engine keeps on a partition for one
+/// of an ancestor's objects (an index, a trigger), which `P` marks. A copy
+/// binds what its original binds, and the original's record holds that. The
+/// copy's name is the engine's to choose, or the one a table's own object had,
+/// so a binding recorded under it would be looked for on another copy, or on
+/// none, wherever two reads named the copies differently (DEC-3075.1).
+fn unbind_partition_copies(inputs: &mut BTreeMap<ObjectIdentity, Input>) {
+    let copies: BTreeSet<ObjectIdentity> = inputs
+        .keys()
+        .filter(|id| id.class == "pg_depend" && id.name == ["P"])
+        .filter_map(|id| id.signature.first().cloned())
+        .collect();
+    for (object, input) in inputs {
+        // An index's expressions are on its `pg_index` row, named by it.
+        let subject = if object.class == "pg_index" {
+            object.signature.first()
+        } else {
+            Some(object)
+        };
+        if subject.is_some_and(|subject| copies.contains(subject)) {
+            input.bindings.clear();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -600,6 +626,8 @@ mod tests {
 mod exclusion_ownership_tests;
 #[cfg(all(test, unix))]
 mod guard_tests;
+#[cfg(test)]
+mod partition_copy_tests;
 #[cfg(test)]
 mod type_ownership_tests;
 #[cfg(all(test, unix))]
