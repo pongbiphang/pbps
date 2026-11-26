@@ -2032,3 +2032,48 @@ fn a_sibling_unique_index_covers_whatever_the_case_of_its_collation_name() {
         reports[0].blocking
     );
 }
+
+#[test]
+fn a_primary_key_of_another_collation_does_not_cover_a_dropped_unique_index() {
+    let mut db = Fresh::file();
+    let c = db.connection();
+    c.execute_batch(
+        "CREATE TABLE p (x TEXT COLLATE BINARY, PRIMARY KEY (x COLLATE NOCASE)); \
+         CREATE UNIQUE INDEX ix_binary ON p(x COLLATE BINARY); \
+         CREATE TABLE child (id INTEGER PRIMARY KEY, px TEXT, \
+           CONSTRAINT fk_x FOREIGN KEY (px) REFERENCES p(x)); \
+         CREATE TABLE q (id INTEGER PRIMARY KEY, y INTEGER); \
+         CREATE UNIQUE INDEX ix_id ON q(id); \
+         CREATE TABLE q_child (id INTEGER PRIMARY KEY, qid INTEGER, \
+           CONSTRAINT fk_q FOREIGN KEY (qid) REFERENCES q(id))",
+    )
+    .expect("setup");
+    // Measured: without `ix_binary` the key has no index of the column's own
+    // collation, and a write to the child reports a mismatch.
+    c.execute_batch("SAVEPOINT m; DROP INDEX ix_binary")
+        .expect("SQLite permits the drop");
+    let mismatch = c
+        .execute_batch("INSERT INTO p VALUES ('a'); INSERT INTO child VALUES (1, 'a')")
+        .expect_err("the key no longer has a parent index")
+        .to_string();
+    assert!(mismatch.contains("foreign key mismatch"), "{mismatch}");
+    c.execute_batch("ROLLBACK TO m; RELEASE m").expect("undo");
+
+    let (stored, stored_ids) = seed_stored(&[
+        ("p", &["x"]),
+        ("child", &["id", "px"]),
+        ("q", &["id", "y"]),
+        ("q_child", &["id", "qid"]),
+    ]);
+    let reports = drop_eval(c, &stored, &stored_ids, vec![drop_idx("p", "ix_binary")])
+        .expect("the catalog is readable");
+    assert!(
+        reports[0].blocking.iter().any(|b| b.contains("fk_x")),
+        "{:?}",
+        reports[0].blocking
+    );
+    // Negative: a rowid primary key needs no index, so it covers the column.
+    let reports = drop_eval(c, &stored, &stored_ids, vec![drop_idx("q", "ix_id")])
+        .expect("the catalog is readable");
+    assert!(reports[0].blocking.is_empty(), "{:?}", reports[0].blocking);
+}

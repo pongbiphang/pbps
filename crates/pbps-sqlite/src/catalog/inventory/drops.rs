@@ -473,7 +473,12 @@ impl<'a> State<'a> {
             .map(|c| ident::fold(&c.name).into_owned())
             .collect();
         let tf = ident::fold(tname);
-        let covered = pk_cols == idx_cols
+        // A rowid primary key has no index and covers its column by itself. Any
+        // other primary key is an index in this list, and covers only as a
+        // sibling does, collations included: measured, a primary key of
+        // another collation leaves the foreign key mismatched.
+        let rowid_key = !indexes.iter().any(|o| o.origin == "pk");
+        let covered = (rowid_key && pk_cols == idx_cols)
             || indexes.iter().any(|o| {
                 !ident::same(&o.name, &ix.name)
                     && !self
