@@ -455,3 +455,40 @@ fn a_kept_engine_built_in_record_that_changed_is_refused_at_closing() {
         "{found:?}"
     );
 }
+
+/// What an `ATTACH` leaves on the table is the attach's: each copy of one of
+/// the parent's objects, whether the engine built it or took one the table had
+/// under its own name, which the seal holds under another name or not at all
+/// (#3075). An index no change explains is still refused on the same table.
+#[test]
+fn an_attached_tables_copies_are_the_attachs_and_an_unrelated_index_is_not() {
+    let (sealed, mut transitions) = closing();
+    transitions.push(ObjectTransition {
+        surface: Surface::Table(TableName::new("app", "late")),
+        before: BTreeSet::new(),
+        after: BTreeSet::new(),
+        references: BTreeSet::new(),
+    });
+    let on_late = |name: &str| {
+        let mut p = record(&object("pg_class", name), "09", &[]);
+        p.ownership = ObjectOwnership::Surface(Surface::Table(TableName::new("app", "late")));
+        p
+    };
+    // Built under the engine's name, and taken under the table's own.
+    for copy in ["late_m_idx", "late_z"] {
+        assert_eq!(
+            sealed
+                .closing_differences(&closed("n_pkey", Some((on_late(copy), true))), &transitions),
+            Vec::<String>::new(),
+            "{copy}"
+        );
+    }
+    let unrelated = record(&object("pg_class", "late_other"), "09", &[]);
+    assert_eq!(
+        sealed.closing_differences(&closed("n_pkey", Some((unrelated, true))), &transitions),
+        [
+            "pg_class app.late_other arrived, and no change of the plan owns it",
+            "the candidates pg_class app.*"
+        ]
+    );
+}
