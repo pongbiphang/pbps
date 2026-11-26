@@ -369,20 +369,25 @@ impl Expansion for Rule<'_> {
         for &leaf in &retire {
             edge(leaf, parent, Source::Effect);
         }
+        let keys = ops
+            .iter()
+            .map(|op| op.key(&owners))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         let mut bindings = BTreeMap::new();
         for (object, d) in &self.prepared.closure.surfaces {
             let old = self.key(d, Spelling::Base)?;
             let new = self.key(d, Spelling::Final)?;
             let locate = |key, teardown| {
-                ops.iter().enumerate().find_map(|(at, op)| {
-                    let purpose = self.prepared.parts[indices[at]].purpose;
-                    ((if teardown {
+                let candidates = keys.iter().enumerate().filter(|(at, _)| {
+                    let purpose = self.prepared.parts[indices[*at]].purpose;
+                    if teardown {
                         purpose == Purpose::Teardown
                     } else {
-                        purpose == Purpose::Own || purpose == Purpose::Restoration
-                    }) && op.key(&owners).ok().as_ref() == key)
-                        .then_some(at)
-                })
+                        matches!(purpose, Purpose::Own | Purpose::Restoration)
+                    }
+                });
+                locate_surface(key, candidates)
             };
             bindings.insert(
                 object,
@@ -407,6 +412,18 @@ impl Expansion for Rule<'_> {
         Ok(out)
     }
 }
+
+/// The first candidate step that carries the surface's key. A surface with
+/// no key at this end binds no step, so the candidates are not compared: an
+/// absent key must never match a step by both being "none" (DEC-2993.4).
+fn locate_surface<'a>(
+    expected: Option<&ObjectKey>,
+    mut candidates: impl Iterator<Item = (usize, &'a ObjectKey)>,
+) -> Option<usize> {
+    let expected = expected?;
+    candidates.find_map(|(at, candidate)| (candidate == expected).then_some(at))
+}
+
 /// Consume the validated inventory into a settled draft, with independent replay.
 /// Only the checked connected continuation can grant its route state.
 pub fn expand(

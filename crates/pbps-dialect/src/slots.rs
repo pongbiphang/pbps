@@ -21,8 +21,8 @@ use pbps_model::ModuleChange;
 use pbps_model::PartitionChange;
 use pbps_model::TableChange;
 use pbps_model::operation::{
-    Address, NameKind, Named, Names, ObjectKey, Operation, OwnerError, Owners, Snapshot,
-    base_table_named,
+    Address, NameKind, Named, Names, ObjectKey, Operation, OwnerError, Owners, Snapshot, Spelling,
+    base_table_named, table_reference, trigger_table,
 };
 use pbps_model::{Change, Module, ModuleId, ModuleKind, TableName};
 
@@ -171,14 +171,11 @@ fn constraint_names(
         // the existing settle delay that arrival (DEC-2100.2).
         for op in introduced {
             if let Some((table, parent)) = partition(op)
-                && op
-                    .input_owners(owners)
-                    .table(parent, op.origin().spelling())
-                    .ok()
-                    == Some(uid.uid().clone())
-                && let Ok(key) = op.key(owners)
+                && table_reference(&op.input_owners(owners), parent, op.origin().spelling())?
+                    .as_ref()
+                    == Some(uid.uid())
             {
-                let named = address(key, table.schema.clone());
+                let named = address(op.key(owners)?, table.schema.clone());
                 if !out.contains(&named) {
                     out.push(named);
                 }
@@ -229,7 +226,7 @@ fn arriving_clones(
     let mut triggers = BTreeMap::new();
     for (id, module) in &before.schema.modules {
         if let ModuleId::Trigger { on, name } = id
-            && let Ok(owner) = owners.table(on, pbps_model::operation::Spelling::Base)
+            && let Some(owner) = table_reference(owners, on, Spelling::Base)?
         {
             triggers.insert((owner, name.clone()), (id, module));
         }
@@ -321,36 +318,30 @@ pub fn names(
         .chain(&out.releases)
         .find(|n| n.address.kind == NameKind::Module(ModuleKind::Trigger))
         .and_then(|n| n.address.table.clone());
-    let scope = match named_scope {
-        Some(scope) => Some(scope),
-        None => match op.change().module_id() {
-            Some(ModuleId::Trigger { on, .. }) => {
-                let base = op
-                    .input_owners(owners)
-                    .table(on, op.origin().spelling())
-                    .ok()
-                    .and_then(|uid| before.ids.tables.get(&uid));
-                match base {
-                    Some(name) => base_table_named(owners, before, name)?.map(|t| t.table_key()),
-                    None => None,
-                }
-            }
-            Some(ModuleId::Named(_) | ModuleId::Routine(_)) | None => None,
-        },
+    let dropping_or_altering = matches!(
+        op.change(),
+        Change::Module(ModuleChange::DropModule { .. } | ModuleChange::AlterModule { .. })
+    );
+    let base = if (named_scope.is_none() || dropping_or_altering)
+        && let Some(ModuleId::Trigger { on, .. }) = op.change().module_id()
+    {
+        trigger_table(&op.input_owners(owners), on, op.origin().spelling())?
+            .and_then(|uid| before.ids.tables.get(&uid))
+    } else {
+        None
+    };
+    let scope = match (named_scope, base) {
+        (None, Some(name)) => base_table_named(owners, before, name)?.map(|t| t.table_key()),
+        (scope, _) => scope,
     };
     if let Change::Module(ModuleChange::DropModule { id, .. })
     | Change::Module(ModuleChange::AlterModule { id, .. }) = op.change()
     {
         let old_id = match id {
-            ModuleId::Trigger { on, name } => op
-                .input_owners(owners)
-                .table(on, op.origin().spelling())
-                .ok()
-                .and_then(|uid| before.ids.tables.get(&uid))
-                .map(|on| ModuleId::Trigger {
-                    on: on.clone(),
-                    name: name.clone(),
-                }),
+            ModuleId::Trigger { name, .. } => base.map(|on| ModuleId::Trigger {
+                on: on.clone(),
+                name: name.clone(),
+            }),
             ModuleId::Named(_) | ModuleId::Routine(_) => None,
         };
         if let Some(module) = old_id.as_ref().and_then(|id| before.schema.modules.get(id)) {
@@ -507,5 +498,311 @@ pub fn same(
             }
         }
         _ => Same::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DialectError, Lexicon, MinimalDialect, TransactionFraming, TypeChangeRisk};
+    use pbps_model::operation::{ModuleEdits, Operations, Spelling};
+    use pbps_model::{
+        ColumnRef, ColumnType, IdsFile, PartitionBound, PartitionOf, PlannedChange, RoleName,
+        Schema, SessionZone, Strategy, Table, Uid, UidKind,
+    };
+
+    struct ConstraintTriggers;
+
+    impl Dialect for ConstraintTriggers {
+        fn name(&self) -> &'static str {
+            "constraint triggers"
+        }
+        fn lexicon(&self) -> Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn transaction_framing(&self, zone: &SessionZone) -> TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
+        }
+        fn probe_framing(&self) -> Option<TransactionFraming> {
+            None
+        }
+        fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
+            MinimalDialect.normalize_type(ty)
+        }
+        fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn validate_table(&self, name: &TableName, table: &Table) -> Vec<DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn intermediate_tables(
+            &self,
+            change: &Change,
+            strategy: Strategy,
+        ) -> Result<Vec<TableName>, DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
+        }
+        fn declares_a_constraint(&self, module: &Module) -> bool {
+            module.kind == ModuleKind::Trigger
+        }
+        fn clones_to_partitions(&self, module: &Module) -> bool {
+            module.kind == ModuleKind::Trigger
+        }
+    }
+
+    struct Parent {
+        name: TableName,
+        uid: Uid,
+        at: Spelling,
+        answer: Result<Uid, OwnerError>,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl Owners for Parent {
+        fn table(&self, name: &TableName, spelling: Spelling) -> Result<Uid, OwnerError> {
+            assert_eq!(name, &self.name);
+            if spelling == self.at {
+                self.reads.set(self.reads.get() + 1);
+                self.answer.clone()
+            } else {
+                Ok(self.uid.clone())
+            }
+        }
+
+        fn column(&self, _: &ColumnRef, _: Spelling) -> Result<Uid, OwnerError> {
+            unreachable!("the trigger clone has no column lookup")
+        }
+
+        fn role(&self, _: &RoleName, _: Spelling) -> Result<Uid, OwnerError> {
+            unreachable!("the trigger clone has no role lookup")
+        }
+    }
+
+    struct Arrival {
+        parent: TableName,
+        uid: Uid,
+        id: ModuleId,
+        module: Module,
+        before: Schema,
+        ids: IdsFile,
+        ops: Operations,
+    }
+    impl Arrival {
+        fn new() -> Self {
+            let parent = TableName::new("app", "parent");
+            let child = TableName::new("app", "child");
+            let uid = Uid::derived(UidKind::Table, "parent", 0);
+            let id = ModuleId::Trigger {
+                on: parent.clone(),
+                name: "audit".into(),
+            };
+            let module = Module {
+                kind: ModuleKind::Trigger,
+                definition: "CONSTRAINT AFTER INSERT FOR EACH ROW EXECUTE FUNCTION app.f()".into(),
+                options: Default::default(),
+                description: None,
+            };
+            let mut before = Schema::default();
+            before.tables.insert(parent.clone(), Table::default());
+            before.modules.insert(id.clone(), module.clone());
+            let mut ids = IdsFile::default();
+            ids.tables.insert(uid.clone(), parent.clone());
+            let ops = Operations::of_plan(
+                &[PlannedChange::new(Change::Table(
+                    TableChange::CreateTable {
+                        uid: Uid::derived(UidKind::Table, "child", 0),
+                        name: child.clone(),
+                        table: Box::new(Table {
+                            partition_of: Some(PartitionOf {
+                                parent: parent.clone(),
+                                bound: PartitionBound::Default,
+                                columns: Default::default(),
+                            }),
+                            ..Default::default()
+                        }),
+                        beside_default: None,
+                        moves_at_most: None,
+                    },
+                ))],
+                ModuleEdits::InPlace,
+            );
+            Self {
+                parent,
+                uid,
+                id,
+                module,
+                before,
+                ids,
+                ops,
+            }
+        }
+
+        fn snapshot(&self) -> Snapshot<'_> {
+            Snapshot {
+                schema: &self.before,
+                ids: &self.ids,
+            }
+        }
+
+        fn references(
+            &self,
+            spelling: Spelling,
+        ) -> impl Iterator<Item = (Parent, Result<bool, OwnerError>)> {
+            let name = self.parent.shown().to_string();
+            let errors = [
+                OwnerError::Unmanaged {
+                    name: name.clone(),
+                    spelling,
+                },
+                OwnerError::Vacant {
+                    name: name.clone(),
+                    spelling,
+                },
+                OwnerError::Names {
+                    name: name.clone(),
+                    spelling,
+                    why: "two holders".into(),
+                },
+                OwnerError::Outside { spelling },
+                OwnerError::Rebuild {
+                    name,
+                    why: "unreadable rebuild",
+                },
+            ];
+            let parent = move |answer| Parent {
+                name: self.parent.clone(),
+                uid: self.uid.clone(),
+                at: spelling,
+                answer,
+                reads: std::cell::Cell::new(0),
+            };
+            std::iter::once((parent(Ok(self.uid.clone())), Ok(true))).chain(errors.into_iter().map(
+                move |error| {
+                    let expected = if matches!(error, OwnerError::Unmanaged { .. }) {
+                        Ok(false)
+                    } else {
+                        Err(error.clone())
+                    };
+                    (parent(Err(error)), expected)
+                },
+            ))
+        }
+    }
+
+    #[test]
+    fn prospective_constraint_clones_require_a_readable_parent_reference() {
+        let scene = Arrival::new();
+        let before = scene.snapshot();
+        let op = &scene.ops.as_slice()[0];
+        for (owners, clone) in scene.references(op.origin().spelling()) {
+            let scope = base_table_named(&owners, before, &scene.parent)
+                .unwrap()
+                .map(|table| table.table_key());
+            let result = constraint_names(
+                &ConstraintTriggers,
+                &scene.id,
+                &scene.module,
+                before,
+                &owners,
+                scope,
+                scene.ops.as_slice(),
+            );
+            assert_eq!(
+                result.map(|named| named.len()),
+                clone.map(|clone| 1 + usize::from(clone))
+            );
+        }
+    }
+
+    #[test]
+    fn arriving_partitions_require_readable_baseline_trigger_references() {
+        let scene = Arrival::new();
+        let op = &scene.ops.as_slice()[0];
+        for (owners, clone) in scene.references(Spelling::Base) {
+            let result = arriving_clones(
+                &ConstraintTriggers,
+                op,
+                &owners,
+                scene.snapshot(),
+                scene.ops.as_slice(),
+            );
+            assert_eq!(result.map(|named| named.len()), clone.map(usize::from));
+        }
+    }
+
+    #[test]
+    fn trigger_companions_share_one_table_read_and_allow_a_view_at_a_vacant_table_name() {
+        let scene = Arrival::new();
+        let ops = Operations::of_plan(
+            &[PlannedChange::new(Change::Module(
+                ModuleChange::AlterModule {
+                    id: scene.id.clone(),
+                    module: Box::new(scene.module.clone()),
+                },
+            ))],
+            ModuleEdits::InPlace,
+        );
+        let op = &ops.as_slice()[0];
+        for (owners, expected) in scene.references(op.origin().spelling()) {
+            let expected = match expected {
+                Err(OwnerError::Vacant { .. }) => Ok(false),
+                other => other,
+            };
+            let names = names(
+                &ConstraintTriggers,
+                op,
+                &owners,
+                scene.snapshot(),
+                ops.as_slice(),
+            );
+            assert_eq!(
+                names.map(|names| (names.claims.len(), names.releases.len())),
+                expected.map(|held| (usize::from(held), usize::from(held)))
+            );
+            assert_eq!(owners.reads.get(), 1);
+        }
+    }
+
+    #[test]
+    fn named_trigger_claims_skip_the_companion_lookup_and_named_releases_keep_it() {
+        let scene = Arrival::new();
+        for (change, reads) in [
+            (
+                ModuleChange::CreateModule {
+                    id: scene.id.clone(),
+                    module: Box::new(scene.module.clone()),
+                },
+                1,
+            ),
+            (
+                ModuleChange::DropModule {
+                    id: scene.id.clone(),
+                    kind: ModuleKind::Trigger,
+                },
+                2,
+            ),
+        ] {
+            let ops = Operations::of_plan(
+                &[PlannedChange::new(Change::Module(change))],
+                ModuleEdits::InPlace,
+            );
+            let op = &ops.as_slice()[0];
+            let (owners, _) = scene.references(op.origin().spelling()).next().unwrap();
+            names(
+                &ConstraintTriggers,
+                op,
+                &owners,
+                scene.snapshot(),
+                ops.as_slice(),
+            )
+            .unwrap();
+            assert_eq!(owners.reads.get(), reads);
+        }
     }
 }

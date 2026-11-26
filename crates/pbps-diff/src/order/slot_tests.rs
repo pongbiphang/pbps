@@ -1177,6 +1177,8 @@ struct Unreadable<'a> {
     inner: &'a dyn pbps_model::operation::Owners,
     table: TableName,
     error: pbps_model::operation::OwnerError,
+    reads: std::cell::Cell<usize>,
+    only_at: Option<pbps_model::operation::Spelling>,
 }
 
 impl pbps_model::operation::Owners for Unreadable<'_> {
@@ -1192,7 +1194,8 @@ impl pbps_model::operation::Owners for Unreadable<'_> {
         name: &TableName,
         spelling: pbps_model::operation::Spelling,
     ) -> Result<Uid, pbps_model::operation::OwnerError> {
-        if *name == self.table {
+        if *name == self.table && self.only_at.is_none_or(|at| at == spelling) {
+            self.reads.set(self.reads.get() + 1);
             return Err(self.error.clone());
         }
         self.inner.table(name, spelling)
@@ -1236,6 +1239,8 @@ fn an_unreadable_baseline_name_reaches_the_catalog_and_replay_refusals_with_its_
         inner: &plan_owners,
         table: name("app.t"),
         error,
+        reads: std::cell::Cell::new(0),
+        only_at: None,
     };
     let broken = OwnerError::Names {
         name: "app.t".into(),
@@ -1272,4 +1277,91 @@ fn an_unreadable_baseline_name_reaches_the_catalog_and_replay_refusals_with_its_
     });
     assert!(carried(ops.as_slice(), &facts, &undeclared, before, &dialect).is_ok());
     assert!(verify(ops.as_slice(), &slots, &dialect, None, &undeclared, before).is_ok());
+}
+
+#[test]
+fn a_non_carrier_with_an_unreadable_key_leaves_catalog_movement_and_collisions_unchanged() {
+    use pbps_model::operation::{OwnerError, Spelling};
+    use pbps_model::plan_names::At;
+    use pbps_model::{DataMode, RowChange};
+
+    let plan = Plan::new(
+        &[("a", "s1.a")],
+        &[("a", "s2.a"), ("claimant", "s1.a_id_seq")],
+        vec![
+            Change::Row(RowChange::SetDataMode {
+                table: name("s1.a"),
+                from: Some(DataMode::Exact),
+                to: Some(DataMode::Ensure),
+            }),
+            rename_table("a", "s1.a", "s2.a"),
+            Change::Table(TableChange::CreateTable {
+                uid: uid("claimant"),
+                name: name("s1.a_id_seq"),
+                table: Box::default(),
+                beside_default: None,
+                moves_at_most: None,
+            }),
+        ],
+    );
+    let names = PlanNames::of(&plan.logical, &plan.after_ids).unwrap();
+    let plan_owners = PlanOwners::new(names, &plan.before_ids, &plan.after_ids);
+    let before = Snapshot {
+        schema: &plan.before,
+        ids: &plan.before_ids,
+    };
+    let spelling = Spelling::At(At::Before(0));
+    let unreadable = OwnerError::Names {
+        name: "s1.a".into(),
+        spelling,
+        why: "two holders".into(),
+    };
+    let owners = Unreadable {
+        inner: &plan_owners,
+        table: name("s1.a"),
+        error: unreadable.clone(),
+        reads: std::cell::Cell::new(0),
+        only_at: Some(spelling),
+    };
+    let ops = Operations::of_plan(&plan.logical, ModuleEdits::InPlace);
+    assert_eq!(ops.as_slice()[0].key(&owners), Err(unreadable));
+    assert_eq!(owners.reads.replace(0), 1);
+
+    let dialect = Slotted { exact: true };
+    let facts = CatalogFacts {
+        occupants: vec![occupant("s1.a_id_seq", "s1.a", None)],
+        ..Default::default()
+    };
+    let carried = carried(ops.as_slice(), &facts, &owners, before, &dialect).unwrap();
+    let carried_reads = owners.reads.replace(0);
+    let [moved] = carried.as_slice() else {
+        panic!("expected one carried occupant: {carried:?}")
+    };
+    assert_eq!(moved.step, 1);
+    assert_eq!(moved.lands.as_ref().unwrap().to_string(), "s2.a_id_seq");
+
+    let replay = |operations: &Operations| {
+        let slots = analyse(operations.as_slice(), &owners, before, &dialect);
+        assert!(slots.unowned.is_empty(), "{:?}", slots.unowned);
+        verify(
+            operations.as_slice(),
+            &slots,
+            &dialect,
+            Some(&facts),
+            &owners,
+            before,
+        )
+        .unwrap()
+        .0
+    };
+    assert!(replay(&ops).is_empty());
+    let replay_reads = owners.reads.replace(0);
+    let reversed = crate::order::reordered_operations(&ops, &[0, 2, 1]);
+    assert_eq!(held(&replay(&reversed)), ["held s1.a_id_seq"]);
+    let collision_reads = owners.reads.get();
+    assert_eq!(
+        (carried_reads, replay_reads, collision_reads),
+        (0, 0, 0),
+        "carried, replay and collision must skip the non-carrier's key"
+    );
 }
