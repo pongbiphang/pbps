@@ -194,6 +194,13 @@ impl Dialect for Sqlite {
         false
     }
 
+    /// Measured: `CONSTRAINT k PRIMARY KEY` and `CONSTRAINT k UNIQUE` create
+    /// `sqlite_autoindex_<table>_N` rather than a `sqlite_schema` entry named
+    /// `k`, so a key's name does not claim an index name.
+    fn keys_claim_index_name(&self) -> bool {
+        false
+    }
+
     /// A partial index's `WHERE` takes the table's own columns and
     /// deterministic built-ins; it names no module.
     fn filter_binds_expression(&self) -> bool {
@@ -342,7 +349,9 @@ mod tests {
             assert!(!d.shares_namespace_with_tables(kind), "{kind}");
         }
         assert!(
-            d.indexes_share_namespace_with_tables() && !d.constraints_share_namespace_with_tables()
+            d.indexes_share_namespace_with_tables()
+                && !d.constraints_share_namespace_with_tables()
+                && !d.keys_claim_index_name()
         );
         assert!(
             accepts("CREATE TABLE t(c); CREATE VIEW u AS SELECT 1; CREATE TABLE u2(c)")

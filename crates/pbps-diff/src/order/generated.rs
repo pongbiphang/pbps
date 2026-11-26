@@ -1558,24 +1558,35 @@ pub(super) fn constraints_in(
 /// key are each a relation of that name where indexes share the namespace of
 /// tables, and a new table brings the ones it keeps inline.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn early_index_names(change: &Change) -> Vec<&str> {
+fn early_index_names(change: &Change, keys_claim_index: bool) -> Vec<&str> {
     match change {
         Change::Index(IndexChange::AddIndex { name, index, .. }) if !index.holds_expression() => {
             vec![name.raw()]
         }
-        Change::Constraint(ConstraintChange::AddUnique { name, .. }) => vec![name.raw()],
+        Change::Constraint(ConstraintChange::AddUnique { name, .. }) if keys_claim_index => {
+            vec![name.raw()]
+        }
         Change::Constraint(ConstraintChange::SetExclusion {
             name, to: Some(_), ..
-        }) => vec![name.raw()],
-        Change::Constraint(ConstraintChange::SetPrimaryKey { to: Some(key), .. }) => {
+        }) if keys_claim_index => vec![name.raw()],
+        Change::Constraint(ConstraintChange::SetPrimaryKey { to: Some(key), .. })
+            if keys_claim_index =>
+        {
             key.name.iter().map(|n| n.raw()).collect()
         }
         Change::Table(TableChange::CreateTable { table, .. }) => table
             .primary_key
             .iter()
+            .filter(|_| keys_claim_index)
             .flat_map(|key| key.name.iter())
             .map(|n| n.raw())
-            .chain(table.unique.keys().map(|n| n.raw()))
+            .chain(
+                table
+                    .unique
+                    .keys()
+                    .filter(|_| keys_claim_index)
+                    .map(|n| n.raw()),
+            )
             .chain(
                 table
                     .indexes
@@ -1745,9 +1756,10 @@ fn scratch_rules(
         }
     }
     if dialect.indexes_share_namespace_with_tables() {
+        let keys_claim_index = dialect.keys_claim_index_name();
         let name_readers = readers(if guessed { Types::Omit } else { Types::All });
         for (at, p) in cs.changes.iter().enumerate() {
-            for name in early_index_names(&p.change) {
+            for name in early_index_names(&p.change, keys_claim_index) {
                 for (reader, texts) in &name_readers {
                     if texts.iter().any(|t| dialect.generation_may_call(t, name)) {
                         guess(out, at, *reader);

@@ -130,8 +130,13 @@ pub fn analyse(
             }
             Err(error) => out.unowned.push((op.id(), error)),
         }
+        // A rename passes through another name in two cases: a move between
+        // schemas, and a rename to a name that differs only in ASCII case,
+        // which an engine that folds case cannot do in one statement (SQLite).
+        // Not asked of every rename: a dialect that cannot lower a plain
+        // rename would report it unlowered, though it passes through nothing.
         if let Change::Table(TableChange::RenameTable { from, to, .. }) = op.change()
-            && from.schema != to.schema
+            && (from.schema != to.schema || from.name.eq_ignore_ascii_case(&to.name))
         {
             match dialect.intermediate_tables(op.change(), op.planned().strategy) {
                 Ok(lowered) => {

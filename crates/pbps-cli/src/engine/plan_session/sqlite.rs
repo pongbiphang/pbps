@@ -1,22 +1,25 @@
 //! SQLite's positions of a connected plan (#2950).
 //!
-//! Implements the 7 required methods of [`PlanSession`] and the 4 provided
-//! plan-gate methods that need no new catalog read
-//! (`require_transactional_rebuilds`, `vet_plan_sites`, `support_rows`,
-//! `server_limits`); the catalog-reading positions
+//! Implements the 7 required methods of [`PlanSession`], the 4 non-catalog plan
+//! gates (`require_transactional_rebuilds`, `vet_plan_sites`, `support_rows`,
+//! `server_limits`), and the 3 name-namespace methods
 //! (`refuse_occupied_relation_names`, `check_names_against_catalog`,
-//! `schedule`, `order_by_catalog`, `check_final_order`) keep their refusing
-//! defaults until their SQLite catalog passes are built.
+//! `order_by_catalog`); `schedule` and `check_final_order` keep their refusing
+//! defaults until SQLite's dependency and drop-blocker passes are built.
 
 use super::*;
+use pbps_dialect::Dialect as _;
+use pbps_sqlite::catalog::inventory::{self, Inventory};
 use pbps_sqlite::dialect::Sqlite;
 
-/// What SQLite carries from one position of a plan to a later one: only the
-/// site admission every engine's state holds, which stays empty because SQLite
-/// has no stored routines.
+/// What SQLite carries from one position of a plan to a later one: the site
+/// admission (empty because SQLite has no stored routines) and the raw catalog
+/// inventory read in [`PlanSession::check_names_against_catalog`] for reuse by
+/// [`PlanSession::order_by_catalog`].
 #[derive(Default)]
 pub(crate) struct PlanState {
     admission: RoutineAdmission,
+    inventory: Option<Inventory>,
 }
 
 impl AsRef<RoutineAdmission> for PlanState {
@@ -140,6 +143,135 @@ pub(in crate::engine) fn refuse_system_versioned(changes: &ChangeSet) -> anyhow:
     Ok(())
 }
 
+fn ensure_inventory<'a>(
+    state: &'a mut PlanState,
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    frame: Frame<'_>,
+) -> anyhow::Result<&'a Inventory> {
+    let c = sqlite_conn(conn)?;
+    let needed = inventory::column_tables(changes, frame.recorded, frame.written);
+    let covered = state.inventory.as_ref().is_some_and(|inv| {
+        needed
+            .iter()
+            .all(|t| inv.columns.keys().any(|k| pbps_sqlite::ident::same(k, t)))
+    });
+    if !covered {
+        let refs: Vec<&str> = needed.iter().map(String::as_str).collect();
+        state.inventory = Some(inventory::read(c, &refs)?);
+    }
+    Ok(state.inventory.as_ref().expect("populated above"))
+}
+
+fn order_and_check_names<S: Clone>(
+    dialect: &Sqlite,
+    inventory: &Inventory,
+    changes: &mut PlanningPlan<S>,
+    frame: Frame<'_>,
+) -> anyhow::Result<pbps_dialect::slots::CatalogFacts> {
+    anyhow::ensure!(
+        !crate::deploy::leaves_something_unlogged(changes),
+        "SQLite does not support unlogged tables"
+    );
+    let cols = crate::object_order::renamed_column_names(changes);
+    if !cols.is_empty() {
+        let mut alike = Vec::new();
+        for i in 0..cols.len() {
+            for j in (i + 1)..cols.len() {
+                if cols[i].0 == cols[j].0
+                    && pbps_sqlite::ident::same(cols[i].1.raw(), cols[j].1.raw())
+                {
+                    alike.push((cols[i].clone(), cols[j].clone()));
+                }
+            }
+        }
+        crate::object_order::order_column_renames(changes, &alike, frame.label)?;
+    }
+    let facts =
+        inventory::catalog_facts(inventory, changes, frame.recorded, frame.written, dialect)
+            .map_err(anyhow::Error::msg)?;
+    order_name_handovers(changes, frame, dialect, &facts)?;
+    inventory::verify_names(
+        inventory,
+        changes,
+        frame.recorded,
+        frame.written,
+        dialect,
+        &facts,
+        frame.label,
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok(facts)
+}
+
+fn order_name_handovers<S: Clone>(
+    changes: &mut PlanningPlan<S>,
+    frame: Frame<'_>,
+    dialect: &Sqlite,
+    facts: &pbps_dialect::slots::CatalogFacts,
+) -> anyhow::Result<()> {
+    let mut schedule = pbps_diff::order::slots::handovers(
+        &changes.changes,
+        frame.recorded,
+        frame.written,
+        dialect,
+        facts,
+    )
+    .map_err(anyhow::Error::msg)?;
+    if schedule.constraints().is_empty() {
+        return Ok(());
+    }
+    // Keep effect edges beside the slot handovers so settling respects table,
+    // column and view prerequisites.
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, frame.written.ids)?;
+    let owners =
+        pbps_model::operation::PlanOwners::new(names, frame.recorded.ids, frame.written.ids);
+    let ops = pbps_model::operation::Operations::of_plan(
+        &changes.changes,
+        if dialect.rebuilds_modules() {
+            pbps_model::operation::ModuleEdits::Rebuilt
+        } else {
+            pbps_model::operation::ModuleEdits::InPlace
+        },
+    );
+    let before = pbps_model::operation::Snapshot {
+        schema: frame.recorded.schema,
+        ids: frame.recorded.ids,
+    };
+    let after = pbps_model::operation::Snapshot {
+        schema: frame.written.schema,
+        ids: frame.written.ids,
+    };
+    let shadowed =
+        pbps_diff::order::analyse_with_catalog(&ops, &owners, before, after, dialect, Some(facts));
+    if shadowed.unowned.is_empty() {
+        let fx_graph = pbps_diff::order::graph(
+            ops.as_slice(),
+            &shadowed.effects,
+            &pbps_diff::order::Baseline::of(before, &owners),
+            &frame.hints.annotations.modules(frame.written.schema),
+            pbps_diff::order::Checks::ALL,
+        );
+        for edge in &fx_graph.edges {
+            schedule.edge(
+                edge.before,
+                edge.after,
+                pbps_diff::order::Source::Effect,
+                pbps_diff::order::schedule::reason(edge, ops.as_slice()),
+            );
+        }
+    }
+    let settled = schedule.settle(changes.clone()).map_err(|refusal| {
+        anyhow::anyhow!(
+            "SQLite cannot order these name handovers for `{}`: {}",
+            pbps_model::escape::Escaped(frame.label),
+            refusal.describe(changes)
+        )
+    })?;
+    *changes = settled.changes;
+    Ok(())
+}
+
 impl PlanSession for Sqlite {
     type State = PlanState;
 
@@ -220,6 +352,24 @@ impl PlanSession for Sqlite {
         pbps_diff::Screen::Text
     }
 
+    /// Asked later, of the whole file: this position exists for an engine
+    /// whose catalog read can miss an object, and it answers from what the
+    /// model could not read. SQLite's `sqlite_schema` is readable whole, so
+    /// [`PlanSession::check_names_against_catalog`], which runs next, sees
+    /// every table, view and index there is, managed or not, and compares
+    /// them by SQLite's own rule. A second answer here could only disagree
+    /// with it. SQL Server answers the same way for the same reason.
+    fn refuse_occupied_relation_names(
+        &self,
+        _changes: &ChangeSet,
+        _scoped: &pbps_diff::Scoped,
+        _unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
+        _unmanaged_relations: &[TableName],
+        _label: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Does not exist on this engine (partitioned-table rebuilds) plus
     /// SQLite's staged-view-edit refusal: delegates to the helper shared with
     /// [`ApplySession::rebuild_mode`].
@@ -229,6 +379,39 @@ impl PlanSession for Sqlite {
         staged: bool,
     ) -> anyhow::Result<()> {
         require_transactional_rebuilds(changes, staged)
+    }
+
+    /// Reads `main.sqlite_schema` and touched `table_xinfo` columns (without
+    /// loading virtual-table modules), orders handovers, refuses whole-file
+    /// collisions, and caches the inventory in [`PlanState`].
+    async fn check_names_against_catalog<S: Clone>(
+        &self,
+        state: &mut PlanState,
+        conn: &mut Conn,
+        changes: &mut PlanningPlan<S>,
+        frame: Frame<'_>,
+        _staged: bool,
+    ) -> anyhow::Result<()> {
+        let inv = ensure_inventory(state, conn, changes, frame)?.clone();
+        order_and_check_names(self, &inv, changes, frame)?;
+        Ok(())
+    }
+
+    /// Orders column renames and slot handovers over the cached inventory and
+    /// returns [`pbps_dialect::slots::CatalogFacts`] computed in memory.
+    async fn order_by_catalog<S: Clone>(
+        &self,
+        state: &mut PlanState,
+        conn: &mut Conn,
+        changes: &mut PlanningPlan<S>,
+        frame: Frame<'_>,
+    ) -> anyhow::Result<Ordered> {
+        let inv = ensure_inventory(state, conn, changes, frame)?.clone();
+        let facts = order_and_check_names(self, &inv, changes, frame)?;
+        Ok(Ordered {
+            verified: false,
+            facts: Some(facts),
+        })
     }
 
     /// Does not exist on this engine (stored routines and `USING` conversions)
@@ -351,6 +534,7 @@ pub(in crate::engine) mod test_support {
     /// A temporary SQLite database file removed on drop.
     pub(in crate::engine) struct TempDb {
         dir: PathBuf,
+        path: PathBuf,
     }
 
     impl TempDb {
@@ -364,7 +548,11 @@ pub(in crate::engine) mod test_support {
             let path = dir.join("test.db");
             let conn = Conn::create(Driver::Sqlite, path.to_str().expect("UTF-8 path"))
                 .expect("the SQLite file is created");
-            (Self { dir }, conn)
+            (Self { dir, path }, conn)
+        }
+
+        pub(in crate::engine) fn path(&self) -> &std::path::Path {
+            &self.path
         }
     }
 
@@ -490,27 +678,42 @@ mod tests {
                 .expect("ok")
                 .is_empty()
         );
-        // Provided defaults stay refusing for plans that create a table.
-        let create = ChangeSet {
+        // Unoverridden defaults stay refusing for plans that still need a
+        // later pass (here `check_final_order` on a table drop).
+        let drop_table = ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Table(
-                pbps_model::TableChange::CreateTable {
+                pbps_model::TableChange::DropTable {
                     uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "main.t", 0),
                     name: TableName::new("main", "t"),
-                    table: Default::default(),
-                    beside_default: None,
-                    moves_at_most: None,
+                    detach_from: None,
                 },
             ))],
         };
-        let empty_scoped = pbps_diff::scope(
-            &Schema::default(),
-            &IdsFile::default(),
-            &BTreeSet::new(),
-            &BTreeSet::new(),
+        let empty = Schema::default();
+        let empty_ids = IdsFile::default();
+        let hints = pbps_model::Hints::default();
+        let baseline = StateSnapshot::new(
+            pbps_model::StateKind::Baseline,
+            empty.clone(),
+            empty_ids.clone(),
+            "test",
         );
-        let refused = dialect
-            .refuse_occupied_relation_names(&create, &empty_scoped, &[], &[], "test.db")
-            .unwrap_err();
+        let side = pbps_diff::Side {
+            schema: &empty,
+            ids: &empty_ids,
+        };
+        let frame = Frame {
+            label: "test.db",
+            recorded: side,
+            written: side,
+            base: side,
+            declared: side,
+            hints: &hints,
+            baseline: &baseline,
+        };
+        let state = PlanState::default();
+        let refused =
+            now(dialect.check_final_order(&state, &mut conn, &drop_table, frame)).unwrap_err();
         assert!(refused.to_string().contains("sqlite"), "{refused}");
     }
 
@@ -1129,5 +1332,1546 @@ mod tests {
                 && guard_err.to_string().contains("drop-requirement"),
             "{guard_err}"
         );
+    }
+
+    fn int_col() -> pbps_model::Column {
+        pbps_model::Column::new("integer".parse().expect("type"))
+    }
+
+    fn table_with_cols(cols: &[&str]) -> pbps_model::Table {
+        let mut table = pbps_model::Table::default();
+        for &c in cols {
+            table.columns.insert(c.into(), int_col());
+        }
+        table
+    }
+
+    fn table_id(ids: &mut IdsFile, name: &str) -> pbps_model::Uid {
+        let tn = TableName::new("main", name);
+        let u = uid(pbps_model::UidKind::Table, &format!("main.{name}"));
+        ids.tables.insert(u.clone(), tn);
+        u
+    }
+
+    fn col_id(ids: &mut IdsFile, table: &str, col: &str) -> pbps_model::Uid {
+        let u = uid(pbps_model::UidKind::Column, &format!("main.{table}.{col}"));
+        ids.columns
+            .insert(u.clone(), TableName::new("main", table).column(col));
+        u
+    }
+
+    fn scoped_of(schema: &Schema, ids: &IdsFile) -> pbps_diff::Scoped {
+        let modules: BTreeSet<pbps_model::ModuleId> = schema.modules.keys().cloned().collect();
+        pbps_diff::scope(schema, ids, &modules, &BTreeSet::new())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_name_methods(
+        dialect: &Sqlite,
+        conn: &mut Conn,
+        plan: &mut PlanningPlan<pbps_diff::order::Draft>,
+        base: &Schema,
+        base_ids: &IdsFile,
+        desired: &Schema,
+        desired_ids: &IdsFile,
+        unmanaged_relations: &[TableName],
+    ) -> anyhow::Result<(PlanState, Ordered)> {
+        let scoped = scoped_of(base, base_ids);
+        dialect.refuse_occupied_relation_names(
+            plan,
+            &scoped,
+            &[],
+            unmanaged_relations,
+            "test.db",
+        )?;
+        let hints = pbps_model::Hints::default();
+        let baseline = StateSnapshot::new(
+            pbps_model::StateKind::Baseline,
+            base.clone(),
+            base_ids.clone(),
+            "test",
+        );
+        let base_side = pbps_diff::Side {
+            schema: base,
+            ids: base_ids,
+        };
+        let desired_side = pbps_diff::Side {
+            schema: desired,
+            ids: desired_ids,
+        };
+        let frame = Frame {
+            label: "test.db",
+            recorded: base_side,
+            written: desired_side,
+            base: base_side,
+            declared: desired_side,
+            hints: &hints,
+            baseline: &baseline,
+        };
+        let mut state = PlanState::default();
+        now(dialect.check_names_against_catalog(&mut state, conn, plan, frame, false))?;
+        let ordered = now(dialect.order_by_catalog(&mut state, conn, plan, frame))?;
+        #[cfg(debug_assertions)]
+        if !ordered.verified {
+            pbps_diff::order::shadow::observe_scheduled(
+                base_side,
+                desired_side,
+                dialect,
+                &hints.annotations.modules(desired),
+                plan,
+                pbps_diff::order::shadow::Stage::Final,
+                ordered.facts.as_ref(),
+                &Default::default(),
+            );
+        }
+        Ok((state, ordered))
+    }
+
+    #[test]
+    fn creating_table_view_and_index_on_clean_file_passes_all_three_name_methods() {
+        use pbps_model::{
+            Change, Index, IndexChange, IndexColumn, ModuleChange, ModuleId, TableChange,
+        };
+
+        let (_tmp, mut conn) = TempDb::create();
+        let dialect = Sqlite::default();
+
+        let base = Schema::default();
+        let base_ids = IdsFile::default();
+        let mut desired = Schema::default();
+        let mut desired_ids = IdsFile::default();
+        let items = table_with_cols(&["id"]);
+        let t_uid = table_id(&mut desired_ids, "items");
+        col_id(&mut desired_ids, "items", "id");
+        let idx = Index {
+            columns: vec![IndexColumn::column("id")],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+            filegroup: None,
+        };
+        let mut items_with_idx = items.clone();
+        items_with_idx
+            .indexes
+            .insert("ix_items".into(), idx.clone());
+        desired
+            .tables
+            .insert(TableName::new("main", "items"), items_with_idx);
+        let view_id = ModuleId::Named(TableName::new("main", "v_items"));
+        desired
+            .modules
+            .insert(view_id.clone(), *view_module("SELECT id FROM items"));
+
+        let mut plan = pbps_diff::order::propose(change_set(vec![
+            Change::Table(TableChange::CreateTable {
+                uid: t_uid,
+                name: TableName::new("main", "items"),
+                table: Box::new(items),
+                beside_default: None,
+                moves_at_most: None,
+            }),
+            Change::Index(IndexChange::AddIndex {
+                table: TableName::new("main", "items"),
+                name: "ix_items".into(),
+                index: Box::new(idx),
+                clustered: false,
+            }),
+            Change::Module(ModuleChange::CreateModule {
+                id: view_id,
+                module: view_module("SELECT id FROM items"),
+            }),
+        ]));
+
+        let (state, ordered) = run_name_methods(
+            &dialect,
+            &mut conn,
+            &mut plan,
+            &base,
+            &base_ids,
+            &desired,
+            &desired_ids,
+            &[],
+        )
+        .expect("clean file passes all three methods and observe_scheduled");
+        assert!(!ordered.verified);
+        assert!(ordered.facts.is_some());
+        assert!(state.inventory.is_some());
+    }
+
+    #[test]
+    fn relation_collisions_across_managed_unmanaged_virtual_ledger_intermediate_and_case_folded_are_refused()
+     {
+        use pbps_model::{
+            Change, Index, IndexColumn, ModuleChange, ModuleId, Strategy, TableChange,
+        };
+
+        let (_tmp, mut conn) = TempDb::create();
+        let dialect = Sqlite::default();
+
+        // Seed the real SQLite file with every kind of occupant:
+        // - a managed table `ManagedTbl` with an explicit index `ManagedIdx`
+        // - a managed view `ManagedView`
+        // - an unmanaged table `UnmanagedTbl`, view `UnmanagedView`, expression index `UnmanagedExprIdx`
+        // - a virtual FTS5 table `DocsFts` (creating shadow tables such as `DocsFts_content`)
+        // - a missing-module virtual table `MissingMod` (via writable_schema)
+        // - a ledger table `__pbps_state`
+        // - a SQLite internal `sqlite_sequence` (via AUTOINCREMENT)
+        // - a trigger `OnlyTrigger` (separate namespace: must NOT collide)
+        // - a non-ASCII table `café` (`cafÉ` must NOT collide)
+        for sql in [
+            "CREATE TABLE ManagedTbl (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            "CREATE INDEX ManagedIdx ON ManagedTbl (id)",
+            "CREATE VIEW ManagedView AS SELECT id FROM ManagedTbl",
+            "CREATE TABLE UnmanagedTbl (id INTEGER)",
+            "CREATE VIEW UnmanagedView AS SELECT 1 AS x",
+            "CREATE INDEX UnmanagedExprIdx ON UnmanagedTbl (ABS(id))",
+            "CREATE VIRTUAL TABLE DocsFts USING fts5(body)",
+            "CREATE TABLE __pbps_state (id INTEGER PRIMARY KEY)",
+            "CREATE TRIGGER OnlyTrigger AFTER INSERT ON ManagedTbl BEGIN SELECT 1; END",
+            "CREATE TABLE \"café\" (id INTEGER)",
+            "PRAGMA writable_schema = ON",
+            "INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) VALUES \
+             ('table', 'MissingMod', 'MissingMod', 0, \
+              'CREATE VIRTUAL TABLE MissingMod USING no_such_module_ever()')",
+            "PRAGMA writable_schema = OFF",
+        ] {
+            now(conn.execute(sql)).expect(sql);
+        }
+
+        // Baseline model holds ManagedTbl (with ManagedIdx) and ManagedView.
+        let mut base = Schema::default();
+        let mut base_ids = IdsFile::default();
+        let mut managed_tbl = table_with_cols(&["id"]);
+        managed_tbl.indexes.insert(
+            "ManagedIdx".into(),
+            Index {
+                columns: vec![IndexColumn::column("id")],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+        );
+        let managed_uid = table_id(&mut base_ids, "ManagedTbl");
+        col_id(&mut base_ids, "ManagedTbl", "id");
+        base.tables
+            .insert(TableName::new("main", "ManagedTbl"), managed_tbl);
+        base.modules.insert(
+            ModuleId::Named(TableName::new("main", "ManagedView")),
+            *view_module("SELECT id FROM ManagedTbl"),
+        );
+        // 2. Whole-file collisions (unmanaged table/view/index, virtual table
+        //    including missing-module, FTS5 shadow table, ledger table, sqlite_sequence)
+        //    refused by `check_names_against_catalog` naming SQLite and both names.
+        for (attempt_name, existing_name) in [
+            ("managedtbl", "ManagedTbl"),
+            ("managedview", "ManagedView"),
+            ("managedidx", "ManagedIdx"),
+            ("unmanagedtbl", "UnmanagedTbl"),
+            ("unmanagedview", "UnmanagedView"),
+            ("unmanagedexpridx", "UnmanagedExprIdx"),
+            ("docsfts", "DocsFts"),
+            ("docsfts_content", "DocsFts_content"),
+            ("missingmod", "MissingMod"),
+            ("__PBPS_STATE", "__pbps_state"),
+            ("SQLITE_SEQUENCE", "sqlite_sequence"),
+        ] {
+            let mut desired = base.clone();
+            let mut desired_ids = base_ids.clone();
+            let new_uid = table_id(&mut desired_ids, attempt_name);
+            col_id(&mut desired_ids, attempt_name, "x");
+            desired.tables.insert(
+                TableName::new("main", attempt_name),
+                table_with_cols(&["x"]),
+            );
+            let mut plan = pbps_diff::order::propose(change_set(vec![Change::Table(
+                TableChange::CreateTable {
+                    uid: new_uid,
+                    name: TableName::new("main", attempt_name),
+                    table: Box::new(table_with_cols(&["x"])),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )]));
+            let hints = pbps_model::Hints::default();
+            let baseline = StateSnapshot::new(
+                pbps_model::StateKind::Baseline,
+                base.clone(),
+                base_ids.clone(),
+                "test",
+            );
+            let base_side = pbps_diff::Side {
+                schema: &base,
+                ids: &base_ids,
+            };
+            let desired_side = pbps_diff::Side {
+                schema: &desired,
+                ids: &desired_ids,
+            };
+            let frame = Frame {
+                label: "test.db",
+                recorded: base_side,
+                written: desired_side,
+                base: base_side,
+                declared: desired_side,
+                hints: &hints,
+                baseline: &baseline,
+            };
+            let mut state = PlanState::default();
+            let err =
+                now(dialect
+                    .check_names_against_catalog(&mut state, &mut conn, &mut plan, frame, false))
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SQLite") && msg.contains(attempt_name) && msg.contains(existing_name),
+                "expected SQLite + {attempt_name} + {existing_name}, got: {msg}"
+            );
+        }
+
+        // 3. Stray table at case-only rename's intermediate name (case-folded)
+        //    is refused naming SQLite and both names.
+        let case_rename = Change::Table(TableChange::RenameTable {
+            uid: managed_uid.clone(),
+            from: TableName::new("main", "ManagedTbl"),
+            to: TableName::new("main", "managedtbl"),
+            defaults: Vec::new(),
+        });
+        let inter = dialect
+            .intermediate_tables(&case_rename, Strategy::default())
+            .expect("intermediate table");
+        assert_eq!(inter.len(), 1);
+        let stray_upper = inter[0].name.to_ascii_uppercase();
+        now(conn.execute(&format!("CREATE TABLE \"{stray_upper}\" (x INTEGER)")))
+            .expect("create stray intermediate");
+        {
+            let mut desired = base.clone();
+            let tbl = desired
+                .tables
+                .remove(&TableName::new("main", "ManagedTbl"))
+                .expect("table");
+            desired
+                .tables
+                .insert(TableName::new("main", "managedtbl"), tbl);
+            let mut desired_ids = base_ids.clone();
+            desired_ids
+                .tables
+                .insert(managed_uid.clone(), TableName::new("main", "managedtbl"));
+            desired_ids.columns.insert(
+                uid(pbps_model::UidKind::Column, "main.ManagedTbl.id"),
+                TableName::new("main", "managedtbl").column("id"),
+            );
+            let mut plan = pbps_diff::order::propose(change_set(vec![case_rename]));
+            let err = run_name_methods(
+                &dialect,
+                &mut conn,
+                &mut plan,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                &[],
+            )
+            .err()
+            .expect("stray intermediate table must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SQLite")
+                    && msg.contains(&inter[0].name)
+                    && msg.contains(&stray_upper),
+                "expected SQLite + intermediate + stray, got: {msg}"
+            );
+        }
+        now(conn.execute(&format!("DROP TABLE \"{stray_upper}\""))).expect("drop stray");
+
+        // 4. Negative-of-collision: trigger name `onlytrigger` and non-ASCII
+        //    `cafÉ` (distinct from `café`) are NOT collisions.
+        for free_name in ["onlytrigger", "cafÉ"] {
+            let mut desired = base.clone();
+            let mut desired_ids = base_ids.clone();
+            let new_uid = table_id(&mut desired_ids, free_name);
+            col_id(&mut desired_ids, free_name, "x");
+            desired
+                .tables
+                .insert(TableName::new("main", free_name), table_with_cols(&["x"]));
+            let mut plan = pbps_diff::order::propose(change_set(vec![Change::Table(
+                TableChange::CreateTable {
+                    uid: new_uid,
+                    name: TableName::new("main", free_name),
+                    table: Box::new(table_with_cols(&["x"])),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            )]));
+            run_name_methods(
+                &dialect,
+                &mut conn,
+                &mut plan,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("{free_name} should not collide: {e}"));
+        }
+
+        // Also creating a view colliding with an unmanaged table fails.
+        let mut desired_v = base.clone();
+        let v_id = ModuleId::Named(TableName::new("main", "unmanagedtbl"));
+        desired_v
+            .modules
+            .insert(v_id.clone(), *view_module("SELECT 1"));
+        let mut plan_v = pbps_diff::order::propose(change_set(vec![Change::Module(
+            ModuleChange::CreateModule {
+                id: v_id,
+                module: view_module("SELECT 1"),
+            },
+        )]));
+        let err_v = run_name_methods(
+            &dialect,
+            &mut conn,
+            &mut plan_v,
+            &base,
+            &base_ids,
+            &desired_v,
+            &base_ids,
+            &[],
+        )
+        .err()
+        .expect("view colliding with unmanaged table must be refused");
+        let msg_v = err_v.to_string();
+        assert!(
+            msg_v.contains("SQLite")
+                && msg_v.contains("unmanagedtbl")
+                && msg_v.contains("UnmanagedTbl"),
+            "{msg_v}"
+        );
+    }
+
+    #[test]
+    fn key_constraint_name_equal_to_existing_table_or_index_is_not_a_collision() {
+        use pbps_model::{Change, PrimaryKey, TableChange, UniqueConstraint};
+
+        let (_tmp, mut conn) = TempDb::create();
+        let dialect = Sqlite::default();
+        now(conn.execute("CREATE TABLE Existing (id INTEGER PRIMARY KEY)")).expect("seed");
+        now(conn.execute("CREATE INDEX ExistingIdx ON Existing (id)")).expect("seed idx");
+
+        let mut base = Schema::default();
+        let mut base_ids = IdsFile::default();
+        table_id(&mut base_ids, "Existing");
+        col_id(&mut base_ids, "Existing", "id");
+        base.tables
+            .insert(TableName::new("main", "Existing"), table_with_cols(&["id"]));
+
+        let mut desired = base.clone();
+        let mut desired_ids = base_ids.clone();
+        let child_uid = table_id(&mut desired_ids, "child");
+        col_id(&mut desired_ids, "child", "id");
+        col_id(&mut desired_ids, "child", "code");
+        let mut child = table_with_cols(&["id", "code"]);
+        child.primary_key = Some(PrimaryKey {
+            name: Some("Existing".into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        child.unique.insert(
+            "ExistingIdx".into(),
+            UniqueConstraint {
+                columns: vec!["code".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+        );
+        desired
+            .tables
+            .insert(TableName::new("main", "child"), child.clone());
+
+        let mut plan =
+            pbps_diff::order::propose(change_set(vec![Change::Table(TableChange::CreateTable {
+                uid: child_uid,
+                name: TableName::new("main", "child"),
+                table: Box::new(child),
+                beside_default: None,
+                moves_at_most: None,
+            })]));
+
+        run_name_methods(
+            &dialect,
+            &mut conn,
+            &mut plan,
+            &base,
+            &base_ids,
+            &desired,
+            &desired_ids,
+            &[],
+        )
+        .expect("PK/UNIQUE names sharing an existing table/index name must pass on SQLite");
+    }
+
+    #[test]
+    fn column_collisions_with_ordinary_and_generated_columns_are_refused() {
+        use pbps_model::{Change, ColumnChange};
+
+        let (_tmp, mut conn) = TempDb::create();
+        let dialect = Sqlite::default();
+        now(conn.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, Qty INTEGER, \
+             DoubleQty INTEGER GENERATED ALWAYS AS (Qty * 2) VIRTUAL, \
+             StoredQty INTEGER GENERATED ALWAYS AS (Qty * 3) STORED)",
+        ))
+        .expect("seed");
+
+        let mut base = Schema::default();
+        let mut base_ids = IdsFile::default();
+        table_id(&mut base_ids, "items");
+        col_id(&mut base_ids, "items", "id");
+        let qty_uid = col_id(&mut base_ids, "items", "Qty");
+        base.tables.insert(
+            TableName::new("main", "items"),
+            table_with_cols(&["id", "Qty"]),
+        );
+
+        // Adding a column colliding (case-folded) with an existing ordinary,
+        // virtual generated, or stored generated column is refused.
+        for (attempt, existing) in [
+            ("qty", "Qty"),
+            ("doubleqty", "DoubleQty"),
+            ("storedqty", "StoredQty"),
+        ] {
+            let mut desired = base.clone();
+            let mut desired_ids = base_ids.clone();
+            let c_uid = col_id(&mut desired_ids, "items", attempt);
+            desired
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items")
+                .columns
+                .insert(attempt.into(), int_col());
+            let mut plan = pbps_diff::order::propose(change_set(vec![Change::Column(
+                ColumnChange::AddColumn {
+                    uid: c_uid,
+                    table: TableName::new("main", "items"),
+                    name: attempt.into(),
+                    column: Box::new(int_col()),
+                },
+            )]));
+            let err = run_name_methods(
+                &dialect,
+                &mut conn,
+                &mut plan,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                &[],
+            )
+            .err()
+            .expect("column collision must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SQLite") && msg.contains(attempt) && msg.contains(existing),
+                "expected SQLite + {attempt} + {existing}, got: {msg}"
+            );
+        }
+
+        // Renaming a column onto a hidden/generated column is refused.
+        {
+            let mut desired = base.clone();
+            let tbl = desired
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items");
+            tbl.columns.shift_remove("Qty");
+            tbl.columns.insert("doubleqty".into(), int_col());
+            let mut desired_ids = base_ids.clone();
+            desired_ids.columns.insert(
+                qty_uid.clone(),
+                TableName::new("main", "items").column("doubleqty"),
+            );
+            let mut plan = pbps_diff::order::propose(change_set(vec![Change::Column(
+                ColumnChange::RenameColumn {
+                    uid: qty_uid,
+                    table: TableName::new("main", "items"),
+                    from: "Qty".into(),
+                    to: "doubleqty".into(),
+                    table_was: None,
+                },
+            )]));
+            let err = run_name_methods(
+                &dialect,
+                &mut conn,
+                &mut plan,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                &[],
+            )
+            .err()
+            .expect("rename onto generated column must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SQLite") && msg.contains("doubleqty") && msg.contains("DoubleQty"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_then_create_and_rename_into_freed_name_are_ordered_and_swap_cycle_is_refused() {
+        use pbps_model::{Change, TableChange};
+
+        let (_tmp, mut conn) = TempDb::create();
+        let dialect = Sqlite::default();
+        now(conn.execute("CREATE TABLE Alpha (id INTEGER PRIMARY KEY)")).expect("Alpha");
+        now(conn.execute("CREATE INDEX IxAlpha ON Alpha (id)")).expect("IxAlpha");
+        now(conn.execute("CREATE TABLE Beta (id INTEGER PRIMARY KEY)")).expect("Beta");
+
+        let mut base = Schema::default();
+        let mut base_ids = IdsFile::default();
+        let alpha_uid = table_id(&mut base_ids, "Alpha");
+        col_id(&mut base_ids, "Alpha", "id");
+        let beta_uid = table_id(&mut base_ids, "Beta");
+        col_id(&mut base_ids, "Beta", "id");
+        base.tables
+            .insert(TableName::new("main", "Alpha"), table_with_cols(&["id"]));
+        base.tables
+            .insert(TableName::new("main", "Beta"), table_with_cols(&["id"]));
+
+        // 1. Out-of-order case-folded drop-then-create: CreateTable `alpha` listed
+        //    BEFORE DropTable `Alpha` (plus CreateTable `ixalpha` freed when `Alpha`
+        //    drops its unmanaged index `IxAlpha`).
+        {
+            let mut desired = Schema::default();
+            let mut desired_ids = IdsFile::default();
+            desired_ids
+                .tables
+                .insert(beta_uid.clone(), TableName::new("main", "Beta"));
+            col_id(&mut desired_ids, "Beta", "id");
+            desired
+                .tables
+                .insert(TableName::new("main", "Beta"), table_with_cols(&["id"]));
+            let new_alpha_uid = uid(pbps_model::UidKind::Table, "main.alpha.new");
+            desired_ids
+                .tables
+                .insert(new_alpha_uid.clone(), TableName::new("main", "alpha"));
+            col_id(&mut desired_ids, "alpha", "x");
+            desired
+                .tables
+                .insert(TableName::new("main", "alpha"), table_with_cols(&["x"]));
+            let new_ix_uid = table_id(&mut desired_ids, "ixalpha");
+            col_id(&mut desired_ids, "ixalpha", "y");
+            desired
+                .tables
+                .insert(TableName::new("main", "ixalpha"), table_with_cols(&["y"]));
+
+            let mut plan = pbps_diff::order::propose(change_set(vec![
+                Change::Table(TableChange::CreateTable {
+                    uid: new_alpha_uid,
+                    name: TableName::new("main", "alpha"),
+                    table: Box::new(table_with_cols(&["x"])),
+                    beside_default: None,
+                    moves_at_most: None,
+                }),
+                Change::Table(TableChange::CreateTable {
+                    uid: new_ix_uid,
+                    name: TableName::new("main", "ixalpha"),
+                    table: Box::new(table_with_cols(&["y"])),
+                    beside_default: None,
+                    moves_at_most: None,
+                }),
+                Change::Table(TableChange::DropTable {
+                    uid: alpha_uid.clone(),
+                    name: TableName::new("main", "Alpha"),
+                    detach_from: None,
+                }),
+            ]));
+
+            run_name_methods(
+                &dialect,
+                &mut conn,
+                &mut plan,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                &[],
+            )
+            .expect("drop-then-create reorders and passes");
+
+            assert!(
+                matches!(
+                    &plan.changes[0].change,
+                    Change::Table(TableChange::DropTable { name, .. }) if name.name == "Alpha"
+                ),
+                "DropTable Alpha must move first: {:?}",
+                plan.changes
+            );
+        }
+
+        // 2. Out-of-order rename chain: `Beta -> alpha` listed BEFORE `Alpha -> Gamma`.
+        {
+            let mut desired = Schema::default();
+            let mut desired_ids = IdsFile::default();
+            desired_ids
+                .tables
+                .insert(alpha_uid.clone(), TableName::new("main", "Gamma"));
+            desired_ids
+                .tables
+                .insert(beta_uid.clone(), TableName::new("main", "alpha"));
+            col_id(&mut desired_ids, "Gamma", "id");
+            col_id(&mut desired_ids, "alpha", "id");
+            desired
+                .tables
+                .insert(TableName::new("main", "Gamma"), table_with_cols(&["id"]));
+            desired
+                .tables
+                .insert(TableName::new("main", "alpha"), table_with_cols(&["id"]));
+
+            let mut plan = pbps_diff::order::propose(change_set(vec![
+                Change::Table(TableChange::RenameTable {
+                    uid: beta_uid.clone(),
+                    from: TableName::new("main", "Beta"),
+                    to: TableName::new("main", "alpha"),
+                    defaults: Vec::new(),
+                }),
+                Change::Table(TableChange::RenameTable {
+                    uid: alpha_uid.clone(),
+                    from: TableName::new("main", "Alpha"),
+                    to: TableName::new("main", "Gamma"),
+                    defaults: Vec::new(),
+                }),
+            ]));
+
+            run_name_methods(
+                &dialect,
+                &mut conn,
+                &mut plan,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                &[],
+            )
+            .expect("rename chain reorders and passes");
+
+            assert!(
+                matches!(
+                    &plan.changes[0].change,
+                    Change::Table(TableChange::RenameTable { from, to, .. })
+                        if from.name == "Alpha" && to.name == "Gamma"
+                ),
+                "Alpha -> Gamma must move before Beta -> alpha: {:?}",
+                plan.changes
+            );
+        }
+
+        // 3. Negative: a case-folded table-rename swap (`Alpha -> beta`, `Beta -> alpha`)
+        //    is a cycle and is refused naming SQLite.
+        {
+            let mut desired = Schema::default();
+            let mut desired_ids = IdsFile::default();
+            desired_ids
+                .tables
+                .insert(alpha_uid.clone(), TableName::new("main", "beta"));
+            desired_ids
+                .tables
+                .insert(beta_uid.clone(), TableName::new("main", "alpha"));
+            col_id(&mut desired_ids, "beta", "id");
+            col_id(&mut desired_ids, "alpha", "id");
+            desired
+                .tables
+                .insert(TableName::new("main", "beta"), table_with_cols(&["id"]));
+            desired
+                .tables
+                .insert(TableName::new("main", "alpha"), table_with_cols(&["id"]));
+
+            let mut plan = pbps_diff::order::propose(change_set(vec![
+                Change::Table(TableChange::RenameTable {
+                    uid: alpha_uid,
+                    from: TableName::new("main", "Alpha"),
+                    to: TableName::new("main", "beta"),
+                    defaults: Vec::new(),
+                }),
+                Change::Table(TableChange::RenameTable {
+                    uid: beta_uid,
+                    from: TableName::new("main", "Beta"),
+                    to: TableName::new("main", "alpha"),
+                    defaults: Vec::new(),
+                }),
+            ]));
+
+            let err = run_name_methods(
+                &dialect,
+                &mut conn,
+                &mut plan,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                &[],
+            )
+            .err()
+            .expect("table rename swap must be refused");
+            assert!(err.to_string().contains("SQLite"), "{err}");
+        }
+    }
+
+    #[test]
+    fn column_rename_chain_is_ordered_and_case_folded_column_swap_is_refused() {
+        use pbps_model::{Change, ColumnChange};
+
+        let (_tmp, mut conn) = TempDb::create();
+        let dialect = Sqlite::default();
+        now(conn.execute("CREATE TABLE items (a INTEGER, b INTEGER)")).expect("seed");
+
+        let mut base = Schema::default();
+        let mut base_ids = IdsFile::default();
+        let t_uid = table_id(&mut base_ids, "items");
+        let a_uid = col_id(&mut base_ids, "items", "a");
+        let b_uid = col_id(&mut base_ids, "items", "b");
+        base.tables.insert(
+            TableName::new("main", "items"),
+            table_with_cols(&["a", "b"]),
+        );
+
+        // 1. Out-of-order case-folded chain: `a -> B` listed before `b -> c`.
+        {
+            let mut desired = Schema::default();
+            let mut desired_ids = IdsFile::default();
+            desired_ids
+                .tables
+                .insert(t_uid.clone(), TableName::new("main", "items"));
+            desired_ids
+                .columns
+                .insert(a_uid.clone(), TableName::new("main", "items").column("B"));
+            desired_ids
+                .columns
+                .insert(b_uid.clone(), TableName::new("main", "items").column("c"));
+            desired.tables.insert(
+                TableName::new("main", "items"),
+                table_with_cols(&["B", "c"]),
+            );
+
+            let mut plan = pbps_diff::order::propose(change_set(vec![
+                Change::Column(ColumnChange::RenameColumn {
+                    uid: a_uid.clone(),
+                    table: TableName::new("main", "items"),
+                    from: "a".into(),
+                    to: "B".into(),
+                    table_was: None,
+                }),
+                Change::Column(ColumnChange::RenameColumn {
+                    uid: b_uid.clone(),
+                    table: TableName::new("main", "items"),
+                    from: "b".into(),
+                    to: "c".into(),
+                    table_was: None,
+                }),
+            ]));
+
+            run_name_methods(
+                &dialect,
+                &mut conn,
+                &mut plan,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                &[],
+            )
+            .expect("column rename chain orders and passes");
+
+            assert!(
+                matches!(
+                    &plan.changes[0].change,
+                    Change::Column(ColumnChange::RenameColumn { from, to, .. })
+                        if from.raw() == "b" && to.raw() == "c"
+                ),
+                "b -> c must run before a -> B: {:?}",
+                plan.changes
+            );
+        }
+
+        // 2. Negative: a case-folded swap (`a -> B`, `b -> A`) is refused by
+        //    `object_order::order_column_renames`.
+        {
+            let mut desired = Schema::default();
+            let mut desired_ids = IdsFile::default();
+            desired_ids
+                .tables
+                .insert(t_uid, TableName::new("main", "items"));
+            desired_ids
+                .columns
+                .insert(a_uid.clone(), TableName::new("main", "items").column("B"));
+            desired_ids
+                .columns
+                .insert(b_uid.clone(), TableName::new("main", "items").column("A"));
+            desired.tables.insert(
+                TableName::new("main", "items"),
+                table_with_cols(&["A", "B"]),
+            );
+
+            let mut plan = pbps_diff::order::propose(change_set(vec![
+                Change::Column(ColumnChange::RenameColumn {
+                    uid: a_uid,
+                    table: TableName::new("main", "items"),
+                    from: "a".into(),
+                    to: "B".into(),
+                    table_was: None,
+                }),
+                Change::Column(ColumnChange::RenameColumn {
+                    uid: b_uid,
+                    table: TableName::new("main", "items"),
+                    from: "b".into(),
+                    to: "A".into(),
+                    table_was: None,
+                }),
+            ]));
+
+            let err = run_name_methods(
+                &dialect,
+                &mut conn,
+                &mut plan,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                &[],
+            )
+            .err()
+            .expect("column swap must be refused");
+            assert!(
+                err.to_string().contains("cycle")
+                    || err.to_string().contains("two separate plans")
+                    || err.to_string().contains("rename"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_inventory_returns_error_and_never_empty() {
+        use pbps_model::{Change, TableChange};
+
+        let (tmp, mut conn) = TempDb::create();
+        let dialect = Sqlite::default();
+        now(conn.execute("PRAGMA busy_timeout = 0")).expect("busy_timeout=0");
+
+        let locker =
+            pbps_db::sqlite::Connection::open(tmp.path(), pbps_db::sqlite::OpenMode::ExistingOnly)
+                .expect("second connection");
+        locker.execute("BEGIN EXCLUSIVE", &[]).expect("lock file");
+
+        let base = Schema::default();
+        let base_ids = IdsFile::default();
+        let mut desired = Schema::default();
+        let mut desired_ids = IdsFile::default();
+        let t_uid = table_id(&mut desired_ids, "t");
+        col_id(&mut desired_ids, "t", "id");
+        desired
+            .tables
+            .insert(TableName::new("main", "t"), table_with_cols(&["id"]));
+        let mut plan =
+            pbps_diff::order::propose(change_set(vec![Change::Table(TableChange::CreateTable {
+                uid: t_uid,
+                name: TableName::new("main", "t"),
+                table: Box::new(table_with_cols(&["id"])),
+                beside_default: None,
+                moves_at_most: None,
+            })]));
+
+        let hints = pbps_model::Hints::default();
+        let baseline = StateSnapshot::new(
+            pbps_model::StateKind::Baseline,
+            base.clone(),
+            base_ids.clone(),
+            "test",
+        );
+        let base_side = pbps_diff::Side {
+            schema: &base,
+            ids: &base_ids,
+        };
+        let desired_side = pbps_diff::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        };
+        let frame = Frame {
+            label: "test.db",
+            recorded: base_side,
+            written: desired_side,
+            base: base_side,
+            declared: desired_side,
+            hints: &hints,
+            baseline: &baseline,
+        };
+
+        let mut state = PlanState::default();
+        let check_err = now(
+            dialect.check_names_against_catalog(&mut state, &mut conn, &mut plan, frame, false)
+        )
+        .unwrap_err();
+        assert!(
+            state.inventory.is_none(),
+            "failed read must not cache an inventory: {check_err}"
+        );
+
+        let order_err = now(dialect.order_by_catalog(&mut state, &mut conn, &mut plan, frame))
+            .expect_err("locked file must fail order_by_catalog too");
+        assert!(state.inventory.is_none(), "{order_err}");
+
+        locker.execute("ROLLBACK", &[]).expect("unlock");
+    }
+
+    #[test]
+    fn sqlite_plan_session_positions_pass_for_every_supported_change_kind_and_pin_remaining_refusals()
+     {
+        use pbps_model::{
+            Change, CheckConstraint, Column, ColumnChange, ConstraintChange, ForeignKey, Index,
+            IndexChange, IndexColumn, ModuleChange, ModuleId, ModuleKind, PrimaryKey, RoleName,
+            TableChange, UniqueConstraint, ValueSource,
+        };
+
+        let dialect = Sqlite::default();
+
+        // Run every PlanSession position in `plan_db.rs` order and return
+        // `Ok(())` or `Err((position_name, error_message))`.
+        let run_all_positions = |seed_sql: &[&str],
+                                 base: &Schema,
+                                 base_ids: &IdsFile,
+                                 desired: &Schema,
+                                 desired_ids: &IdsFile,
+                                 changes: Vec<Change>|
+         -> Result<(), (&'static str, String)> {
+            let (_tmp, mut conn) = TempDb::create();
+            for sql in seed_sql {
+                now(conn.execute(sql)).expect(sql);
+            }
+            let scoped = scoped_of(base, base_ids);
+            let mut plan = pbps_diff::order::propose(change_set(changes));
+            let hints = pbps_model::Hints::default();
+            let baseline = StateSnapshot::new(
+                pbps_model::StateKind::Baseline,
+                base.clone(),
+                base_ids.clone(),
+                "test",
+            );
+            let base_side = pbps_diff::Side {
+                schema: base,
+                ids: base_ids,
+            };
+            let desired_side = pbps_diff::Side {
+                schema: desired,
+                ids: desired_ids,
+            };
+            let frame = Frame {
+                label: "test.db",
+                recorded: base_side,
+                written: desired_side,
+                base: base_side,
+                declared: desired_side,
+                hints: &hints,
+                baseline: &baseline,
+            };
+            let mut state = PlanState::default();
+
+            dialect
+                .refuse_occupied_relation_names(&plan, &scoped, &[], &[], "test.db")
+                .map_err(|e| ("refuse_occupied_relation_names", e.to_string()))?;
+            dialect
+                .require_transactional_rebuilds(&plan, false)
+                .map_err(|e| ("require_transactional_rebuilds", e.to_string()))?;
+            now(dialect.check_names_against_catalog(&mut state, &mut conn, &mut plan, frame, false))
+                .map_err(|e| ("check_names_against_catalog", e.to_string()))?;
+            let reads = now(dialect.read_before_schedule(&mut conn, &plan, desired, base_ids))
+                .map_err(|e| ("read_before_schedule", e.to_string()))?;
+            let rediff =
+                |_also: &BTreeSet<ModuleId>| -> anyhow::Result<PlanningPlan<pbps_diff::order::Draft>> {
+                    anyhow::bail!("unexpected rediff")
+                };
+            let (mut plan, _deps) = now(dialect.schedule(
+                &mut state,
+                &mut conn,
+                plan,
+                frame,
+                reads.role_members.as_ref(),
+                &rediff,
+            ))
+            .map_err(|e| ("schedule", e.to_string()))?;
+            let ordered = now(dialect.order_by_catalog(&mut state, &mut conn, &mut plan, frame))
+                .map_err(|e| ("order_by_catalog", e.to_string()))?;
+            #[cfg(debug_assertions)]
+            if !ordered.verified {
+                pbps_diff::order::shadow::observe_scheduled(
+                    base_side,
+                    desired_side,
+                    &dialect,
+                    &hints.annotations.modules(desired),
+                    &plan,
+                    pbps_diff::order::shadow::Stage::Final,
+                    ordered.facts.as_ref(),
+                    &Default::default(),
+                );
+            }
+            now(dialect.check_final_order(&state, &mut conn, &plan, frame))
+                .map_err(|e| ("check_final_order", e.to_string()))?;
+            let plan_names = pbps_model::plan_names::PlanNames::of(&plan.changes, desired_ids)
+                .map_err(|e| ("plan_names", e.to_string()))?;
+            now(dialect.vet_plan_sites(&state, &mut conn, &plan_names, &mut |_| {}))
+                .map_err(|e| ("vet_plan_sites", e.to_string()))?;
+            let _ = now(dialect.probe_stranded_rows(&state, &mut conn, &plan, frame, None))
+                .map_err(|e| ("probe_stranded_rows", e.to_string()))?;
+            let owners = BTreeMap::new();
+            let role = RoleName::new("");
+            now(dialect.support_rows(
+                &mut conn,
+                &plan,
+                desired_ids,
+                SupportReads {
+                    owners: &owners,
+                    session_role: &role,
+                    unrevocable: &[],
+                },
+            ))
+            .map_err(|e| ("support_rows", e.to_string()))?;
+            now(dialect.server_limits(&mut conn, &plan))
+                .map_err(|e| ("server_limits", e.to_string()))?;
+            Ok(())
+        };
+
+        // Shared baseline with parent & items tables.
+        let mut base = Schema::default();
+        let mut base_ids = IdsFile::default();
+        let parent_uid = table_id(&mut base_ids, "parent");
+        col_id(&mut base_ids, "parent", "id");
+        let items_uid = table_id(&mut base_ids, "items");
+        col_id(&mut base_ids, "items", "id");
+        let qty_uid = col_id(&mut base_ids, "items", "qty");
+        base.tables
+            .insert(TableName::new("main", "parent"), table_with_cols(&["id"]));
+        let mut items_tbl = table_with_cols(&["id", "qty"]);
+        items_tbl.checks.insert(
+            "ck_pos".into(),
+            CheckConstraint {
+                expression: "qty >= 0".into(),
+            },
+        );
+        items_tbl.foreign_keys.insert(
+            "fk_parent".into(),
+            ForeignKey {
+                columns: vec!["qty".into()],
+                references_table: TableName::new("main", "parent"),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        base.tables
+            .insert(TableName::new("main", "items"), items_tbl);
+        let seed = [
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+        ];
+
+        // 1. Create table (with PK, UNIQUE, CHECK, DEFAULT, FK).
+        {
+            let mut desired = base.clone();
+            let mut desired_ids = base_ids.clone();
+            let u = table_id(&mut desired_ids, "orders");
+            col_id(&mut desired_ids, "orders", "id");
+            col_id(&mut desired_ids, "orders", "code");
+            let mut t = table_with_cols(&["id", "code"]);
+            t.primary_key = Some(PrimaryKey {
+                name: Some("pk_orders".into()),
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            });
+            t.unique.insert(
+                "uq_orders".into(),
+                UniqueConstraint {
+                    columns: vec!["code".into()],
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                },
+            );
+            t.checks.insert(
+                "ck_code".into(),
+                CheckConstraint {
+                    expression: "code > 0".into(),
+                },
+            );
+            desired
+                .tables
+                .insert(TableName::new("main", "orders"), t.clone());
+            run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                vec![Change::Table(TableChange::CreateTable {
+                    uid: u,
+                    name: TableName::new("main", "orders"),
+                    table: Box::new(t),
+                    beside_default: None,
+                    moves_at_most: None,
+                })],
+            )
+            .expect("create table passes every PlanSession position");
+        }
+
+        // 2. Create view.
+        {
+            let mut desired = base.clone();
+            let v = ModuleId::Named(TableName::new("main", "v_items"));
+            desired
+                .modules
+                .insert(v.clone(), *view_module("SELECT id FROM items"));
+            run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &base_ids,
+                vec![Change::Module(ModuleChange::CreateModule {
+                    id: v,
+                    module: view_module("SELECT id FROM items"),
+                })],
+            )
+            .expect("create view passes every PlanSession position");
+        }
+
+        // 3. Add index (with partial WHERE).
+        {
+            let mut desired = base.clone();
+            let idx = Index {
+                columns: vec![IndexColumn::column("qty")],
+                include: Vec::new(),
+                unique: false,
+                filter: Some("qty > 0".into()),
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: None,
+            };
+            desired
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items")
+                .indexes
+                .insert("ix_qty".into(), idx.clone());
+            run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &base_ids,
+                vec![Change::Index(IndexChange::AddIndex {
+                    table: TableName::new("main", "items"),
+                    name: "ix_qty".into(),
+                    index: Box::new(idx),
+                    clustered: false,
+                })],
+            )
+            .expect("add index passes every PlanSession position");
+        }
+
+        // 4. Add column with constant default.
+        {
+            let mut desired = base.clone();
+            let mut desired_ids = base_ids.clone();
+            let c_uid = col_id(&mut desired_ids, "items", "status");
+            let mut col = Column::new("integer".parse().expect("type"));
+            col.nullable = false;
+            col.value_source = ValueSource::Default("0".into());
+            desired
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items")
+                .columns
+                .insert("status".into(), col.clone());
+            run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                vec![Change::Column(ColumnChange::AddColumn {
+                    uid: c_uid,
+                    table: TableName::new("main", "items"),
+                    name: "status".into(),
+                    column: Box::new(col),
+                })],
+            )
+            .expect("add column with constant default passes every PlanSession position");
+        }
+
+        // 5. Add check & drop check.
+        {
+            let mut desired = base.clone();
+            let ck = CheckConstraint {
+                expression: "qty < 100".into(),
+            };
+            let tbl = desired
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items");
+            tbl.checks.remove("ck_pos");
+            tbl.checks.insert("ck_max".into(), ck.clone());
+            run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &base_ids,
+                vec![
+                    Change::Constraint(ConstraintChange::AddCheck {
+                        table: TableName::new("main", "items"),
+                        name: "ck_max".into(),
+                        constraint: ck,
+                    }),
+                    Change::Constraint(ConstraintChange::DropCheck {
+                        table: TableName::new("main", "items"),
+                        name: "ck_pos".into(),
+                    }),
+                ],
+            )
+            .expect("add/drop check passes every PlanSession position");
+        }
+
+        // 6. Drop foreign key.
+        {
+            let mut desired = base.clone();
+            desired
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items")
+                .foreign_keys
+                .remove("fk_parent");
+            run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &base_ids,
+                vec![Change::Constraint(ConstraintChange::DropForeignKey {
+                    table: TableName::new("main", "items"),
+                    name: "fk_parent".into(),
+                })],
+            )
+            .expect("drop foreign key passes every PlanSession position");
+        }
+
+        // 7. Alter column nullability.
+        {
+            let mut desired = base.clone();
+            desired
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items")
+                .columns
+                .get_mut("qty")
+                .expect("qty")
+                .nullable = false;
+            run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &base_ids,
+                vec![Change::Column(ColumnChange::AlterColumnNullability {
+                    uid: qty_uid.clone(),
+                    column: TableName::new("main", "items").column("qty"),
+                    ty: "integer".parse().expect("type"),
+                    to_nullable: false,
+                    collation: None,
+                    through_external_partitions: false,
+                })],
+            )
+            .expect("alter column nullability passes every PlanSession position");
+        }
+
+        // 8. Rename table (ordinary + case-only).
+        for target_name in ["records", "ITEMS"] {
+            let mut desired = base.clone();
+            let tbl = desired
+                .tables
+                .remove(&TableName::new("main", "items"))
+                .expect("items");
+            desired
+                .tables
+                .insert(TableName::new("main", target_name), tbl);
+            let mut desired_ids = base_ids.clone();
+            desired_ids
+                .tables
+                .insert(items_uid.clone(), TableName::new("main", target_name));
+            desired_ids.columns.insert(
+                uid(pbps_model::UidKind::Column, "main.items.id"),
+                TableName::new("main", target_name).column("id"),
+            );
+            desired_ids.columns.insert(
+                qty_uid.clone(),
+                TableName::new("main", target_name).column("qty"),
+            );
+            run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                vec![Change::Table(TableChange::RenameTable {
+                    uid: items_uid.clone(),
+                    from: TableName::new("main", "items"),
+                    to: TableName::new("main", target_name),
+                    defaults: Vec::new(),
+                })],
+            )
+            .unwrap_or_else(|e| panic!("rename table to {target_name} should pass: {e:?}"));
+        }
+
+        // 9. Rename column.
+        {
+            let mut desired = base.clone();
+            let tbl = desired
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items");
+            let c = tbl.columns.shift_remove("qty").expect("qty");
+            tbl.columns.insert("amount".into(), c);
+            let mut desired_ids = base_ids.clone();
+            desired_ids.columns.insert(
+                qty_uid.clone(),
+                TableName::new("main", "items").column("amount"),
+            );
+            run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                vec![Change::Column(ColumnChange::RenameColumn {
+                    uid: qty_uid,
+                    table: TableName::new("main", "items"),
+                    from: "qty".into(),
+                    to: "amount".into(),
+                    table_was: None,
+                })],
+            )
+            .expect("rename column passes every PlanSession position");
+        }
+
+        // 10. Pin the positions that still refuse plans needing later PRs:
+        // - DropTable -> `check_final_order` (drop blockers)
+        {
+            let mut desired = base.clone();
+            desired.tables.remove(&TableName::new("main", "parent"));
+            let mut desired_ids = base_ids.clone();
+            desired_ids.tables.remove(&parent_uid);
+            desired_ids
+                .columns
+                .remove(&uid(pbps_model::UidKind::Column, "main.parent.id"));
+            let (pos, _) = run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                vec![Change::Table(TableChange::DropTable {
+                    uid: parent_uid,
+                    name: TableName::new("main", "parent"),
+                    detach_from: None,
+                })],
+            )
+            .unwrap_err();
+            assert_eq!(pos, "check_final_order");
+        }
+        // - DropColumn -> `check_final_order` (drop blockers)
+        {
+            let mut desired = base.clone();
+            desired
+                .tables
+                .get_mut(&TableName::new("main", "items"))
+                .expect("items")
+                .columns
+                .shift_remove("qty");
+            let mut desired_ids = base_ids.clone();
+            desired_ids
+                .columns
+                .remove(&uid(pbps_model::UidKind::Column, "main.items.qty"));
+            let (pos, _) = run_all_positions(
+                &seed,
+                &base,
+                &base_ids,
+                &desired,
+                &desired_ids,
+                vec![Change::Column(ColumnChange::DropColumn {
+                    uid: uid(pbps_model::UidKind::Column, "main.items.qty"),
+                    column: TableName::new("main", "items").column("qty"),
+                })],
+            )
+            .unwrap_err();
+            assert_eq!(pos, "check_final_order");
+        }
+        // - DropModule (View) -> `schedule` (module dependents)
+        {
+            let mut base_v = base.clone();
+            let v_id = ModuleId::Named(TableName::new("main", "v_old"));
+            base_v
+                .modules
+                .insert(v_id.clone(), *view_module("SELECT 1"));
+            let (pos, _) = run_all_positions(
+                &[
+                    "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+                    "CREATE VIEW v_old AS SELECT 1",
+                ],
+                &base_v,
+                &base_ids,
+                &base,
+                &base_ids,
+                vec![Change::Module(ModuleChange::DropModule {
+                    id: v_id,
+                    kind: ModuleKind::View,
+                })],
+            )
+            .unwrap_err();
+            assert_eq!(pos, "schedule");
+        }
+        // - AlterModule (View) -> `schedule` (module dependents)
+        {
+            let mut base_v = base.clone();
+            let v_id = ModuleId::Named(TableName::new("main", "v_edit"));
+            base_v
+                .modules
+                .insert(v_id.clone(), *view_module("SELECT 1"));
+            let mut desired_v = base.clone();
+            desired_v
+                .modules
+                .insert(v_id.clone(), *view_module("SELECT 2"));
+            let (pos, _) = run_all_positions(
+                &[
+                    "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+                    "CREATE VIEW v_edit AS SELECT 1",
+                ],
+                &base_v,
+                &base_ids,
+                &desired_v,
+                &base_ids,
+                vec![Change::Module(ModuleChange::AlterModule {
+                    id: v_id,
+                    module: view_module("SELECT 2"),
+                })],
+            )
+            .unwrap_err();
+            assert_eq!(pos, "schedule");
+        }
     }
 }

@@ -457,7 +457,8 @@ pub fn slots(dialect: &(impl Dialect + ?Sized), address: &Address) -> Vec<SlotKe
             vec![Namespace::Routines(address.schema.clone())]
         }
         NameKind::Index => vec![index()],
-        NameKind::Key => vec![index(), constraint()],
+        NameKind::Key if dialect.keys_claim_index_name() => vec![index(), constraint()],
+        NameKind::Key => vec![constraint()],
         NameKind::Constraint => vec![constraint()],
         NameKind::Policy => vec![table(TableSpace::Policies)],
         NameKind::Column => vec![table(TableSpace::Columns)],
