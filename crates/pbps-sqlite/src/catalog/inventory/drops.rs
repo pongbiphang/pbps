@@ -128,7 +128,7 @@ fn stored<A>(source: Source<A>, kind: &str, shown: impl Display) -> Result<Optio
     }
 }
 
-fn describe_fk(child: &str, fk: &ForeignKeyEntry) -> String {
+pub(super) fn describe_fk(child: &str, fk: &ForeignKeyEntry) -> String {
     let c = Escaped(child);
     match &fk.name {
         Some(n) => format!("foreign key `{}` on table `main.{c}`", Escaped(n)),

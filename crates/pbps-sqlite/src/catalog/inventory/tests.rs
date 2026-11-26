@@ -2077,3 +2077,562 @@ fn a_primary_key_of_another_collation_does_not_cover_a_dropped_unique_index() {
         .expect("the catalog is readable");
     assert!(reports[0].blocking.is_empty(), "{:?}", reports[0].blocking);
 }
+
+#[test]
+fn real_sqlite_file_measurements_confirm_rename_rewrites_broken_objects_and_case_only_renames() {
+    let sql_of = |c: &Connection, name: &str| -> String {
+        c.query(
+            "SELECT tbl_name || ' | ' || COALESCE(sql, '<NULL>') FROM main.sqlite_schema WHERE name = ?1",
+            &[pbps_db::sqlite::Value::Text(name.into())],
+        )
+        .expect("query")
+        .first()
+        .expect("row")
+        .text(0)
+        .expect("text")
+        .to_owned()
+    };
+
+    // 1. RENAME COLUMN a -> b and RENAME TABLE t -> u rewrite every direct
+    //    referrer (views, indexes, partial/expression indexes, CHECK, outbound
+    //    and inbound FKs, triggers on t including WHEN/UPDATE OF and triggers
+    //    on other tables, and virtual/stored generated columns), and all work.
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+             CREATE TABLE log (x TEXT); \
+             CREATE TABLE other (id INTEGER PRIMARY KEY); \
+             CREATE TABLE t (\
+                 id INTEGER PRIMARY KEY, \
+                 a INTEGER, \
+                 pid INTEGER REFERENCES parent(id), \
+                 g_virt INTEGER GENERATED ALWAYS AS (a + 1) VIRTUAL, \
+                 g_stor INTEGER GENERATED ALWAYS AS (a * 2) STORED, \
+                 CONSTRAINT ck_a CHECK (a >= 0)\
+             ); \
+             CREATE TABLE child (id INTEGER PRIMARY KEY, ta INTEGER REFERENCES t(id)); \
+             CREATE UNIQUE INDEX uq_t_a ON t(a); \
+             CREATE TABLE child_a (id INTEGER PRIMARY KEY, ta INTEGER REFERENCES t(a)); \
+             CREATE INDEX ix_plain ON t(a); \
+             CREATE INDEX ix_partial ON t(id) WHERE a > 0; \
+             CREATE INDEX ix_expr ON t(abs(a)); \
+             CREATE VIEW v_t AS SELECT id, a FROM t; \
+             CREATE VIEW v_star AS SELECT * FROM t; \
+             CREATE TRIGGER tr_on_t AFTER INSERT ON t WHEN NEW.a > 0 BEGIN INSERT INTO log VALUES (CAST(NEW.a AS TEXT)); END; \
+             CREATE TRIGGER tr_upd_t AFTER UPDATE OF a ON t BEGIN INSERT INTO log VALUES (CAST(OLD.a AS TEXT) || '->' || CAST(NEW.a AS TEXT)); END; \
+             CREATE TRIGGER tr_other AFTER INSERT ON other BEGIN INSERT INTO log SELECT CAST(a AS TEXT) FROM t; END; \
+             INSERT INTO parent VALUES (1); \
+             INSERT INTO t(id, a, pid) VALUES (1, 10, 1); \
+             INSERT INTO child(id, ta) VALUES (1, 1); \
+             INSERT INTO child_a(id, ta) VALUES (1, 10);",
+        )
+        .expect("setup 1");
+
+        c.execute_batch("ALTER TABLE main.t RENAME COLUMN a TO b")
+            .expect("rename column a -> b");
+        assert!(
+            sql_of(c, "t").contains("AS (b + 1) VIRTUAL")
+                && sql_of(c, "t").contains("AS (b * 2) STORED")
+                && sql_of(c, "t").contains("CHECK (b >= 0)")
+        );
+        assert!(sql_of(c, "child_a").contains("REFERENCES t(b)"));
+        assert!(sql_of(c, "ix_plain").contains("ON t(b)"));
+        assert!(sql_of(c, "ix_partial").contains("WHERE b > 0"));
+        assert!(sql_of(c, "ix_expr").contains("ON t(abs(b))"));
+        assert!(sql_of(c, "v_t").contains("SELECT id, b FROM t"));
+        assert!(
+            sql_of(c, "tr_on_t").contains("WHEN NEW.b > 0")
+                && sql_of(c, "tr_on_t").contains("NEW.b")
+        );
+        assert!(
+            sql_of(c, "tr_upd_t").contains("UPDATE OF b ON t")
+                && sql_of(c, "tr_upd_t").contains("OLD.b")
+        );
+        assert!(sql_of(c, "tr_other").contains("CAST(b AS TEXT) FROM t"));
+        // SQLite rewrites `SELECT a FROM t` to `SELECT b FROM t` without an alias.
+        let v_cols: Vec<String> = c
+            .query("PRAGMA main.table_info(v_t)", &[])
+            .expect("v_t info")
+            .iter()
+            .map(|r| r.text(1).expect("name").to_owned())
+            .collect();
+        assert_eq!(v_cols, ["id", "b"]);
+        c.execute_batch("INSERT INTO t(id, b, pid) VALUES (2, 20, 1); UPDATE t SET b = 25 WHERE id = 2; INSERT INTO other VALUES (1)")
+            .expect("all referrers work after column rename");
+        assert!(
+            c.execute_batch("INSERT INTO t(id, b, pid) VALUES (3, -1, 1)")
+                .is_err()
+        );
+        assert_eq!(
+            c.query("SELECT g_virt, g_stor FROM t WHERE id = 2", &[])
+                .expect("gen")[0]
+                .integer(1)
+                .expect("stor"),
+            50
+        );
+
+        c.execute_batch("ALTER TABLE main.t RENAME TO u")
+            .expect("rename table t -> u");
+        for (obj, expected) in [
+            ("child", "REFERENCES \"u\"(id)"),
+            ("child_a", "REFERENCES \"u\"(b)"),
+            ("ix_plain", "ON \"u\"(b)"),
+            ("ix_partial", "ON \"u\"(id) WHERE b > 0"),
+            ("ix_expr", "ON \"u\"(abs(b))"),
+            ("v_t", "FROM \"u\""),
+            ("v_star", "FROM \"u\""),
+            ("tr_on_t", "ON \"u\""),
+            ("tr_upd_t", "ON \"u\""),
+            ("tr_other", "FROM \"u\""),
+        ] {
+            let s = sql_of(c, obj);
+            assert!(s.contains(expected), "{obj}: {s}");
+        }
+        assert!(c.query("SELECT id, b FROM v_t", &[]).is_ok());
+        assert!(
+            c.query("PRAGMA foreign_key_check", &[])
+                .expect("fkc")
+                .is_empty()
+        );
+        c.execute_batch("INSERT INTO u(id, b, pid) VALUES (4, 30, 1); UPDATE u SET b = 35 WHERE id = 4; INSERT INTO other VALUES (2); INSERT INTO child_a(id, ta) VALUES (2, 35)")
+            .expect("all referrers work after table rename");
+    }
+
+    // 2. Outbound FK column rename, self-FK, omitted-column inbound FK, string
+    //    literals, DQS fallback strings, and single-quoted table references.
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+             CREATE TABLE t (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id), self_id INTEGER REFERENCES t(id)); \
+             CREATE TABLE child_omitted (id INTEGER PRIMARY KEY, tid INTEGER REFERENCES t); \
+             CREATE TABLE other (k INTEGER); \
+             CREATE VIEW v_lit AS SELECT 'pid' AS s1, 't' AS s2, \"not_a_col\" AS dqs, pid FROM 't'; \
+             CREATE VIEW v_dqs_other AS SELECT \"pid\", \"t\" FROM other; \
+             INSERT INTO parent VALUES (1); INSERT INTO t VALUES (1, 1, 1); INSERT INTO child_omitted VALUES (1, 1);",
+        )
+        .expect("setup 2");
+        c.execute_batch("ALTER TABLE main.t RENAME COLUMN pid TO pid2; ALTER TABLE main.t RENAME COLUMN id TO id2; ALTER TABLE main.t RENAME TO u")
+            .expect("fk renames");
+        assert!(
+            sql_of(c, "u").contains("pid2 INTEGER REFERENCES parent(id)")
+                && sql_of(c, "u").contains("REFERENCES \"u\"(id2)")
+        );
+        assert!(sql_of(c, "child_omitted").contains("REFERENCES \"u\""));
+        let v_lit = sql_of(c, "v_lit");
+        assert!(
+            v_lit.contains("'pid'")
+                && v_lit.contains("'t'")
+                && v_lit.contains("'not_a_col'")
+                && v_lit.contains("pid2 FROM \"u\""),
+            "{v_lit}"
+        );
+        assert!(sql_of(c, "v_dqs_other").contains("SELECT 'pid', 't' FROM other"));
+        assert!(
+            c.query("PRAGMA foreign_key_check", &[])
+                .expect("fkc")
+                .is_empty()
+        );
+    }
+
+    // 3. Chained views and INSTEAD OF triggers on RENAME COLUMN vs aliased/case-only/RENAME TO.
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch("CREATE TABLE t (a INTEGER); CREATE VIEW v1 AS SELECT a FROM t; CREATE VIEW v2 AS SELECT a FROM v1;")
+            .expect("chained");
+        let err = c
+            .execute_batch("ALTER TABLE main.t RENAME COLUMN a TO b")
+            .expect_err("chained unaliased fails")
+            .to_string();
+        assert!(err.contains("error in view v2 after rename"), "{err}");
+        c.execute_batch("ALTER TABLE main.t RENAME TO u; ALTER TABLE main.u RENAME COLUMN a TO A")
+            .expect("table rename and case-only column rename succeed over chained views");
+    }
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch("CREATE TABLE t (a INTEGER); CREATE VIEW v1 AS SELECT a AS a FROM t; CREATE VIEW v2 AS SELECT a FROM v1;")
+            .expect("aliased");
+        c.execute_batch("ALTER TABLE main.t RENAME COLUMN a TO b")
+            .expect("aliased view succeeds");
+        assert!(sql_of(c, "v1").contains("SELECT b AS a FROM t"));
+    }
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch("CREATE TABLE t (a INTEGER); CREATE TABLE log (x INTEGER); CREATE VIEW v1 AS SELECT a FROM t; CREATE TRIGGER tr_io INSTEAD OF INSERT ON v1 BEGIN INSERT INTO log VALUES (NEW.a); END;")
+            .expect("io");
+        let err = c
+            .execute_batch("ALTER TABLE main.t RENAME COLUMN a TO b")
+            .expect_err("io fails")
+            .to_string();
+        assert!(err.contains("error in trigger tr_io after rename"), "{err}");
+    }
+
+    // 4. Already-broken views and triggers refuse every rename even on unrelated tables.
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch("CREATE TABLE gone (x INTEGER); CREATE TABLE t (a INTEGER); CREATE VIEW v_broken AS SELECT x FROM gone; DROP TABLE gone;")
+            .expect("broken view");
+        for stmt in [
+            "ALTER TABLE main.t RENAME TO u",
+            "ALTER TABLE main.t RENAME COLUMN a TO b",
+        ] {
+            let err = c.execute_batch(stmt).expect_err(stmt).to_string();
+            assert!(err.contains("error in view v_broken"), "{stmt}: {err}");
+        }
+    }
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch("CREATE TABLE gone (x INTEGER); CREATE TABLE victim (y INTEGER); CREATE TABLE t (a INTEGER); CREATE TRIGGER tr_broken AFTER INSERT ON victim BEGIN SELECT x FROM gone; END; DROP TABLE gone;")
+            .expect("broken trigger");
+        for stmt in [
+            "ALTER TABLE main.t RENAME TO u",
+            "ALTER TABLE main.t RENAME COLUMN a TO b",
+        ] {
+            let err = c.execute_batch(stmt).expect_err(stmt).to_string();
+            assert!(err.contains("error in trigger tr_broken"), "{stmt}: {err}");
+        }
+    }
+
+    // 5. Case-only table rename via intermediate name rewrites every referrer twice cleanly.
+    {
+        let mut db = Fresh::file();
+        let c = db.connection();
+        c.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, g INTEGER GENERATED ALWAYS AS (a + 1) VIRTUAL, CONSTRAINT ck_a CHECK (a >= 0)); \
+             CREATE TABLE child (id INTEGER PRIMARY KEY, tid INTEGER REFERENCES t(id)); \
+             CREATE TABLE log (x INTEGER); \
+             CREATE TABLE other (id INTEGER PRIMARY KEY); \
+             CREATE INDEX ix_t ON t(a) WHERE a > 0; \
+             CREATE INDEX ix_t_expr ON t(abs(a)); \
+             CREATE VIEW v_t AS SELECT id, a FROM t; \
+             CREATE TRIGGER tr_on_t AFTER INSERT ON t WHEN NEW.a > 0 BEGIN INSERT INTO log VALUES (NEW.a); END; \
+             CREATE TRIGGER tr_other AFTER INSERT ON other BEGIN INSERT INTO log SELECT a FROM t; END;",
+        )
+        .expect("case-only");
+        c.execute_batch("ALTER TABLE main.\"t\" RENAME TO \"__pbps_rename_t_000001\"; ALTER TABLE main.\"__pbps_rename_t_000001\" RENAME TO \"T\"")
+            .expect("two-step case rename");
+        for obj in ["child", "ix_t", "ix_t_expr", "v_t", "tr_on_t", "tr_other"] {
+            let s = sql_of(c, obj);
+            assert!(
+                s.contains("\"T\"") && !s.contains("__pbps_rename_"),
+                "{obj}: {s}"
+            );
+        }
+        c.execute_batch("INSERT INTO \"T\"(id, a) VALUES (1, 5); INSERT INTO child VALUES (1, 1); INSERT INTO other VALUES (1)")
+            .expect("all work");
+        assert_eq!(c.query("SELECT id, a FROM v_t", &[]).expect("v_t").len(), 1);
+    }
+
+    // 6. Missing-module virtual table alone does not block renames (DEC-2950.14).
+    {
+        let mut db = Fresh::file();
+        db.connection()
+            .execute_batch(
+                "CREATE TABLE t (a INTEGER); \
+                 PRAGMA writable_schema = ON; \
+                 INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) VALUES \
+                   ('table', 'ghost_vtab', 'ghost_vtab', 0, 'CREATE VIRTUAL TABLE ghost_vtab USING missing_mod()'); \
+                 PRAGMA writable_schema = OFF;",
+            )
+            .expect("ghost");
+        let c2 = Connection::open(db.path(), OpenMode::ExistingOnly).expect("reopen");
+        c2.execute_batch("ALTER TABLE main.t RENAME TO u; ALTER TABLE main.u RENAME COLUMN a TO b")
+            .expect("ghost_vtab does not block renames");
+    }
+}
+
+#[test]
+fn rename_report_classifies_every_referrer_kind_for_table_and_column_renames() {
+    use pbps_db::impact::RenameTarget;
+
+    let mut db = Fresh::file();
+    let c = db.connection();
+    c.execute_batch(
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+         CREATE TABLE log (x TEXT); \
+         CREATE TABLE other (id INTEGER PRIMARY KEY); \
+         CREATE TABLE orders (\
+             id INTEGER PRIMARY KEY, \
+             amount INTEGER, \
+             pid INTEGER, \
+             doubled INTEGER GENERATED ALWAYS AS (amount * 2) VIRTUAL, \
+             tripled INTEGER GENERATED ALWAYS AS (amount * 3) STORED, \
+             CONSTRAINT fk_orders_parent FOREIGN KEY (pid) REFERENCES parent(id), \
+             CONSTRAINT ck_orders_amount CHECK (amount >= 0)\
+         ); \
+         CREATE UNIQUE INDEX uq_orders_amount ON orders(amount); \
+         CREATE INDEX ix_plain ON orders(amount); \
+         CREATE INDEX ix_partial ON orders(id) WHERE amount > 0; \
+         CREATE INDEX ix_expr ON orders(abs(amount)); \
+         CREATE INDEX ix_amount_unrelated ON orders(id); \
+         CREATE TABLE items (\
+             id INTEGER PRIMARY KEY, \
+             oid INTEGER, \
+             oamt INTEGER, \
+             CONSTRAINT fk_items_orders FOREIGN KEY (oid) REFERENCES orders, \
+             CONSTRAINT fk_items_amount FOREIGN KEY (oamt) REFERENCES orders(amount)\
+         ); \
+         CREATE VIEW v_orders AS SELECT id, amount FROM orders; \
+         CREATE VIEW v_downstream AS SELECT amount FROM v_orders; \
+         CREATE TRIGGER tr_orders_ins AFTER INSERT ON orders WHEN NEW.amount > 0 BEGIN INSERT INTO log VALUES (NEW.amount); END; \
+         CREATE TRIGGER tr_other_reads AFTER INSERT ON other BEGIN INSERT INTO log SELECT amount FROM orders; END; \
+         CREATE TRIGGER tr_io_orders INSTEAD OF INSERT ON v_orders BEGIN INSERT INTO log VALUES (NEW.amount); END; \
+         PRAGMA writable_schema = ON; \
+         INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) VALUES \
+           ('table', 'ghost_vtab', 'ghost_vtab', 0, 'CREATE VIRTUAL TABLE ghost_vtab USING missing_mod()'); \
+         PRAGMA writable_schema = OFF;",
+    )
+    .expect("setup");
+
+    // 1. Table rename: orders -> ...
+    let tbl_report = rename_report(c, &RenameTarget::Table(TableName::new("main", "orders")))
+        .expect("table rename report");
+    assert!(tbl_report.blocking.is_empty(), "{tbl_report:#?}");
+    let carried: Vec<&str> = tbl_report.carried.iter().map(|r| r.name.as_str()).collect();
+    for expected in [
+        "view main.v_orders",
+        "index main.uq_orders_amount on table main.orders",
+        "index main.ix_plain on table main.orders",
+        "index main.ix_partial on table main.orders",
+        "index main.ix_expr on table main.orders",
+        "foreign key `fk_orders_parent` on table `main.orders`",
+        "foreign key `fk_items_orders` on table `main.items`",
+        "foreign key `fk_items_amount` on table `main.items`",
+        "trigger main.tr_orders_ins on table main.orders",
+        "trigger main.tr_other_reads on table main.other",
+    ] {
+        assert!(
+            carried.contains(&expected),
+            "missing carried `{expected}` in {carried:#?}"
+        );
+    }
+    // Managed view carries `removed_with` matching ModuleId::Named(main.v_orders).
+    let view_ref = tbl_report
+        .carried
+        .iter()
+        .find(|r| r.name == "view main.v_orders")
+        .expect("v_orders");
+    assert_eq!(
+        view_ref.removed_with,
+        Some((
+            ModuleKind::View,
+            ModuleId::Named(TableName::new("main", "v_orders")),
+        ))
+    );
+    // Advisory names embedding `orders`.
+    let adv: Vec<(&str, &str)> = tbl_report
+        .advisory
+        .iter()
+        .map(|r| (r.kind.as_str(), r.name.as_str()))
+        .collect();
+    for expected in [
+        ("view", "main.v_orders"),
+        ("index", "uq_orders_amount"),
+        ("foreign key", "fk_orders_parent"),
+        ("check constraint", "ck_orders_amount"),
+        ("foreign key", "fk_items_orders on table main.items"),
+        ("trigger", "main.tr_orders_ins"),
+    ] {
+        assert!(
+            adv.contains(&expected),
+            "missing advisory {expected:?} in {adv:#?}"
+        );
+    }
+
+    // 2. Column rename: orders.amount -> ...
+    let col_report = rename_report(
+        c,
+        &RenameTarget::Column(TableName::new("main", "orders").column("amount")),
+    )
+    .expect("column rename report");
+    assert!(col_report.blocking.is_empty(), "{col_report:#?}");
+    let col_carried: Vec<&str> = col_report.carried.iter().map(|r| r.name.as_str()).collect();
+    for expected in [
+        "view main.v_orders",
+        "index main.uq_orders_amount on table main.orders",
+        "index main.ix_plain on table main.orders",
+        "index main.ix_partial on table main.orders",
+        "index main.ix_expr on table main.orders",
+        "check constraint ck_orders_amount on table main.orders",
+        "generated column main.orders.doubled",
+        "generated column main.orders.tripled",
+        "foreign key `fk_items_amount` on table `main.items`",
+        "trigger main.tr_orders_ins on table main.orders",
+        "trigger main.tr_other_reads on table main.other",
+    ] {
+        assert!(
+            col_carried.contains(&expected),
+            "missing carried `{expected}` in {col_carried:#?}"
+        );
+    }
+    // `ix_amount_unrelated` is ON `orders(id)`, NOT `amount`: advisory by name only, never carried!
+    assert!(
+        !col_carried
+            .iter()
+            .any(|n| n.contains("ix_amount_unrelated")),
+        "{col_carried:#?}"
+    );
+    assert!(
+        col_report
+            .advisory
+            .iter()
+            .any(|r| r.kind == "index" && r.name == "ix_amount_unrelated")
+    );
+    // Downstream view and INSTEAD OF trigger over `v_orders` are advisory on column rename.
+    assert!(
+        col_report
+            .advisory
+            .iter()
+            .any(|r| r.kind == "view" && r.name == "main.v_downstream")
+    );
+    assert!(
+        col_report
+            .advisory
+            .iter()
+            .any(|r| r.kind == "trigger" && r.name == "main.tr_io_orders")
+    );
+
+    // 3. Outbound FK column (`orders.pid`) and omitted-column PK (`orders.id`) are carried.
+    let pid_report = rename_report(
+        c,
+        &RenameTarget::Column(TableName::new("main", "orders").column("pid")),
+    )
+    .expect("pid report");
+    assert!(
+        pid_report
+            .carried
+            .iter()
+            .any(|r| r.name == "foreign key `fk_orders_parent` on table `main.orders`")
+    );
+    let id_report = rename_report(
+        c,
+        &RenameTarget::Column(TableName::new("main", "orders").column("id")),
+    )
+    .expect("id report");
+    assert!(
+        id_report
+            .carried
+            .iter()
+            .any(|r| r.name == "foreign key `fk_items_orders` on table `main.items`")
+    );
+}
+
+#[test]
+fn rename_report_is_empty_when_unreferenced_and_embeds_names_ascii_case_insensitively() {
+    use pbps_db::impact::RenameTarget;
+
+    let mut db = Fresh::file();
+    let c = db.connection();
+    c.execute_batch(
+        "CREATE TABLE solo (id INTEGER PRIMARY KEY, qty INTEGER); \
+         CREATE TABLE other (id INTEGER PRIMARY KEY, x INTEGER); \
+         CREATE INDEX ix_other ON other(x); \
+         CREATE VIEW v_other AS SELECT x FROM other;",
+    )
+    .expect("setup");
+
+    let t_rep = rename_report(c, &RenameTarget::Table(TableName::new("main", "solo"))).expect("t");
+    assert!(t_rep.is_empty(), "{t_rep:#?}");
+    let c_rep = rename_report(
+        c,
+        &RenameTarget::Column(TableName::new("main", "solo").column("qty")),
+    )
+    .expect("c");
+    assert!(c_rep.is_empty(), "{c_rep:#?}");
+
+    // An index on another column whose name embeds `qty` in different ASCII case is advisory only.
+    c.execute_batch("CREATE INDEX IX_QTY_NOTE ON solo(id)")
+        .expect("idx");
+    let c_rep2 = rename_report(
+        c,
+        &RenameTarget::Column(TableName::new("main", "solo").column("qty")),
+    )
+    .expect("c2");
+    assert!(
+        c_rep2.carried.is_empty() && c_rep2.blocking.is_empty(),
+        "{c_rep2:#?}"
+    );
+    assert!(
+        c_rep2
+            .advisory
+            .iter()
+            .any(|r| r.kind == "index" && r.name == "IX_QTY_NOTE"),
+        "{c_rep2:#?}"
+    );
+}
+
+#[test]
+fn rename_report_errors_on_absent_virtual_view_module_foreign_schema_and_unreadable_file() {
+    use pbps_db::impact::{ImpactError, RenameTarget};
+
+    let mut db = Fresh::file();
+    let c = db.connection();
+    c.execute_batch(
+        "CREATE TABLE t (a INTEGER); \
+         CREATE VIEW v AS SELECT a FROM t; \
+         PRAGMA writable_schema = ON; \
+         INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) VALUES \
+           ('table', 'ghost_vtab', 'ghost_vtab', 0, 'CREATE VIRTUAL TABLE ghost_vtab USING missing_mod()'); \
+         PRAGMA writable_schema = OFF;",
+    )
+    .expect("setup");
+
+    for (label, target) in [
+        (
+            "absent table",
+            RenameTarget::Table(TableName::new("main", "missing")),
+        ),
+        (
+            "absent column",
+            RenameTarget::Column(TableName::new("main", "t").column("missing")),
+        ),
+        (
+            "virtual table",
+            RenameTarget::Table(TableName::new("main", "ghost_vtab")),
+        ),
+        (
+            "view target",
+            RenameTarget::Table(TableName::new("main", "v")),
+        ),
+        (
+            "module target",
+            RenameTarget::Module(TableName::new("main", "v")),
+        ),
+        (
+            "foreign schema",
+            RenameTarget::Table(TableName::new("app", "t")),
+        ),
+        (
+            "empty name",
+            RenameTarget::Table(TableName::new("main", "")),
+        ),
+    ] {
+        let err = rename_report(c, &target).expect_err(label);
+        assert!(
+            matches!(err, ImpactError::Name(_)),
+            "{label}: expected ImpactError::Name, got {err:?}"
+        );
+    }
+
+    // Exclusively locked (unreadable) file returns ImpactError::Query, never empty.
+    let locker = Connection::open(db.path(), OpenMode::ExistingOnly).expect("second conn");
+    locker.execute_batch("BEGIN EXCLUSIVE").expect("lock");
+    let err = rename_report(
+        db.connection(),
+        &RenameTarget::Table(TableName::new("main", "t")),
+    )
+    .expect_err("locked file must error");
+    assert!(
+        matches!(err, ImpactError::Query(_)),
+        "expected ImpactError::Query, got {err:?}"
+    );
+    locker.execute_batch("ROLLBACK").expect("unlock");
+}

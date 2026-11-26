@@ -889,7 +889,7 @@ pub(super) async fn drop_preflight<D: crate::engine::ApplySession>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn preflight<D: crate::engine::ApplySession>(
+pub(crate) async fn preflight<D: crate::engine::ApplySession>(
     conn: &mut Conn,
     dialect: &D,
     plan: &pbps_diff::order::AdmittedPlan<D>,

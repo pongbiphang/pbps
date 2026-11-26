@@ -239,6 +239,8 @@ pub(crate) struct TableText {
     pub typed: Vec<bool>,
     pub constraints: Vec<Constraint>,
     pub markers: Vec<Marked>,
+    /// Generated column expressions `(column_index, expr)` as stored.
+    pub generated_exprs: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -852,7 +854,8 @@ fn column(p: &mut Parser<'_>, out: &mut TableText) -> Result<(), Unread> {
                     p.expect_word("always")?;
                 }
                 p.expect_word("as")?;
-                p.expression("a generated column's expression")?;
+                let expr = p.expression("a generated column's expression")?;
+                out.generated_exprs.push((at, expr));
                 let stored = if p.eat_word("stored") {
                     Some(true)
                 } else if p.eat_word("virtual") {
