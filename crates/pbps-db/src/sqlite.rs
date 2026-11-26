@@ -219,6 +219,63 @@ impl Record {
     }
 }
 
+/// One action SQLite's authorizer reported while preparing a statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthEvent {
+    Select,
+    Read {
+        database: Option<String>,
+        table: String,
+        column: String,
+        accessor: Option<String>,
+    },
+    Function {
+        name: String,
+    },
+    Other(String),
+}
+
+/// What preparing a statement under an authorizer observed, without stepping it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedAudit {
+    pub events: Vec<AuthEvent>,
+    pub parameters: usize,
+}
+
+type ClearAuth = fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization;
+
+struct PrepareGuard<'a> {
+    conn: &'a mut rusqlite::Connection,
+    active: bool,
+    restore_dqs: Option<bool>,
+}
+
+impl PrepareGuard<'_> {
+    fn restore(&mut self) -> Result<(), DbError> {
+        let auth = if std::mem::take(&mut self.active) {
+            self.conn
+                .authorizer(None::<ClearAuth>)
+                .map_err(|e| driver_error(e).context("removing the SQLite authorizer"))
+        } else {
+            Ok(())
+        };
+        let dqs = self.restore_dqs.take().map_or(Ok(()), |prev| {
+            self.conn
+                .set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DML, prev)
+                .map(|_| ())
+                .map_err(|e| driver_error(e).context("restoring SQLite double-quoted string mode"))
+        });
+        auth?;
+        dqs
+    }
+}
+
+impl Drop for PrepareGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 /// An open SQLite database, with foreign keys enforced.
 ///
 /// `Send` and not `Sync`, as the library's own connection is.
@@ -514,6 +571,91 @@ impl Connection {
         Ok(copy)
     }
 
+    /// Prepares one statement under a temporary authorizer without stepping it,
+    /// disabling `DQS_DML` during prepare so mistyped quoted columns fail
+    /// instead of becoming strings. Both are restored on every return path.
+    pub fn prepare_authorized(
+        &mut self,
+        sql: &str,
+        mut authorize: impl FnMut(&AuthEvent) -> Result<(), String> + Send + 'static,
+    ) -> Result<PreparedAudit, DbError> {
+        use rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DML;
+        use rusqlite::hooks::{AuthAction, Authorization};
+        let prev = self
+            .inner
+            .db_config(SQLITE_DBCONFIG_DQS_DML)
+            .map_err(|e| driver_error(e).context("reading SQLite double-quoted string mode"))?;
+        let restore_dqs = prev.then_some(prev);
+        if prev {
+            self.inner
+                .set_db_config(SQLITE_DBCONFIG_DQS_DML, false)
+                .map_err(|e| {
+                    driver_error(e).context("disabling SQLite double-quoted string mode")
+                })?;
+        }
+        let mut guard = PrepareGuard {
+            conn: &mut self.inner,
+            active: false,
+            restore_dqs,
+        };
+        let state = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), None::<String>)));
+        let sink = std::sync::Arc::clone(&state);
+        guard
+            .conn
+            .authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                let event = if let AuthAction::Select = ctx.action {
+                    AuthEvent::Select
+                } else if let AuthAction::Read {
+                    table_name,
+                    column_name,
+                } = ctx.action
+                {
+                    AuthEvent::Read {
+                        database: ctx.database_name.map(str::to_owned),
+                        table: table_name.to_owned(),
+                        column: column_name.to_owned(),
+                        accessor: ctx.accessor.map(str::to_owned),
+                    }
+                } else if let AuthAction::Function { function_name } = ctx.action {
+                    AuthEvent::Function {
+                        name: function_name.to_owned(),
+                    }
+                } else {
+                    AuthEvent::Other(format!("{:?}", ctx.action))
+                };
+                let decision = authorize(&event);
+                let mut lock = sink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                lock.0.push(event);
+                match decision {
+                    Ok(()) => Authorization::Allow,
+                    Err(reason) => {
+                        lock.1.get_or_insert(reason);
+                        Authorization::Deny
+                    }
+                }
+            }))
+            .map_err(|e| driver_error(e).context("installing the SQLite authorizer"))?;
+        guard.active = true;
+
+        let prepared = guard.conn.prepare(sql).map(|stmt| stmt.parameter_count());
+        let restored = guard.restore();
+        let mut lock = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (events, denied) = (std::mem::take(&mut lock.0), lock.1.take());
+        drop(lock);
+        restored?;
+        if let Some(reason) = denied {
+            return Err(DbError::Refused(reason));
+        }
+        Ok(PreparedAudit {
+            events,
+            parameters: prepared.map_err(driver_error)?,
+        })
+    }
+
     /// Runs one or more statements that return no rows.
     pub fn execute_batch(&self, sql: &str) -> Result<(), DbError> {
         self.inner.execute_batch(sql).map_err(driver_error)
@@ -751,10 +893,15 @@ fn retry_busy<T>(
 /// decimal text (5 busy, 26 not a database, 787 foreign key), which is what
 /// SQLite documents; a name would hide the number a person looks up.
 fn driver_error(error: rusqlite::Error) -> DbError {
-    DbError::Driver {
-        code: error
+    let code = if let rusqlite::Error::SqlInputError { error, .. } = &error {
+        Some(error.extended_code.to_string())
+    } else {
+        error
             .sqlite_extended_error_code()
-            .map(|code| code.to_string()),
+            .map(|code| code.to_string())
+    };
+    DbError::Driver {
+        code,
         message: error.to_string(),
         diagnostic: None,
     }
@@ -1171,5 +1318,112 @@ mod tests {
             .join()
             .expect("join");
         assert_eq!(n, 42);
+    }
+
+    #[test]
+    fn prepare_authorized_reports_events_and_parameters_without_reading_rows() {
+        let dir = dir();
+        let path = dir.path().join("auth.db");
+        let mut c = Connection::open(&path, OpenMode::CreateIfMissing).expect("open");
+        c.execute_batch(
+            "CREATE TABLE MixedTbl (ColA INTEGER, txt TEXT);
+             CREATE TABLE other (x INTEGER);
+             INSERT INTO MixedTbl VALUES (1, 'not-valid-json');",
+        )
+        .expect("setup");
+
+        // Column reads carry the stored catalog spelling and parameter count is exact.
+        let audit = c
+            .prepare_authorized(
+                "SELECT CASE WHEN (cola = ?1 AND txt LIKE 'a%') THEN 0 ELSE 1 END FROM main.\"mixedtbl\"",
+                |_| Ok(()),
+            )
+            .expect("prepare");
+        assert_eq!(audit.parameters, 1);
+        assert!(audit.events.contains(&AuthEvent::Select));
+        assert!(audit.events.contains(&AuthEvent::Function {
+            name: "like".into(),
+        }));
+        assert!(audit.events.contains(&AuthEvent::Read {
+            database: Some("main".into()),
+            table: "MixedTbl".into(),
+            column: "ColA".into(),
+            accessor: None,
+        }));
+        assert!(audit.events.contains(&AuthEvent::Read {
+            database: Some("main".into()),
+            table: "MixedTbl".into(),
+            column: "txt".into(),
+            accessor: None,
+        }));
+
+        // Preparing never steps: `json(txt)` fails on the stored row when stepped,
+        // yet preparing it succeeds.
+        let runtime_sql =
+            "SELECT CASE WHEN (json(txt) IS NOT NULL) THEN 0 ELSE 1 END FROM main.\"MixedTbl\"";
+        let prepared = c
+            .prepare_authorized(runtime_sql, |_| Ok(()))
+            .expect("prepare does not evaluate rows");
+        assert!(prepared.events.contains(&AuthEvent::Function {
+            name: "json".into(),
+        }));
+        assert!(
+            c.query(runtime_sql, &[]).is_err(),
+            "stepping the same SQL fails on the row"
+        );
+
+        // Negative: double-quoted unknown names fail with SQLite's code rather than
+        // falling back to string literals, and the connection's DQS_DML setting is restored.
+        let before_dqs = c
+            .inner
+            .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DML)
+            .expect("dqs before");
+        let typo = c
+            .prepare_authorized(
+                "SELECT CASE WHEN (\"nope\" = 'x') THEN 0 ELSE 1 END FROM main.\"MixedTbl\"",
+                |_| Ok(()),
+            )
+            .expect_err("double-quoted typo refused");
+        assert_eq!(typo.server_error_code().as_deref(), Some("1"), "{typo:?}");
+        assert_eq!(
+            c.inner
+                .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DML)
+                .expect("dqs after"),
+            before_dqs
+        );
+    }
+
+    #[test]
+    fn prepare_authorized_denies_rejected_events_and_always_removes_the_authorizer() {
+        let dir = dir();
+        let path = dir.path().join("deny.db");
+        let mut c = Connection::open(&path, OpenMode::CreateIfMissing).expect("open");
+        c.execute_batch("CREATE TABLE t (a INTEGER)").expect("ddl");
+
+        // Denial returns the callback's refusal reason as `DbError::Refused`.
+        let denied = c
+            .prepare_authorized("SELECT random() FROM main.t", |event| match event {
+                AuthEvent::Function { name } => Err(format!("function `{name}` is denied")),
+                AuthEvent::Select | AuthEvent::Read { .. } | AuthEvent::Other(_) => Ok(()),
+            })
+            .expect_err("denied");
+        let DbError::Refused(msg) = denied else {
+            panic!("expected DbError::Refused, got {denied:?}");
+        };
+        assert!(msg.contains("function `random` is denied"), "{msg}");
+
+        // After denial, the authorizer is gone: ordinary queries and DDL run freely.
+        assert_eq!(count(&c, "SELECT count(*) FROM main.t"), 0);
+        c.execute_batch("CREATE TABLE after_deny (x INTEGER); INSERT INTO after_deny VALUES (1)")
+            .expect("ordinary DDL and DML work after denial");
+
+        // Negative: after a syntax/prepare error, the authorizer is also gone.
+        let bad = c
+            .prepare_authorized("SELECT FROM", |_| Ok(()))
+            .expect_err("syntax error");
+        assert_eq!(bad.server_error_code().as_deref(), Some("1"), "{bad:?}");
+        c.execute_batch("INSERT INTO after_deny VALUES (2)")
+            .expect("ordinary DML works after prepare error");
+        assert_eq!(count(&c, "SELECT count(*) FROM after_deny"), 2);
     }
 }
