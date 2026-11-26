@@ -54,15 +54,11 @@ impl ApplySession for Sqlite {
     ) -> Option<&'s dyn pbps_dialect::RetainedComparison> {
         None
     }
-    /// Does not exist on this engine (partitioned-table rebuilds) plus the
-    /// refusing staged-module-rebuild default: SQLite has no partitioned-table
-    /// rebuilds, and staged view replacement has no catalog-preservation step.
+    /// Does not exist on this engine (partitioned-table rebuilds) plus
+    /// SQLite's staged-view-edit refusal: delegates to the helper shared with
+    /// [`PlanSession::require_transactional_rebuilds`].
     fn rebuild_mode(&self, changes: &ChangeSet, staged: bool) -> anyhow::Result<()> {
-        refuse_if(
-            has_partition_rebuild(changes),
-            "SQLite does not support partitioned-table rebuilds",
-        )?;
-        plan_session::defaults::transactional_rebuilds("SQLite", changes, staged)
+        plan_session::sqlite::require_transactional_rebuilds(changes, staged)
     }
     /// Exists in `pbps-db` already: builds `RenameTarget::Table` and
     /// `RenameTarget::Column` in first-occurrence order using stored names
@@ -355,10 +351,7 @@ impl ApplySession for Sqlite {
         _conn: &mut Conn,
         changes: &ChangeSet,
     ) -> anyhow::Result<()> {
-        refuse_if(
-            pbps_mssql::temporal::needs_the_question(changes),
-            "SQLite does not support system-versioned tables",
-        )
+        plan_session::sqlite::refuse_system_versioned(changes)
     }
     /// Does not exist on this engine: SQLite has no roles, object owners or
     /// grants; refuses if a plan grants anything.
@@ -436,21 +429,40 @@ impl ApplySession for Sqlite {
         Ok(Vec::new())
     }
     /// Does not exist on this engine in v0: generated columns are refused by
-    /// `pbps_sqlite::validate` as not built yet; refuses if a plan alters a
-    /// generated column's expression.
+    /// `pbps_sqlite::validate` as not built yet and SQLite has no exclusion
+    /// constraints; refuses a plan that carries either, and answers
+    /// `not_applicable` otherwise (including plain column drops and retypes).
     async fn generation_support(
         &self,
         _conn: &mut Conn,
         changes: &ChangeSet,
         _ids: &IdsFile,
     ) -> anyhow::Result<ConnectedCheck> {
-        let alters = has_change(changes, |c| {
+        let generated = has_change(changes, |c| {
             matches!(
                 c,
                 Change::Column(pbps_model::ColumnChange::AlterColumnExpression { .. })
+            ) || matches!(
+                c,
+                Change::Column(pbps_model::ColumnChange::AddColumn { column, .. })
+                    if matches!(column.value_source, pbps_model::ValueSource::Generated(_))
+            ) || matches!(
+                c,
+                Change::Table(pbps_model::TableChange::CreateTable { table, .. })
+                    if table
+                        .columns
+                        .values()
+                        .any(|col| matches!(col.value_source, pbps_model::ValueSource::Generated(_)))
             )
         });
-        refuse_if(alters, "SQLite does not support generated columns yet")?;
+        refuse_if(generated, "SQLite does not support generated columns yet")?;
+        let exclusion = has_change(changes, |c| {
+            matches!(
+                c,
+                Change::Constraint(pbps_model::ConstraintChange::SetExclusion { .. })
+            )
+        });
+        refuse_if(exclusion, "SQLite does not support exclusion constraints")?;
         Ok(plan_session::defaults::not_applicable(
             "SQLite",
             "generation_support",
@@ -482,44 +494,21 @@ impl ApplySession for Sqlite {
         let _ = sqlite_conn(conn)?;
         plan_session::defaults::drop_blockers("SQLite", &plan.changes).map(|_| ())
     }
-    /// Exists in `pbps-sqlite` already: runs `pbps_sqlite::preflight::before_apply`
-    /// (connection pragmas, library version against every in-place form, ledger
-    /// integrity, file writability probe, and floor notes) in place, and refuses
-    /// any change carrying `strategy: online` (SQLite has no online operations).
+    /// Exists in `pbps-sqlite` already: delegates to the helper shared with
+    /// [`PlanSession::server_limits`] at `Stage::Apply` (adding the
+    /// file-writability probe to the connection, library, ledger, floor-note
+    /// and `strategy: online` checks).
     async fn preflight_limits(
         &self,
         conn: &mut Conn,
         plan: &pbps_model::SavedPlan,
     ) -> Result<EditionVerdict, anyhow::Error> {
-        let c = sqlite_conn(conn)?;
-        let online: Vec<String> = plan
-            .changes
-            .changes
-            .iter()
-            .filter(|p| p.strategy.online)
-            .map(|p| pbps_model::escape::Escaped(&p.change.subject()).to_string())
-            .collect();
-        if !online.is_empty() {
-            anyhow::bail!(
-                "SQLite does not support `strategy: online` (requested for {}); remove \
-                 `strategy: online` and plan again",
-                online.join(", ")
-            );
-        }
-        let verdict = pbps_sqlite::preflight::before_apply(
-            c,
+        plan_session::sqlite::preflight_verdict(
+            self,
+            conn,
             &plan.changes,
-            self.floor(),
             pbps_sqlite::preflight::Stage::Apply,
-        )?;
-        if !verdict.problems.is_empty() {
-            anyhow::bail!("{}", pbps_sqlite::preflight::refusal(&verdict.problems));
-        }
-        Ok(EditionVerdict {
-            refused_online: Vec::new(),
-            runs: format!("SQLite {}", c.version()?),
-            warnings: verdict.notes,
-        })
+        )
     }
     /// Does not exist on this engine: SQLite has no roles; refused rather than
     /// answered empty because callers ask this only for a plan that drops a role.
