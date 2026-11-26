@@ -128,15 +128,21 @@ fn stored<A>(source: Source<A>, kind: &str, shown: impl Display) -> Result<Optio
     }
 }
 
-pub(super) fn describe_fk(child: &str, fk: &ForeignKeyEntry) -> String {
-    let c = Escaped(child);
+/// A foreign key as a message names it, its names as the catalog spells them.
+/// For a field the renderer escapes; a message built here takes
+/// [`describe_fk`].
+pub(super) fn fk_label(child: &str, fk: &ForeignKeyEntry) -> String {
     match &fk.name {
-        Some(n) => format!("foreign key `{}` on table `main.{c}`", Escaped(n)),
-        None => {
-            let cols: Vec<_> = fk.from.iter().map(|col| Escaped(col).to_string()).collect();
-            format!("foreign key on table `main.{c}` ({})", cols.join(", "))
-        }
+        Some(n) => format!("foreign key `{n}` on table `main.{child}`"),
+        None => format!(
+            "foreign key on table `main.{child}` ({})",
+            fk.from.join(", ")
+        ),
     }
+}
+
+fn describe_fk(child: &str, fk: &ForeignKeyEntry) -> String {
+    Escaped(&fk_label(child, fk)).to_string()
 }
 
 fn plain_unique_key(ix: &IndexEntry) -> Option<BTreeMap<String, String>> {

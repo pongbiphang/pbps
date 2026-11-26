@@ -17,7 +17,7 @@ use pbps_db::sqlite::Connection;
 use pbps_dialect::DialectError;
 use pbps_model::{ModuleId, ModuleKind, ObjectName};
 
-use super::drops::describe_fk;
+use super::drops::fk_label;
 use super::{
     ColumnEntry, EntryKind, IndexEntry, TableColumns, read_for_rename, require_stored_sql,
     sql_may_read,
@@ -316,7 +316,7 @@ pub fn rename_report(c: &Connection, target: &RenameTarget) -> Result<ImpactRepo
             if !affected {
                 continue;
             }
-            carry(&mut report.carried, "foreign key", describe_fk(child, fk));
+            carry(&mut report.carried, "foreign key", fk_label(child, fk));
             if !on_target && let Some(fk_name) = &fk.name {
                 note_name(
                     &mut report.advisory,

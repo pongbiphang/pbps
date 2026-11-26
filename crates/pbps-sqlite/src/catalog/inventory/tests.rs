@@ -2636,3 +2636,28 @@ fn rename_report_errors_on_absent_virtual_view_module_foreign_schema_and_unreada
     );
     locker.execute_batch("ROLLBACK").expect("unlock");
 }
+
+#[test]
+fn a_carried_foreign_key_is_labelled_as_the_catalog_spells_it() {
+    // The renderer escapes a carried referrer's name once; a label escaped
+    // here as well would show a backslash doubled.
+    let key = |name: Option<&str>| ForeignKeyEntry {
+        name: name.map(str::to_owned),
+        parent: "p".to_owned(),
+        from: vec!["a\nb".to_owned()],
+        to: vec![None],
+    };
+    assert_eq!(
+        super::drops::fk_label("ch\nild", &key(Some("fk\n1"))),
+        "foreign key `fk\n1` on table `main.ch\nild`"
+    );
+    assert_eq!(
+        super::drops::fk_label("child", &key(None)),
+        "foreign key on table `main.child` (a\nb)"
+    );
+    // Negative: a name without such a character is unchanged either way.
+    assert_eq!(
+        super::drops::fk_label("child", &key(Some("fk_1"))),
+        "foreign key `fk_1` on table `main.child`"
+    );
+}
