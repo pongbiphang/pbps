@@ -4,3 +4,4 @@ pub(super) mod adoption;
 pub(super) mod attach;
 pub(super) mod detach;
 pub(super) mod refusals;
+pub(super) mod rehearsal;

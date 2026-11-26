@@ -90,6 +90,9 @@ pub struct Managed {
     /// Names outside the managed set whose relation definitions were omitted.
     /// An unsupported temporal table still occupies its name (SPEC §7.6).
     pub unmanaged_relations: Vec<TableName>,
+    /// The relations an attach rehearsal asked about, read with the schema
+    /// (DEC-1671.2). Empty for a read that asked for none.
+    pub relations: pbps_model::adoption::Relations,
 }
 
 /// The scoped state alone, with the rows of every table in `scopes` read back
@@ -222,6 +225,7 @@ pub(super) async fn managed_state_once(
         &rows_to_read(scopes),
         read,
         warnings,
+        &BTreeSet::new(),
     )
     .await?;
     refuse_managed_limitations(&managed.limitations)?;
@@ -303,6 +307,7 @@ pub(super) async fn baseline_state(
         &rows_to_read(&pinned_scopes(scopes, as_the_apply_reads_it)),
         crate::engine::Read::Snapshot,
         warnings,
+        &BTreeSet::new(),
     )
     .await?;
     refuse_managed_limitations(&managed.limitations)?;
@@ -437,8 +442,9 @@ pub(super) async fn managed_state_full(
     rows: &BTreeMap<TableName, RowScope>,
     read: crate::engine::Read,
     warnings: CatalogWarnings<'_>,
+    wanted: &BTreeSet<TableName>,
 ) -> anyhow::Result<Managed> {
-    let pulled = pull(conn, read).await?;
+    let (pulled, relations) = pull_wanting(conn, read, wanted).await?;
     warnings.emit(
         pulled
             .warnings
@@ -502,6 +508,7 @@ pub(super) async fn managed_state_full(
         unreadable,
         rows,
         unmanaged_relations,
+        relations,
     })
 }
 
@@ -676,7 +683,16 @@ pub(super) async fn pull(
     conn: &mut Conn,
     read: crate::engine::Read,
 ) -> anyhow::Result<pbps_db::catalog::Pulled> {
-    crate::engine::introspect(conn, read)
+    Ok(pull_wanting(conn, read, &BTreeSet::new()).await?.0)
+}
+
+/// [`pull`] with the relations an attach rehearsal asks about.
+async fn pull_wanting(
+    conn: &mut Conn,
+    read: crate::engine::Read,
+    wanted: &BTreeSet<TableName>,
+) -> anyhow::Result<(pbps_db::catalog::Pulled, pbps_model::adoption::Relations)> {
+    crate::engine::introspect_wanting(conn, read, wanted)
         .await
         .context("cannot read the database catalog")
 }

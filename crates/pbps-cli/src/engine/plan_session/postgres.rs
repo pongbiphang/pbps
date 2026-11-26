@@ -1808,6 +1808,31 @@ impl PlanSession for pbps_pg::Postgres {
         Ok(())
     }
 
+    async fn attach_rehearsal_hints(
+        &self,
+        scratch: Option<&mut crate::resolution::Entry<'_>>,
+        conn: &mut Conn,
+        target: &crate::db::Target,
+        before: pbps_diff::Side<'_>,
+        after: pbps_diff::Side<'_>,
+        read_back: &Schema,
+        relations: &pbps_model::adoption::Relations,
+        hints: &mut pbps_model::Hints,
+    ) -> anyhow::Result<()> {
+        if let Some(entry) = scratch {
+            let questions = pbps_diff::attach::questions(before, after, self, hints, read_back);
+            if !questions.is_empty() {
+                // The scratch run's future stays out of the planner's, as the
+                // retained comparison's does.
+                hints.attach_rehearsals = Box::pin(crate::resolution::attach::rehearse(
+                    entry, conn, target, before, hints, &questions, relations,
+                ))
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Reads the `NOT VALID` checks of the domains standing in the database.
     ///
     /// PostgreSQL has them.

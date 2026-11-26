@@ -455,6 +455,27 @@ pub(crate) trait PlanSession: crate::emission::Engine {
         Ok(())
     }
 
+    /// Asks the resolver's scratch which of a table's indexes each attach
+    /// takes, from the two relations as the planning read found them, and
+    /// records the answers in `hints` (DEC-1671.2).
+    ///
+    /// Neutral for an engine that rehearses no attach: unanswered, each index
+    /// an attach might take is dropped ahead of it.
+    #[allow(clippy::too_many_arguments)]
+    async fn attach_rehearsal_hints(
+        &self,
+        _scratch: Option<&mut crate::resolution::Entry<'_>>,
+        _conn: &mut Conn,
+        _target: &crate::db::Target,
+        _before: pbps_diff::Side<'_>,
+        _after: pbps_diff::Side<'_>,
+        _read_back: &Schema,
+        _relations: &pbps_model::adoption::Relations,
+        _hints: &mut pbps_model::Hints,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// The `NOT VALID` checks of the domains standing in the database. The
     /// pipeline asks only when the base holds a domain.
     ///

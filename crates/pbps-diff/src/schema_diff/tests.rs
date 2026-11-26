@@ -1347,7 +1347,7 @@ impl Dialect for Aliases {
 /// `MinimalDialect` under PostgreSQL's name and with what neutral code asks
 /// of that engine, for the shapes only it plans: a package's lifecycle
 /// (DEC-2447.12).
-struct Postgres;
+pub(super) struct Postgres;
 
 impl Dialect for Postgres {
     fn name(&self) -> &'static str {

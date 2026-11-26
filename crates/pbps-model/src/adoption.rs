@@ -11,7 +11,7 @@
 use crate::{
     Change, ChangeSet, ColumnChange, ConstraintChange, ExtensionChange, IndexChange, ModuleChange,
     ModuleId, ObjectLocalName, PartitionChange, SavedPlan, TableChange, TableName, Text,
-    TypeChange, TypeValueChange,
+    TypeChange, TypeValueChange, Uid,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -40,9 +40,15 @@ pub struct HeldIndex {
     pub valid: bool,
 }
 
-/// A relation as apply reads it.
+/// A relation as a rehearsal and apply read it: enough to make an empty copy of
+/// it, and its indexes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relation {
+    /// Each column as `CREATE TABLE` spells it: name, type, collation and
+    /// `NOT NULL`.
+    pub columns: Vec<String>,
+    /// The partition key, for a partitioned table.
+    pub partition_key: Option<String>,
     pub indexes: Vec<HeldIndex>,
 }
 
@@ -61,6 +67,15 @@ pub struct AttachRehearsal {
     /// Each of the table's own indexes the plan leaves standing, and the
     /// parent's index the rehearsal's engine gave it to.
     pub kept: BTreeMap<ObjectLocalName, ObjectLocalName>,
+}
+
+/// A rehearsal's answer on its way to the differ, which checks it against the
+/// question it would ask before using it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachAnswer {
+    pub uid: Uid,
+    pub parent: TableName,
+    pub rehearsal: AttachRehearsal,
 }
 
 /// Whether `change` takes the index `index` off `relation`: the forms a plan

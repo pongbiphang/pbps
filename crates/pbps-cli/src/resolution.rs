@@ -11,6 +11,7 @@
 //!    ordinary connected checks and a fresh recheck of the target
 //!    (DEC-1516.1).
 
+pub mod attach;
 pub mod domain;
 pub mod retained;
 

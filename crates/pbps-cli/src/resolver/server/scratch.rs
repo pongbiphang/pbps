@@ -38,6 +38,7 @@ pub use super::engine::{
     Standard, declared_standard,
 };
 
+pub mod attach;
 pub mod domain;
 pub mod preview;
 pub mod recovery;

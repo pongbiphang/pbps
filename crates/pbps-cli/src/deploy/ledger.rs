@@ -89,6 +89,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
             &rows_to_read(&recorded_scopes),
             crate::engine::Read::Snapshot,
             CatalogWarnings::for_output(json, &catalog),
+            &Default::default(),
         )
         .await
         .map_err(|error| VerifyFailure::at("environment.unreadable", error))?;

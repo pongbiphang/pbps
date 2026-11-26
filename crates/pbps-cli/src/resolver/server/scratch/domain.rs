@@ -1,14 +1,33 @@
 //! An unsealed, code-only goal of the scratch run (DEC-2309.1).
-use super::super::{Error, PlanningDialect, ProduceError, producer::request};
+use super::super::{
+    Error, PlanningDialect, ProduceError,
+    producer::{request, request_as_it_stands},
+};
 use super::{Provenance, Standard, Tokens};
 use crate::resolver::contract::{PreparedView, ResolverEngine};
 use pbps_db::resolver::environment::Verdict;
 use pbps_db::{Conn, Driver};
 use pbps_dialect::Dialect;
-use pbps_model::{Hints, IdsFile, PlanMode, Schema};
+use pbps_model::{Hints, IdsFile, ModuleKind, PlanMode, Schema};
 
 /// The code vet is a PostgreSQL operation by design.
 type Postgres = <pbps_pg::Postgres as PlanningDialect>::Resolver;
+
+/// What a code-only run is for (DEC-2309.1, DEC-2354.1, DEC-1671.2).
+pub(super) enum Goal<'a> {
+    /// Compile the declared types and inspect their bound trees.
+    Vet,
+    Retained(&'a super::retained::Comparison<'a>),
+    /// Rehearse attaches, over the base's declared types and functions.
+    Attach(&'a super::attach::Rehearsal<'a>),
+}
+
+/// What the goal asked, where it asks anything.
+#[derive(Default)]
+pub(super) struct Answers {
+    pub retained: Vec<pbps_model::RetainedExpression>,
+    pub attach: Vec<pbps_model::adoption::AttachAnswer>,
+}
 
 /// An answered refusal is distinct from a scratch that could not answer.
 #[derive(Debug)]
@@ -37,7 +56,7 @@ pub async fn vet(
         standard,
         externals,
         provenance,
-        None,
+        Goal::Vet,
     )
     .await
     .map(|_| ())
@@ -52,10 +71,34 @@ pub(super) async fn run(
     standard: &Standard<pbps_pg::Postgres>,
     externals: Option<&str>,
     provenance: &Provenance,
-    comparison: Option<&super::retained::Comparison<'_>>,
-) -> Result<Vec<pbps_model::RetainedExpression>, Refused> {
+    goal: Goal<'_>,
+) -> Result<Answers, Refused> {
+    let dialect = pbps_pg::Postgres::new();
+    // An attach's index definitions can call a function as well as name a type.
+    let (functions, hints) = match &goal {
+        Goal::Attach(rehearsal) => {
+            let functions: std::collections::BTreeMap<_, _> = desired
+                .schema
+                .modules
+                .iter()
+                .filter(|(_, module)| module.kind == ModuleKind::Function)
+                .map(|(id, module)| (id.clone(), module.clone()))
+                .collect();
+            let mut hints = Hints::default();
+            hints.annotations.declared = pbps_model::object_ref::ObjectDeps::from_legacy(
+                &rehearsal
+                    .hints
+                    .annotations
+                    .baseline()
+                    .modules(desired.schema),
+            );
+            (functions, hints)
+        }
+        Goal::Vet | Goal::Retained(_) => Default::default(),
+    };
     let types = Schema {
         types: desired.schema.types.clone(),
+        modules: functions,
         ..Default::default()
     };
     let ids = IdsFile {
@@ -72,12 +115,11 @@ pub(super) async fn run(
         schema: &types,
         ids: &ids,
     };
-    let hints = Hints::default();
-    let dialect = pbps_pg::Postgres::new();
     let unavailable = |why: String| Refused::Unavailable(ProduceError::Run(Error::Binding(why)));
-    let bootstrap = pbps_diff::diff(base, desired_types, &dialect, &hints).map_err(|errors| {
-        unavailable(format!("the declared types cannot be ordered: {errors:?}"))
-    })?;
+    let bootstrap =
+        pbps_diff::bootstrap(base, desired_types, &dialect, &hints).map_err(|errors| {
+            unavailable(format!("the declared types cannot be ordered: {errors:?}"))
+        })?;
     let ordered = pbps_diff::order::deployment::schedule::schedule(
         bootstrap.clone(),
         &pbps_diff::order::deployment::schedule::Declarations {
@@ -99,11 +141,13 @@ pub(super) async fn run(
         &dialect,
     )
     .map_err(|error| unavailable(error.to_string()))?;
-    let request = match comparison {
-        Some(comparison) => {
+    let request = match &goal {
+        Goal::Retained(comparison) => {
             request::<pbps_pg::Postgres>(comparison.before, comparison.after, comparison.hints, &[])
         }
-        None => request::<pbps_pg::Postgres>(base, desired_types, &hints, &[]),
+        // The shells go in the schemas of the relations they copy.
+        Goal::Attach(_) => Ok(request_as_it_stands(desired, desired, &[])),
+        Goal::Vet => request::<pbps_pg::Postgres>(base, desired_types, &hints, &[]),
     }
     .map_err(|error| Refused::Unavailable(ProduceError::Run(error)))?;
     let mut target = Conn::connect(Driver::Postgres, target_connection)
@@ -213,12 +257,20 @@ pub(super) async fn run(
             }
         }
         match report.verdict() {
-            Verdict::Verified => match comparison {
-                Some(comparison) => comparison
+            Verdict::Verified => match goal {
+                Goal::Retained(comparison) => comparison
                     .run(session)
                     .await
+                    .map(|retained| Answers {
+                        retained,
+                        ..Default::default()
+                    })
                     .map_err(|why| run(Error::Binding(why))),
-                None => Ok(Vec::new()),
+                Goal::Attach(rehearsal) => Ok(Answers {
+                    attach: rehearsal.run(session).await,
+                    ..Default::default()
+                }),
+                Goal::Vet => Ok(Answers::default()),
             },
             Verdict::Mismatch(facts) => Err(run(Error::Incompatible(facts))),
             Verdict::Unknown(facts) => Err(run(Error::Scope(facts.join("; ")))),

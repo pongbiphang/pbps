@@ -268,6 +268,8 @@ mod index_gist2448;
 mod loose_drop1671;
 #[path = "support/partition_trigger1811.rs"]
 mod partition_trigger1811;
+#[path = "support/rehearsal1671.rs"]
+mod rehearsal1671;
 #[path = "support/resolved_attach3075.rs"]
 mod resolved_attach3075;
 

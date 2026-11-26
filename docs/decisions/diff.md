@@ -10463,30 +10463,83 @@ Pinned by `an_attach_drops_each_own_index_and_key_a_parents_index_might_take`,
 the ordering pass's tests in `dependents.rs`, and on 16 and 18 by
 `support/loose_drop1671.rs`.
 
+*Amended by [DEC-1671.2](#dec-1671-2): with a resolver selected, a plain index
+of an attached table that the scratch's engine takes is no longer dropped.*
+
 <a id="dec-1671-2"></a>
 
-**DEC-1671.2. Apply holds an attach that records a rehearsal to the indexes it
-records (#1671).**
+**DEC-1671.2. With a resolver selected, an attach keeps each plain index of the
+table that the engine takes, and apply holds both relations to what was read
+(#1671; amends DEC-1671.1).**
 
-**Context.** DEC-1671.1 drops every own index a parent's might take. The
-maintainer decided on 2026-11-26 that a project which selects a resolver may
-instead have an engine asked which of them it takes, and leave those to the
-attach. Such an answer rests on two facts the model does not hold: what the
-definitions bind to, and the order the indexes were made in, which decides which
-of two the engine takes. So it is not usable without a check of both at apply.
-This entry decides the record and that check. **The planning half, which asks
-the engine and writes the record, follows. Until it does, no plan carries a
-record, and every attach is planned as DEC-1671.1 says.**
+**Context.** DEC-1671.1 drops every own index a parent's might take, so an
+attach builds again what the engine would have adopted. The engine takes, for
+each index of the parent's in the order they were made, the first of the
+table's in that order which it holds equal and which nothing has taken. The
+comparison is of bound expressions, and the model holds neither those nor the
+order. The maintainer decided on 2026-11-26 to ask an engine for those who
+select a resolver (option A), in three parts:
 
-**The record.** `AttachPartition` may hold `rehearsal`: the parent's indexes and
-the table's, each list in object-number order with every index's name,
-`pg_get_indexdef` and, under a key, unique or exclusion constraint,
-`pg_get_constraintdef`; and `kept`, each of the table's indexes the plan leaves
-standing with the parent's index the engine gave it to. It is not
-`ResolverEvidence` and is not sealed (DEC-2354.1): apply checks it against the
-target itself. The report names what is kept. The plan's format changes with the
-field, which the format fingerprint catches; no version number moves
-(DEC-2412.3).
+- **Part 2a, this entry:** the rehearsal, for the plain indexes of an attached
+  table, expression and partial ones included. Keys and exclusions keep
+  DEC-1671.1's drop.
+- **Part 2b:** keys and exclusions.
+- **Part 3:** a parent's new index or exclusion over standing partitions.
+
+Without a resolver, and whenever the rehearsal gives no answer, the plan is
+DEC-1671.1's, change for change.
+
+**The question** comes from the plan made without an answer, so the two share
+one rule: for each attach, the indexes it drops of the attached table that one
+of the parent's might take. One under a name the declarations give to a
+relation of that schema, or to anything of the table's own, is dropped whatever
+the engine says; the rest may be left to the attach. No attach is asked about
+when:
+
+- the plan is refused;
+- the attach meets a pending parent shape (DEC-2296.12);
+- the plan renames a table, a column or a type, renames or rebuilds an enum or
+  rebuilds a domain, moves or updates an extension, or alters or drops a
+  function: a definition can print or bind otherwise by the time of the attach.
+  What calls a function is also taken down around its change, an index left
+  standing among it. This is `adoption::unsettles`, the predicate admission
+  refuses a record by.
+
+**The read.** With a resolver selected, the connected read fetches both
+relations in the statement that reads the catalog (DEC-423): their columns, the
+partition key, and each index's `pg_get_indexdef`, `pg_get_constraintdef` and
+validity in object-number order, under the canonical path. A relation the
+catalog does not hold, one with no index and a read that fails stay three
+different things.
+
+**The rehearsal.** The scratch compiles the base's declared types and
+functions, no table or view. In one transaction, rolled back, it makes both
+relations empty, replays the parent's indexes and constraints and the table's
+plain indexes less those dropped whatever it says, each as one statement
+(DEC-2354.3), attaches the table as the `DEFAULT` partition, and reads
+`pg_inherits`. The table's keys and exclusions are left out: DEC-1671.1 drops
+each one the attach could take, and one it could not take changes no choice.
+So the scratch holds what the target will hold at the attach, and no constraint
+of the table's can end up local over an inherited index. Any failure, an
+invalid index on either relation among them, is no answer. Only a scratch
+cleanup that cannot be confirmed fails the plan.
+
+**The answer** reaches the differ in `Hints`, and is used only where it agrees
+with the question the differ asks itself: one answer for the table's identity,
+the same parent, the parent's plain indexes exactly the base's, every candidate
+among the table's, and each index kept a candidate taken by one plain index of
+the parent's, no two by one. A kept index loses its drop and nothing else
+changes.
+
+**The record.** `AttachPartition` then holds `rehearsal`, only when something
+is kept: the parent's indexes and the table's, each list in object-number order
+with every index's name, `pg_get_indexdef` and, under a key, unique or
+exclusion constraint, `pg_get_constraintdef`; and `kept`, each of the table's
+indexes the plan leaves standing with the parent's index the engine gave it to.
+It is not `ResolverEvidence` and is not sealed (DEC-2354.1): apply checks it
+against the target itself. The report names what is kept. The plan's format
+changes with the field, which the format fingerprint catches; no version number
+moves (DEC-2412.3).
 
 **Admission** refuses a record on another engine, one that keeps nothing,
 repeats a name in either list or gives one index of the parent's two, one whose
@@ -10524,11 +10577,49 @@ not show it. An index made again that leaves names, definitions and order as
 they were, as the newest of a relation's does, is no difference: the engine's
 choice is the same.
 
-**Measured** on 16.15 and 18.6 (`~/gate1671/pr2/measure1671b.py`):
-`REINDEX CONCURRENTLY` moves the order; an attach passes over an invalid index,
-whose definition does not say it is one; the two locks hold off every statement
-that adds, drops or rebuilds an index of either relation, but not a rename.
+**The answers to the design's questions.**
 
-Pinned by the tests of `pbps-model/src/adoption.rs`, by
+- **Q1.** Part 2b's: a rehearsal that keeps keys must remove each constraint
+  left local over an inherited index and ask again. Part 2a leaves every key
+  out of the replay, so none arises.
+- **Q2.** Two comparisons from one record, since the plan's own drops run
+  between planning and the attach.
+- **Q3.** No rehearsal for a pending parent shape, or for a plan holding a
+  change `adoption::unsettles` names. The planner and admission share that
+  predicate, so the planner writes no record admission refuses for it.
+- **Q4.** An invalid index gives no answer, and apply requires every index
+  valid. A managed table holding one is already refused by the catalog read, so
+  the rule acts between planning and apply, and in the rehearsal itself.
+- **Q5.** No index is kept under a declared name, so a resolver changes what a
+  plan costs and not whether it applies.
+- **Q6.** `--staged` is as before. A staged plan holds one change, so one with
+  a rehearsal is an attach that drops nothing, and an attach that moves a
+  binding surface is still `Case::Required`, which `--staged` refuses.
+- **Q7.** The base's declared types and functions only.
+
+**Measured** on 16.15 and 18.6 (`~/gate1671/pr2/`):
+
+- `measure1671.py`: a replay in object-number order on empty relations, as a
+  plain owner under an empty path, took what the target took, for a contested
+  pair, one made again or renamed, a range bound against `DEFAULT`, respelled
+  expressions and predicates, a function of another schema, classes,
+  directions, collations, `INCLUDE`, BRIN options, keys, and exclusions on 18.
+- `measure1671b.py`: `REINDEX CONCURRENTLY` moves the order; an attach passes
+  over an invalid index, whose definition does not say it is one; the two locks
+  hold off every statement that adds, drops or rebuilds an index of either
+  relation, but not a rename.
+- `measure1671d.py`: every ordered list of one to three of primary key, unique
+  constraint, unique index and plain index over the same columns, on the parent
+  against the table, 5,329 pairs on each engine. After the plan's drops the
+  target took exactly what the rehearsal said, every index kept was taken, no
+  constraint of the parent's took an index of the table's, and none was left
+  local over an inherited index, in 2,271 pairs with an index kept beside a
+  dropped key. `measure1671d_full.py` replays the keys too: it keeps fewer, and
+  in 180 pairs on 18 and 281 on 16 its own attach is refused for a second
+  primary key.
+
+Pinned by the tests of `schema_diff/partitions/rehearsal.rs` and
+`pbps-model/src/adoption.rs`, by
 `an_attach_that_records_a_rehearsal_marks_its_attach_statement_alone`, and on
-16 and 18 by `support/adoption1671.rs`.
+16 and 18 by `support/adoption1671.rs` (apply's hold on a record) and
+`support/rehearsal1671.rs` (the rehearsal, and the apply of what it keeps).

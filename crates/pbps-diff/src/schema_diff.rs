@@ -124,6 +124,8 @@ use partitions::detach::detached_names;
 use partitions::detach::parent_shape_changes;
 use partitions::refusals::parent_column;
 use partitions::refusals::refuse_partition_changes;
+use partitions::rehearsal::leave_to_attach;
+pub use partitions::rehearsal::{Question, candidates, questions};
 pub use restoration::restoration_comparison;
 use roles::diff_roles;
 pub(crate) use roles::member_depth;
@@ -516,6 +518,8 @@ pub(crate) fn diff_partial_rebuilding(
 
     let (mut label_changes, label_errors) = crate::enum_labels::changes(base, declared, hints);
     errs.extend(label_errors);
+    // The sides as the caller gave them, which an attach's question is asked of.
+    let given = base;
     let comparison = crate::retained::comparison(base, declared, hints, &mut label_changes);
     let comparison =
         crate::extensions::forward_moved_types(comparison, base, declared, &hints.extension_moves);
@@ -598,6 +602,19 @@ pub(crate) fn diff_partial_rebuilding(
     ) = diff_tables(base, declared, dialect, types, read_back, changes, errs);
     changes = changes_out;
     errs = errs_out;
+    // Before every pass that reads the index drops: one a rehearsal leaves to
+    // its attach is not dropped (DEC-1671.2).
+    leave_to_attach(
+        given,
+        declared,
+        dialect,
+        hints,
+        also,
+        rebinding,
+        screen,
+        read_back,
+        &mut changes,
+    );
     let base_tables = &base.ids.tables;
     let declared_tables = &declared.ids.tables;
 
