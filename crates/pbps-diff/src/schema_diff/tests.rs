@@ -7683,9 +7683,11 @@ fn an_attach_drops_each_own_index_and_key_a_parents_index_might_take() {
         storage_parameters: Default::default(),
         filegroup: None,
     };
+    // An index the declaration adds to the parent beside the attach (round 1).
+    let added: std::cell::RefCell<Option<Index>> = Default::default();
     // The statements ahead of the attach, with the table's indexes all kept by
     // the declaration unless `declared` is empty.
-    let before = |theirs: &[Index], own: &[(&str, Index)], constrained: bool, kept: bool| {
+    let outcome = |theirs: &[Index], own: &[(&str, Index)], constrained: bool, kept: bool| {
         let mut parent = columns();
         parent.partition_by = Some(PartitionBy {
             external: false,
@@ -7725,7 +7727,11 @@ fn an_attach_drops_each_own_index_and_key_a_parents_index_might_take() {
         };
         let mut base = schema_of("app.ev", parent.clone());
         base.tables.insert("app.t".parse().unwrap(), ordinary);
-        let mut declared = schema_of("app.ev", parent);
+        let mut declared_parent = parent;
+        if let Some(ix) = added.borrow().clone() {
+            declared_parent.indexes.insert("p_new".into(), ix);
+        }
+        let mut declared = schema_of("app.ev", declared_parent);
         declared.tables.insert("app.t".parse().unwrap(), attached);
         let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
             .unwrap()
@@ -7744,8 +7750,11 @@ fn an_attach_drops_each_own_index_and_key_a_parents_index_might_take() {
             },
             &MinimalDialect,
             &Hints::default(),
-        )
-        .expect("an attach is planned");
+        );
+        let cs = match cs {
+            Ok(cs) => cs,
+            Err(e) => return Err(format!("{e:?}")),
+        };
         let steps: Vec<String> = cs
             .changes
             .iter()
@@ -7766,7 +7775,10 @@ fn an_attach_drops_each_own_index_and_key_a_parents_index_might_take() {
                 }
             })
             .collect();
-        steps
+        Ok(steps)
+    };
+    let before = |theirs: &[Index], own: &[(&str, Index)], constrained: bool, kept: bool| {
+        outcome(theirs, own, constrained, kept).expect("an attach is planned")
     };
     let m = || index(&["m"], false, None);
     let mut descending = m();
@@ -7908,6 +7920,14 @@ fn an_attach_drops_each_own_index_and_key_a_parents_index_might_take() {
             "{own:?}"
         );
     }
+    // Negative (round 1): a parent's index the plan adds beside the attach is
+    // refused by name (DEC-1687.1), so the attach never meets a parent's index
+    // the base did not hold, and nothing of the table's is left to be adopted
+    // by it.
+    *added.borrow_mut() = Some(m());
+    let refused = outcome(&[], &[("t_m", m())], false, true).expect_err("refused");
+    assert!(refused.contains("while this plan attaches"), "{refused}");
+    *added.borrow_mut() = None;
 }
 
 /// An ordinary table declared as a partition of a standing parent is
