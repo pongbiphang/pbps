@@ -48,6 +48,7 @@ macro_rules! string_json_schema {
     )+};
 }
 
+pub mod adoption;
 pub mod baseline_evidence;
 pub mod change;
 mod column_wire;

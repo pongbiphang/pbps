@@ -81,6 +81,7 @@ fn attach() -> Change {
         bound: PartitionBound::Default,
         key: Vec::new(),
         shape: Box::new(plain()),
+        rehearsal: None,
     })
 }
 fn steps(changes: Vec<Change>) -> Vec<PlannedChange> {

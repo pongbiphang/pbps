@@ -779,6 +779,7 @@ fn attached_partition() -> Plan {
                 bound: PartitionBound::Default,
                 key: Vec::new(),
                 shape: Box::new(member),
+                rehearsal: None,
             })),
             p(Change::Partition(PartitionChange::SetPartitionDefault {
                 uid: pt.clone(),

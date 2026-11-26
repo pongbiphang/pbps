@@ -666,6 +666,7 @@ mod effects_of_each_kind {
                     bound: bound(),
                     key: Vec::new(),
                     shape: Box::new(w.p.clone()),
+                    rehearsal: None,
                 }),
             ),
             (
@@ -677,6 +678,7 @@ mod effects_of_each_kind {
                     bound: bound(),
                     key: Vec::new(),
                     shape: Box::new(w.p.clone()),
+                    rehearsal: None,
                 }),
             ),
             (

@@ -2327,6 +2327,7 @@ mod tests {
                 bound,
                 key: vec![],
                 shape: Box::new(child),
+                rehearsal: None,
             });
             for change in [creating, attaching] {
                 for with_label in [true, false] {

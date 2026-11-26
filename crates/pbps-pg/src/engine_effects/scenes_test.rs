@@ -326,6 +326,7 @@ pub(super) fn steps(s: &self::Scene, kind: Kind, motion: Motion) -> Vec<Change> 
             bound: self::bound(),
             key: vec![],
             shape: Box::new(s.after.tables[&a].clone()),
+            rehearsal: None,
         }),
         Motion::Detach => Change::Partition(PartitionChange::DetachPartition {
             uid: self::uid("t_bbbbbb"),

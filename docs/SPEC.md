@@ -2586,6 +2586,15 @@ section, not a defect; it is answered by pointing here.
 
 See DECISIONS 150, 153, 159, 161, 166, 173, 181–190.
 
+**An attach's choice of index (DEC-1671.2):** which of two indexes an attach
+takes depends on the order they were made in, which no comparison of the
+read-back with the baseline can see. Where a plan records a rehearsal, `apply`
+compares each of the two relations' indexes (names, definitions, order,
+validity) with the record before its first statement, and again just before the
+`ATTACH`, in its transaction and under the locks the attach takes, less what the
+plan has dropped by then. Any difference refuses the attach before it runs. A
+resumed staged apply makes the second comparison only.
+
 **Declared-domain code (§9.3.2, DEC-2309.1):** target-aware planning with a
 selected resolver vets code-bearing created or altered domains on scratch.
 This early check reads bound CHECK and DEFAULT trees, including operators and

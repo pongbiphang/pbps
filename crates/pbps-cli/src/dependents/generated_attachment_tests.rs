@@ -91,6 +91,7 @@ fn fixture(placeholder: bool, generated: bool) -> (ChangeSet, Schema, IdsFile, S
                 bound: PartitionBound::Default,
                 key: vec!["id".into()],
                 shape: Box::new(schema.tables[&TableName::new("app", "child")].clone()),
+                rehearsal: None,
             }),
         ]
         .into_iter()

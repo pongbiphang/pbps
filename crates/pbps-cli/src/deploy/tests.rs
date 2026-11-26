@@ -2280,6 +2280,7 @@ fn an_attached_table_is_held_to_its_shape_once_it_is_a_partition() {
                 bound: PartitionBound::Default,
                 key: Vec::new(),
                 shape: Box::new(shape.clone()),
+                rehearsal: None,
             },
         ))],
     };
@@ -2653,6 +2654,7 @@ fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
                 unlogged,
                 ..Table::default()
             }),
+            rehearsal: None,
         }))
     };
     let e = refused(vec![attach(true)], &parent).unwrap_err();

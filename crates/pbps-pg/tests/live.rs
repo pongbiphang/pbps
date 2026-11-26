@@ -6363,6 +6363,7 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
                     bound,
                     key: Vec::new(),
                     shape: Box::default(),
+                    rehearsal: None,
                 },
             ))],
         };
@@ -8273,6 +8274,7 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
                     bound: B::Range { from, to },
                     key: Vec::new(),
                     shape: Box::default(),
+                    rehearsal: None,
                 },
             ))],
         };
@@ -8401,6 +8403,7 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
                         },
                         key: Vec::new(),
                         shape: Box::default(),
+                        rehearsal: None,
                     },
                 )),
                 pbps_model::PlannedChange::new(Change::Constraint(
@@ -8512,6 +8515,7 @@ async fn a_default_attach_counts_the_rows_another_partition_takes() {
                 bound: B::Default,
                 key: Vec::new(),
                 shape: Box::default(),
+                rehearsal: None,
             })
         };
         let plan = |changes: Vec<Change>| pbps_model::ChangeSet {

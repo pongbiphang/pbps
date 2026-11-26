@@ -974,6 +974,7 @@ fn partition_membership_and_default_moves_cannot_certify_empty_creation() {
         bound: PartitionBound::Default,
         key: vec![],
         shape: Box::default(),
+        rehearsal: None,
     }));
     let detach = PlannedChange::new(Change::Partition(PartitionChange::DetachPartition {
         uid: ids.table_uid(&child).unwrap().clone(),

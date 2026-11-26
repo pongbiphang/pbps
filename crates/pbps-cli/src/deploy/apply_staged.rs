@@ -453,6 +453,9 @@ pub(super) async fn apply_staged_under_lock<D: crate::engine::ApplySession>(
                 || stmt.rewrites.is_some()
                 || stmt.introduces.is_some()
                 || stmt.extension.is_some()
+                // The compare ahead of an attach and the attach share one
+                // transaction, under its locks (DEC-1671.2).
+                || stmt.attach_pin.is_some()
                 || !written_routines.is_empty()
                 || !plan.type_pins.is_empty()
                 || !plan.provider_pins.is_empty()

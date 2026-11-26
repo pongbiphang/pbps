@@ -546,6 +546,7 @@ mod tests {
                 bound: PartitionBound::Default,
                 key: vec![],
                 shape: Box::new(after.tables[&a].clone()),
+                rehearsal: None,
             })),
             PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
                 uid: uid("c_bbbbbb"),

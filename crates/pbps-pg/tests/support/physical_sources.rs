@@ -248,6 +248,7 @@ async fn column_order_and_membership_match_the_catalog_at_each_boundary() {
             bound: pbps_model::PartitionBound::Default,
             key: vec![],
             shape: Box::default(),
+            rehearsal: None,
         }),
         Change::Column(ColumnChange::RenameColumn {
             uid: uid("c_bbbbbb"),

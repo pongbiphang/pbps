@@ -1225,6 +1225,11 @@ pub enum PartitionChange {
         /// once every statement has run, as it holds a created table to its
         /// `CREATE`.
         shape: Box<Table>,
+        /// What a resolver's rehearsal answered, on a plan that leaves an own
+        /// index to the attach: apply holds both relations to it before the
+        /// attach (DEC-1671.2). `None` where the plan keeps none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rehearsal: Option<Box<crate::adoption::AttachRehearsal>>,
     },
     /// A partition's own default on a column it inherits (#1581, DEC-1581.1):
     /// `ALTER TABLE <partition> ALTER COLUMN … SET DEFAULT` or `DROP

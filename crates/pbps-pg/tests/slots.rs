@@ -337,6 +337,7 @@ fn an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_release
                     bound: PartitionBound::Default,
                     key: Vec::new(),
                     shape: Box::new(shape),
+                    rehearsal: None,
                 })
             } else {
                 Change::Table(TableChange::CreateTable {
@@ -486,6 +487,7 @@ fn an_attach_claims_its_standing_checks_instead_of_its_final_checks() {
             bound: PartitionBound::Default,
             key: Vec::new(),
             shape: Box::new(shape),
+            rehearsal: None,
         });
         let mut changes = Vec::new();
         if removed_first {

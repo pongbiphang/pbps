@@ -30,12 +30,7 @@ pub(super) fn emit(pg: &Postgres, change: &Change, partition: &PartitionChange) 
             parent,
             bound,
             ..
-        } => unscoped(format!(
-            "ALTER TABLE {} ATTACH PARTITION {} {};",
-            qualified(parent)?,
-            qualified(table)?,
-            bound_clause(bound)
-        )),
+        } => Ok(vec![attach(change, table, parent, bound)?]),
         // A partition's own default, or, without one, the copy of its
         // parent's that the engine gives every partition: `DROP DEFAULT`
         // would leave the partition without the default its parent's rows
@@ -95,4 +90,30 @@ pub(super) fn emit(pg: &Postgres, change: &Change, partition: &PartitionChange) 
             ),
         ),
     }
+}
+
+/// The `ATTACH` itself, alone or as the third statement of a staged attach.
+/// One whose plan records a rehearsal carries its change to apply, which
+/// compares both relations with the record just before it runs (DEC-1671.2).
+pub(super) fn attach(
+    change: &Change,
+    table: &TableName,
+    parent: &TableName,
+    bound: &pbps_model::PartitionBound,
+) -> Result<Statement, DialectError> {
+    let mut statement = Statement::new(format!(
+        "ALTER TABLE {} ATTACH PARTITION {} {};",
+        qualified(parent)?,
+        qualified(table)?,
+        bound_clause(bound)
+    ));
+    statement.attach_pin = matches!(
+        change,
+        Change::Partition(PartitionChange::AttachPartition {
+            rehearsal: Some(_),
+            ..
+        })
+    )
+    .then(|| Box::new(change.clone()));
+    Ok(statement)
 }

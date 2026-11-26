@@ -1095,6 +1095,7 @@ fn physical_sources_agrees_with_symbolic_scope_entry_and_exit() {
         bound,
         key: vec![],
         shape: Box::new(shape),
+        rehearsal: None,
     }));
     let changes = vec![change];
     let names = PlanNames::of(&changes, &final_ids).unwrap();

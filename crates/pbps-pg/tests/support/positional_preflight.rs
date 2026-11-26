@@ -43,6 +43,7 @@ async fn an_attach_cannot_borrow_a_later_detachs_empty_range() {
         },
         key: Vec::new(),
         shape: Box::new(shape.clone()),
+        rehearsal: None,
     });
     let detach = Change::Partition(PartitionChange::DetachPartition {
         uid: standing_id.clone(),
@@ -173,6 +174,7 @@ async fn tightening_sees_an_attached_child_only_after_the_attach() {
         },
         key: Vec::new(),
         shape: Box::new(shape),
+        rehearsal: None,
     });
     let ids = IdsFile {
         tables: [
@@ -498,6 +500,7 @@ async fn membership_null_probes_read_each_selected_stored_source_once() {
         },
         key: vec![],
         shape: Box::default(),
+        rehearsal: None,
     });
     let tighten = Change::Column(ColumnChange::AlterColumnNullability {
         uid: uid("c_bbbbbb"),
@@ -682,6 +685,7 @@ async fn converted_membership_values_are_unchecked_and_engine_constraints_still_
             },
             key: vec![],
             shape: Box::default(),
+            rehearsal: None,
         }));
         changes.push(Change::Column(ColumnChange::AlterColumnNullability {
             uid: uid("c_bbbbbb"),
