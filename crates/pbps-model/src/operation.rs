@@ -209,6 +209,20 @@ pub enum Spelling {
     Final,
 }
 
+impl fmt::Display for Spelling {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::At(At::Start) => f.write_str("at the start of the plan"),
+            Self::At(At::Before(step)) => write!(f, "before change {step}"),
+            Self::At(At::After(step)) => write!(f, "after change {step}"),
+            Self::At(At::End) => f.write_str("at the end of the plan"),
+            Self::Input(id) => write!(f, "at the input to operation {id}"),
+            Self::Base => f.write_str("in the baseline"),
+            Self::Final => f.write_str("in the final declarations"),
+        }
+    }
+}
+
 impl Spelling {
     /// The spelling of what the step itself brings into being: after its
     /// own change, where a whole step is spelled before it.
@@ -415,19 +429,19 @@ pub struct Definition {
 pub enum OwnerError {
     /// Neither the plan nor the identity files record anything under the
     /// name: not evidence that nothing is there.
-    #[error("no managed object is recorded under `{name}` ({spelling:?})")]
+    #[error("no managed object is recorded under `{name}` ({spelling})")]
     Unmanaged { name: String, spelling: Spelling },
     /// A managed name nothing holds at that boundary.
-    #[error("nothing holds `{name}` at {spelling:?}")]
+    #[error("nothing holds `{name}` {spelling}")]
     Vacant { name: String, spelling: Spelling },
-    #[error("cannot bind {name} at {spelling:?}: {why}")]
+    #[error("cannot bind {name} {spelling}: {why}")]
     Names {
         name: String,
         spelling: Spelling,
         why: String,
     },
     /// The step's position is outside the logical plan the owners index.
-    #[error("{spelling:?} is outside the indexed plan")]
+    #[error("the position {spelling} is outside the indexed plan")]
     Outside { spelling: Spelling },
     #[error("rebuild of `{name}` is unavailable: {why}")]
     Rebuild { name: String, why: &'static str },
