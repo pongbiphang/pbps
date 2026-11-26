@@ -146,7 +146,11 @@ fn plain_unique_key(ix: &IndexEntry) -> Option<BTreeMap<String, String>> {
     let mut map = BTreeMap::new();
     for (col, coll) in &ix.keys {
         if map
-            .insert(ident::fold(col.as_deref()?).into_owned(), coll.clone())
+            // SQLite compares a collation's name without regard to ASCII case.
+            .insert(
+                ident::fold(col.as_deref()?).into_owned(),
+                coll.to_ascii_lowercase(),
+            )
             .is_some()
         {
             return None;

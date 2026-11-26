@@ -1990,3 +1990,45 @@ fn drop_blockers_refuses_rebuild_changes_absent_targets_and_unreadable_or_missin
     );
     locker.execute_batch("ROLLBACK").expect("unlock");
 }
+
+#[test]
+fn a_sibling_unique_index_covers_whatever_the_case_of_its_collation_name() {
+    let mut db = Fresh::file();
+    let c = db.connection();
+    c.execute_batch(
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE, b TEXT); \
+         CREATE UNIQUE INDEX uq_upper ON parent(k COLLATE NOCASE); \
+         CREATE UNIQUE INDEX uq_lower ON parent(k COLLATE nocase); \
+         CREATE UNIQUE INDEX uq_b ON parent(b COLLATE NOCASE); \
+         CREATE UNIQUE INDEX uq_b_binary ON parent(b); \
+         CREATE TABLE child (id INTEGER PRIMARY KEY, pk TEXT, pb TEXT, \
+           CONSTRAINT fk_k FOREIGN KEY (pk) REFERENCES parent(k), \
+           CONSTRAINT fk_b FOREIGN KEY (pb) REFERENCES parent(b))",
+    )
+    .expect("setup");
+    let (stored, stored_ids) = seed_stored(&[
+        ("parent", &["id", "k", "b"]),
+        ("child", &["id", "pk", "pb"]),
+    ]);
+    let reports = drop_eval(
+        c,
+        &stored,
+        &stored_ids,
+        vec![drop_idx("parent", "uq_upper")],
+    )
+    .expect("the catalog is readable");
+    assert!(reports[0].blocking.is_empty(), "{:?}", reports[0].blocking);
+    // Negative: another collation is another key, so it does not cover.
+    let reports = drop_eval(
+        c,
+        &stored,
+        &stored_ids,
+        vec![drop_idx("parent", "uq_b_binary")],
+    )
+    .expect("the catalog is readable");
+    assert!(
+        reports[0].blocking.iter().any(|b| b.contains("fk_b")),
+        "{:?}",
+        reports[0].blocking
+    );
+}
