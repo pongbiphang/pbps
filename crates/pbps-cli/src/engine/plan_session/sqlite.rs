@@ -243,12 +243,12 @@ fn order_name_handovers<S: Clone>(
         ids: frame.written.ids,
     };
     let shadowed =
-        pbps_diff::order::analyse_with_catalog(&ops, &owners, before, after, dialect, Some(facts));
+        pbps_diff::order::analyse_with_catalog(&ops, &owners, before, after, dialect, Some(facts))?;
     if shadowed.unowned.is_empty() {
         let fx_graph = pbps_diff::order::graph(
             ops.as_slice(),
             &shadowed.effects,
-            &pbps_diff::order::Baseline::of(before, &owners),
+            &pbps_diff::order::Baseline::of(before, &owners)?,
             &frame.hints.annotations.modules(frame.written.schema),
             pbps_diff::order::Checks::ALL,
         );
@@ -1422,7 +1422,7 @@ mod tests {
                 pbps_diff::order::shadow::Stage::Final,
                 ordered.facts.as_ref(),
                 &Default::default(),
-            );
+            )?;
         }
         Ok((state, ordered))
     }
@@ -2418,7 +2418,8 @@ mod tests {
                     pbps_diff::order::shadow::Stage::Final,
                     ordered.facts.as_ref(),
                     &Default::default(),
-                );
+                )
+                .map_err(|e| ("observe_scheduled", e.to_string()))?;
             }
             now(dialect.check_final_order(&state, &mut conn, &plan, frame))
                 .map_err(|e| ("check_final_order", e.to_string()))?;
