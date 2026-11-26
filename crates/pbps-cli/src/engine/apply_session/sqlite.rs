@@ -8,7 +8,7 @@
 //!   where the input can carry one;
 //! - *exists in `pbps-sqlite` or `pbps-db` already*: calls it in place on the
 //!   calling thread through `Conn::sqlite()` (DEC-2950.17);
-//! - *needs logic nobody has written yet* (`requirement`, `rename_report`):
+//! - *needs logic nobody has written yet* (`requirement`):
 //!   refuses by name naming SQLite and the unsupported operation, never
 //!   returning an empty answer that would read as "nothing blocks" or
 //!   "nothing depends".
@@ -549,18 +549,16 @@ impl ApplySession for Sqlite {
     ) -> anyhow::Result<Vec<(String, String, String)>> {
         Err(sqlite_has_no_roles("reading which principals hold a name"))
     }
-    /// Needs logic nobody has written yet: `pbps-sqlite` has no rename-impact
-    /// catalog reader. Refused by name naming SQLite and the target rather
-    /// than returning an empty report.
+    /// Exists in `pbps-sqlite` already: reads the SQLite catalog inventory and
+    /// classifies every referrer of a renamed table or column as carried or
+    /// advisory (`blocking` is always empty on SQLite).
     async fn rename_report(
         &self,
-        _conn: &mut Conn,
+        conn: &mut Conn,
         target: &RenameTarget,
     ) -> Result<ImpactReport, ImpactError> {
-        Err(ImpactError::Query(DbError::Refused(format!(
-            "SQLite does not support rename impact analysis yet (cannot inspect referrers of \
-             {target})"
-        ))))
+        let c = sqlite_conn(conn)?;
+        pbps_sqlite::catalog::inventory::rename_report(c, target)
     }
     /// Does not exist on this engine: SQLite records no `USING` conversion
     /// expressions; refuses if a change carries one.
@@ -1013,22 +1011,13 @@ mod tests {
         let dialect = Sqlite::default();
         let admission = RoutineAdmission::default();
 
-        // 1. requirement
+        // 1. requirement (only remaining unimplemented Step B method on ApplySession)
         let req =
             now(dialect.requirement(&mut conn, &admission, &TableName::new("main", "t"), "x > 0"))
                 .unwrap_err();
         assert!(
             req.to_string().contains("SQLite") && req.to_string().contains("drop-requirement"),
             "{req}"
-        );
-
-        // 2. rename_report
-        let target = RenameTarget::Table(TableName::new("main", "t"));
-        let report_err = now(dialect.rename_report(&mut conn, &target)).unwrap_err();
-        assert!(
-            report_err.to_string().contains("SQLite")
-                && report_err.to_string().contains("rename impact"),
-            "{report_err}"
         );
     }
 
@@ -1480,5 +1469,327 @@ mod tests {
             .expect_err("locked file must error");
         assert!(!lock_err.to_string().is_empty(), "{lock_err}");
         locker.execute("ROLLBACK", &[]).expect("unlock");
+    }
+
+    #[test]
+    fn rename_report_classifies_referrers_excuses_dropped_views_and_passes_apply_preflight_end_to_end()
+     {
+        use pbps_model::{ForeignKey, Index, IndexColumn, Module, PrimaryKey};
+
+        let dialect = Sqlite::default();
+        let seed_sql = [
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER)",
+            "CREATE INDEX ix_items_qty ON items(qty)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, iid INTEGER, CONSTRAINT fk_child_items FOREIGN KEY (iid) REFERENCES items(id))",
+            "CREATE VIEW v_items AS SELECT id, qty FROM items",
+        ];
+        let build_stored = || -> (Schema, IdsFile) {
+            let mut schema = Schema::default();
+            let mut ids = IdsFile::default();
+            let items_tn = TableName::new("main", "items");
+            let child_tn = TableName::new("main", "child");
+            let mut items = pbps_model::Table::default();
+            for c in ["id", "qty"] {
+                items.columns.insert(
+                    c.into(),
+                    pbps_model::Column::new("integer".parse().expect("ty")),
+                );
+                ids.columns.insert(
+                    uid(UidKind::Column, &format!("main.items.{c}")),
+                    items_tn.column(c),
+                );
+            }
+            items.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            });
+            items.indexes.insert(
+                "ix_items_qty".into(),
+                Index {
+                    columns: vec![IndexColumn::column("qty")],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                },
+            );
+            let mut child = pbps_model::Table::default();
+            for c in ["id", "iid"] {
+                child.columns.insert(
+                    c.into(),
+                    pbps_model::Column::new("integer".parse().expect("ty")),
+                );
+                ids.columns.insert(
+                    uid(UidKind::Column, &format!("main.child.{c}")),
+                    child_tn.column(c),
+                );
+            }
+            child.foreign_keys.insert(
+                "fk_child_items".into(),
+                ForeignKey {
+                    columns: vec!["iid".into()],
+                    references_table: items_tn.clone(),
+                    references_columns: vec!["id".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+            schema.tables.insert(items_tn.clone(), items);
+            schema.tables.insert(child_tn.clone(), child);
+            schema.modules.insert(
+                ModuleId::Named(TableName::new("main", "v_items")),
+                Module {
+                    kind: ModuleKind::View,
+                    description: None,
+                    definition: "SELECT id, qty FROM items".into(),
+                    options: Default::default(),
+                },
+            );
+            ids.tables
+                .insert(uid(UidKind::Table, "main.items"), items_tn);
+            ids.tables
+                .insert(uid(UidKind::Table, "main.child"), child_tn);
+            (schema, ids)
+        };
+
+        // 1. Direct `ApplySession::rename_report` and locked-file error.
+        {
+            let (tmp, mut conn) = TempDb::create();
+            for sql in seed_sql {
+                now(conn.execute(sql)).expect(sql);
+            }
+            let target = RenameTarget::Table(TableName::new("main", "items"));
+            let rep = now(dialect.rename_report(&mut conn, &target)).expect("rename_report");
+            assert!(rep.blocking.is_empty(), "{rep:#?}");
+            assert!(rep.carried.iter().any(|r| r.name == "view main.v_items"
+                && r.removed_with
+                    == Some((
+                        ModuleKind::View,
+                        ModuleId::Named(TableName::new("main", "v_items"))
+                    ))));
+            assert!(
+                rep.carried
+                    .iter()
+                    .any(|r| r.name == "index main.ix_items_qty on table main.items")
+            );
+            assert!(
+                rep.carried
+                    .iter()
+                    .any(|r| r.name == "foreign key `fk_child_items` on table `main.child`")
+            );
+            assert!(
+                rep.advisory
+                    .iter()
+                    .any(|r| r.kind == "index" && r.name == "ix_items_qty")
+            );
+            assert!(
+                rep.advisory
+                    .iter()
+                    .any(|r| r.kind == "view" && r.name == "main.v_items")
+            );
+
+            // Negative: exclusively locked file errors, never empty.
+            let locker = pbps_db::sqlite::Connection::open(
+                tmp.path(),
+                pbps_db::sqlite::OpenMode::ExistingOnly,
+            )
+            .expect("second conn");
+            locker.execute("BEGIN EXCLUSIVE", &[]).expect("lock");
+            assert!(now(dialect.rename_report(&mut conn, &target)).is_err());
+            locker.execute("ROLLBACK", &[]).expect("unlock");
+        }
+
+        // 2. End-to-end `apply::preflight` for rename table, case-only rename, rename column,
+        //    and rename table paired with dropping `main.v_items` (verifying `impact_lines`,
+        //    `rename_notes`, and `excuse_dropped_referrers` through `Progress`).
+        let (stored, stored_ids) = build_stored();
+        let project = pbps_config::Project {
+            root: std::path::PathBuf::from("."),
+            config: pbps_config::Config::parse(
+                "dialect: postgres\n",
+                std::path::Path::new("pbps.yml"),
+            )
+            .expect("config"),
+        };
+        let managed = crate::pins::Managed {
+            modules: BTreeSet::new(),
+            references: BTreeSet::new(),
+            declared_types: BTreeSet::new(),
+        };
+        let renamed_records_ids = {
+            let mut ids = stored_ids.clone();
+            ids.tables.insert(
+                uid(UidKind::Table, "main.items"),
+                TableName::new("main", "records"),
+            );
+            ids.columns.insert(
+                uid(UidKind::Column, "main.items.id"),
+                TableName::new("main", "records").column("id"),
+            );
+            ids.columns.insert(
+                uid(UidKind::Column, "main.items.qty"),
+                TableName::new("main", "records").column("qty"),
+            );
+            ids
+        };
+        let cases: Vec<(&str, Vec<Change>, IdsFile, bool)> = vec![
+            (
+                "rename table",
+                vec![Change::Table(TableChange::RenameTable {
+                    uid: uid(UidKind::Table, "main.items"),
+                    from: TableName::new("main", "items"),
+                    to: TableName::new("main", "records"),
+                    defaults: Vec::new(),
+                })],
+                renamed_records_ids.clone(),
+                false,
+            ),
+            (
+                "rename table dropping view",
+                vec![
+                    Change::Module(ModuleChange::DropModule {
+                        id: ModuleId::Named(TableName::new("main", "v_items")),
+                        kind: ModuleKind::View,
+                    }),
+                    Change::Table(TableChange::RenameTable {
+                        uid: uid(UidKind::Table, "main.items"),
+                        from: TableName::new("main", "items"),
+                        to: TableName::new("main", "records"),
+                        defaults: Vec::new(),
+                    }),
+                ],
+                renamed_records_ids,
+                true,
+            ),
+            (
+                "case-only rename table",
+                vec![Change::Table(TableChange::RenameTable {
+                    uid: uid(UidKind::Table, "main.items"),
+                    from: TableName::new("main", "items"),
+                    to: TableName::new("main", "ITEMS"),
+                    defaults: Vec::new(),
+                })],
+                {
+                    let mut ids = stored_ids.clone();
+                    ids.tables.insert(
+                        uid(UidKind::Table, "main.items"),
+                        TableName::new("main", "ITEMS"),
+                    );
+                    ids.columns.insert(
+                        uid(UidKind::Column, "main.items.id"),
+                        TableName::new("main", "ITEMS").column("id"),
+                    );
+                    ids.columns.insert(
+                        uid(UidKind::Column, "main.items.qty"),
+                        TableName::new("main", "ITEMS").column("qty"),
+                    );
+                    ids
+                },
+                false,
+            ),
+            (
+                "rename column",
+                vec![Change::Column(ColumnChange::RenameColumn {
+                    uid: uid(UidKind::Column, "main.items.qty"),
+                    table: TableName::new("main", "items"),
+                    from: "qty".into(),
+                    to: "amount".into(),
+                    table_was: None,
+                })],
+                {
+                    let mut ids = stored_ids.clone();
+                    ids.columns.insert(
+                        uid(UidKind::Column, "main.items.qty"),
+                        TableName::new("main", "items").column("amount"),
+                    );
+                    ids
+                },
+                false,
+            ),
+        ];
+        for (label, changes, after_ids, drops_view) in cases {
+            let (tmp, mut conn) = TempDb::create();
+            for sql in seed_sql {
+                now(conn.execute(sql)).expect(sql);
+            }
+            let plan = saved(
+                changes.into_iter().map(PlannedChange::new).collect(),
+                after_ids,
+            );
+            let checksum = plan.wire_fingerprint();
+            let admitted = pbps_diff::order::admit(
+                plan,
+                &dialect,
+                std::path::Path::new("plan.json"),
+                &checksum,
+            )
+            .unwrap_or_else(|e| panic!("{label}: admit failed: {e}"));
+            let names =
+                pbps_model::plan_names::PlanNames::of(&admitted.changes.changes, &admitted.ids)
+                    .expect("names");
+            let targets = dialect.rename_targets(&names);
+            assert_eq!(targets.len(), 1, "{label}: {targets:?}");
+            let target_cfg = crate::db::Target::test_owned_with_driver(
+                pbps_db::Driver::Sqlite,
+                tmp.path().to_string_lossy().into_owned(),
+                Vec::new(),
+            );
+            let approved = Approved {
+                project: &project,
+                target: &target_cfg,
+                plan: &admitted,
+                managed: &managed,
+            };
+            let progress = crate::deploy::services::Progress::default();
+            now(crate::deploy::preflight(
+                &mut conn,
+                &dialect,
+                &admitted,
+                &targets,
+                &stored,
+                &stored_ids,
+                &approved,
+                Some(&progress),
+            ))
+            .unwrap_or_else(|e| panic!("{label}: preflight failed: {e}"));
+
+            let notes: Vec<String> = progress
+                .findings
+                .borrow()
+                .iter()
+                .map(|f| f.message.clone())
+                .collect();
+            assert!(
+                notes.iter().any(|l| l.contains("legacy_alter_table")),
+                "{label}: {notes:#?}"
+            );
+            if drops_view {
+                assert!(
+                    !notes.iter().any(|l| l.contains("v_items")),
+                    "{label}: dropped view must be excused from carried and advisory: {notes:#?}"
+                );
+            } else {
+                assert!(
+                    notes.iter().any(|l| l.contains("view main.v_items")
+                        && l.contains("carried into the new name")),
+                    "{label}: {notes:#?}"
+                );
+            }
+
+            // Emit and execute the plan's statements on the live SQLite file to confirm
+            // the rename executes cleanly after preflight passes.
+            let stmts = crate::statements(&admitted, &dialect)
+                .unwrap_or_else(|e| panic!("{label}: statements failed: {e}"));
+            now(conn.begin(&pbps_sqlite::TRANSACTION)).expect("begin");
+            for stmt in &stmts {
+                now(conn.execute(&stmt.sql))
+                    .unwrap_or_else(|e| panic!("{label}: `{}` failed: {e}", stmt.sql));
+            }
+            now(conn.rollback(&pbps_sqlite::TRANSACTION)).expect("rollback");
+        }
     }
 }

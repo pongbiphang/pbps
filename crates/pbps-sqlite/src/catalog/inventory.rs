@@ -28,7 +28,9 @@ use crate::pragma::{self, table_list, table_xinfo};
 use crate::{ident, lexis, names};
 
 mod drops;
+mod renames;
 pub use drops::{drop_blockers, has_drop_blocker_target};
+pub use renames::rename_report;
 
 /// The kind of a row in `main.sqlite_schema`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -197,7 +199,16 @@ pub fn read(c: &Connection, column_tables: &[&str]) -> Result<Inventory, DbError
 pub fn read_for_drops(c: &Connection, sources: &PhysicalSources<'_>) -> Result<Inventory, DbError> {
     let tables = drops::inspected_tables(sources);
     let refs: Vec<&str> = tables.iter().map(String::as_str).collect();
-    let mut inv = read(c, &refs)?;
+    enrich_relations(c, read(c, &refs)?)
+}
+
+/// Reads everything [`rename_report`] needs for `table` without loading any
+/// virtual table's module (DEC-2950.14).
+pub fn read_for_rename(c: &Connection, table: &str) -> Result<Inventory, DbError> {
+    enrich_relations(c, read(c, &[table])?)
+}
+
+fn enrich_relations(c: &Connection, mut inv: Inventory) -> Result<Inventory, DbError> {
     for (req, cols) in &inv.columns {
         if matches!(cols, TableColumns::Columns(_)) {
             let actual = inv
