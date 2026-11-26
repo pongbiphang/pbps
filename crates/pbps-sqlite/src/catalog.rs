@@ -30,6 +30,7 @@ use pbps_model::escape::Escaped;
 
 mod assemble;
 pub(crate) mod facts;
+pub mod inventory;
 #[cfg(test)]
 mod tests;
 pub(crate) mod text;

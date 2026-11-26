@@ -3286,6 +3286,19 @@ pub trait Dialect {
         true
     }
 
+    /// Whether a named primary-key, unique or exclusion constraint also creates
+    /// an index bearing that constraint's name.
+    ///
+    /// True on PostgreSQL (an index of that name in `pg_class`, sharing the
+    /// schema's relation namespace) and on SQL Server (a backing index of that
+    /// name in `sys.indexes`, per table). False on SQLite, where `CONSTRAINT k
+    /// PRIMARY KEY` / `UNIQUE` creates `sqlite_autoindex_<table>_N` and no
+    /// `sqlite_schema` entry named `k`, so a table, view or index named `k`
+    /// coexists with it.
+    fn keys_claim_index_name(&self) -> bool {
+        true
+    }
+
     /// The names this engine gives `table`'s constraints itself, which no
     /// declaration spells and which still take a name where constraints share
     /// the schema's namespace: SQL Server's generated default constraints. A
@@ -4819,6 +4832,9 @@ fn declared_relation_claims<'a>(
                     key_of: Some(table_name),
                 },
             ));
+        }
+        if !dialect.keys_claim_index_name() {
+            declared.retain(|(_, claim)| claim.key_of.is_none());
         }
         for (name, claim) in declared {
             let claim_name = ObjectName::new(table_name.schema.clone(), name);

@@ -37,6 +37,7 @@ pub(crate) fn order(
 ) -> Vec<Vec<(TableName, TableName)>> {
     let indexes = dialect.indexes_share_namespace_with_tables();
     let constraints = dialect.constraints_share_namespace_with_tables();
+    let keys_in_relation = constraints || (indexes && dialect.keys_claim_index_name());
     // No early return when neither answer is yes: a dropped table releases
     // its own name regardless of what else shares the namespace.
     let mut owners = BTreeMap::new();
@@ -47,7 +48,7 @@ pub(crate) fn order(
     // name, so both are asked.
     let dropped_children: BTreeSet<(&TableName, &str)> = planned
         .iter()
-        .filter_map(|p| dropped_relation(&p.change, indexes, constraints))
+        .filter_map(|p| dropped_relation(&p.change, indexes, constraints, keys_in_relation))
         .collect();
     let dropped_from = |from: &TableName, to: &TableName, name: &str| {
         dropped_children.contains(&(from, name)) || dropped_children.contains(&(to, name))
@@ -71,7 +72,7 @@ pub(crate) fn order(
                 // constraints into the destination, where a same-named one on
                 // another table has to be dropped first (review of #969).
                 if let Some(moving) = base.schema.tables.get(from) {
-                    for carried in carried_names(moving, indexes, constraints)
+                    for carried in carried_names(moving, indexes, constraints, keys_in_relation)
                         .into_iter()
                         .filter(|carried| !dropped_from(from, to, carried.raw()))
                     {
@@ -164,7 +165,7 @@ pub(crate) fn order(
             let mut released = vec![(name.name.clone(), true)];
             if let Some(t) = base.schema.tables.get(name) {
                 released.extend(
-                    carried_names(t, indexes, constraints)
+                    carried_names(t, indexes, constraints, keys_in_relation)
                         .into_iter()
                         .map(|n| (n.into_raw(), true)),
                 );
@@ -206,7 +207,9 @@ pub(crate) fn order(
         if own.contains(&i) {
             continue;
         }
-        let Some((table, name)) = dropped_relation(&p.change, indexes, constraints) else {
+        let Some((table, name)) =
+            dropped_relation(&p.change, indexes, constraints, keys_in_relation)
+        else {
             continue;
         };
         // A carried index may occupy the source schema now and the destination
@@ -301,7 +304,7 @@ pub(crate) fn order(
             released.push((TableName::new(to.schema.clone(), from.name.clone()), true));
             if let Some(moving) = base.schema.tables.get(from) {
                 released.extend(
-                    carried_names(moving, indexes, constraints)
+                    carried_names(moving, indexes, constraints, keys_in_relation)
                         .into_iter()
                         .filter(|carried| !dropped_from(from, to, carried.raw()))
                         .map(|carried| {
@@ -676,9 +679,13 @@ fn carried_names(
     table: &pbps_model::schema::Table,
     indexes: bool,
     constraints: bool,
+    keys_in_relation: bool,
 ) -> Vec<pbps_model::ObjectLocalName> {
-    let mut names: Vec<pbps_model::ObjectLocalName> = table.unique.keys().cloned().collect();
-    names.extend(table.primary_key.as_ref().and_then(|pk| pk.name.clone()));
+    let mut names: Vec<pbps_model::ObjectLocalName> = Vec::new();
+    if keys_in_relation {
+        names.extend(table.unique.keys().cloned());
+        names.extend(table.primary_key.as_ref().and_then(|pk| pk.name.clone()));
+    }
     if indexes {
         names.extend(table.indexes.keys().cloned());
     }
@@ -706,15 +713,20 @@ fn generated_names(
 }
 
 /// The table and name a change releases in its schema's table namespace, if
-/// any. `indexes` and `constraints` are the dialect's two answers: a key's name
-/// is released under either, an index's only where indexes share the namespace,
-/// and a check's or a foreign key's only where constraints do.
+/// any. `indexes`, `constraints` and `keys_in_relation` are derived from the
+/// dialect's answers: a key's name is released when constraints share the
+/// namespace or when indexes do and keys claim an index name, an index's only
+/// where indexes share the namespace, and a check's or a foreign key's only
+/// where constraints do.
 fn dropped_relation(
     change: &Change,
     indexes: bool,
     constraints: bool,
+    keys_in_relation: bool,
 ) -> Option<(&TableName, &str)> {
-    if let Change::Constraint(ConstraintChange::DropUnique { table, name }) = change {
+    if let Change::Constraint(ConstraintChange::DropUnique { table, name }) = change
+        && keys_in_relation
+    {
         return Some((table, name.raw()));
     }
     if let Change::Index(IndexChange::DropIndex { table, name }) = change
@@ -734,6 +746,7 @@ fn dropped_relation(
         to: None,
         ..
     }) = change
+        && keys_in_relation
     {
         return pk
             .name
