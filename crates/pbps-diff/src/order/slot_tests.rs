@@ -12,7 +12,7 @@ use pbps_model::IndexChange;
 use pbps_model::ModuleChange;
 use pbps_model::PartitionChange;
 use pbps_model::TableChange;
-use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot, effects};
+use pbps_model::operation::{ModuleEdits, Operations, OwnerError, PlanOwners, Snapshot, effects};
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{
     Change, ColumnType, IdsFile, ModuleDeps, PlannedChange, Schema, Strategy, Table, TableName,
@@ -20,7 +20,9 @@ use pbps_model::{
 };
 
 use super::edges::Baseline;
-use super::slots::{Skipped, SlotEdge, SlotViolation, analyse, carried, edges, verify};
+use super::slots::{
+    Skipped, SlotEdge, SlotEffects, SlotViolation, Slots, analyse, carried, edges, verify,
+};
 
 /// An engine that renames across schemas in two statements, through the
 /// table's old name in the new schema, as PostgreSQL's `SET SCHEMA` and SQL
@@ -271,6 +273,129 @@ impl Plan {
     }
 }
 
+fn slot_analysis(plan: &Plan, dialect: &impl Dialect) -> (Operations, Slots) {
+    let names = PlanNames::of(&plan.logical, &plan.after_ids).unwrap();
+    let owners = PlanOwners::new(names, &plan.before_ids, &plan.after_ids);
+    let before = Snapshot {
+        schema: &plan.before,
+        ids: &plan.before_ids,
+    };
+    let ops = Operations::of_plan(&plan.logical, ModuleEdits::InPlace);
+    let slots = analyse(ops.as_slice(), &owners, before, dialect);
+    (ops, slots)
+}
+
+fn drop_check_on_undeclared_table() -> Change {
+    Change::Constraint(ConstraintChange::DropCheck {
+        table: name("app.missing"),
+        name: "ck".into(),
+    })
+}
+
+#[test]
+fn unread_names_refuse_complete_slot_access_and_keep_row_positions() {
+    let plan = Plan::new(
+        &[("t", "app.t")],
+        &[],
+        vec![drop_check_on_undeclared_table(), drop_table("t", "app.t")],
+    );
+    let (ops, slots) = slot_analysis(&plan, &MinimalDialect);
+    let step = &ops.as_slice()[0];
+    let refused = slots.effects().expect_err("an unread owner refuses access");
+    assert_eq!(
+        refused.unowned,
+        &[(
+            step.id(),
+            OwnerError::Unmanaged {
+                name: name("app.missing").shown().to_string(),
+                spelling: step.origin().spelling(),
+            },
+        )]
+    );
+    assert!(refused.unlowered.is_empty());
+
+    let (rows, unread) = slots.effects_with_unread();
+    assert_eq!(unread.unowned, refused.unowned);
+    assert_eq!(unread.unlowered, refused.unlowered);
+    assert_eq!(rows.len(), ops.len());
+    assert_eq!(rows[0], SlotEffects::default());
+    assert!(!rows[1].releases.is_empty());
+}
+
+#[test]
+fn failed_lowering_refuses_complete_slot_access_with_the_step_id() {
+    let plan = Plan::new(
+        &[("t", "s1.t")],
+        &[("t", "s2.u")],
+        vec![rename_table("t", "s1.t", "s2.u")],
+    );
+    // A schema move asks for lowering, which MinimalDialect refuses.
+    let (ops, slots) = slot_analysis(&plan, &MinimalDialect);
+    let refused = slots.effects().expect_err("failed lowering refuses access");
+    assert_eq!(refused.unlowered, &[ops.as_slice()[0].id()]);
+    assert!(refused.unowned.is_empty());
+
+    let (rows, unread) = slots.effects_with_unread();
+    assert_eq!(unread.unlowered, refused.unlowered);
+    assert_eq!(unread.unowned, refused.unowned);
+    assert_eq!(rows.len(), ops.len());
+    assert!(!rows[0].claims.is_empty());
+    assert!(!rows[0].releases.is_empty());
+    assert!(rows[0].intermediate.is_empty());
+}
+
+#[test]
+fn readable_steps_supply_the_same_slot_rows_through_both_doors() {
+    let plan = Plan::new(
+        &[("t", "s1.t")],
+        &[("t", "s2.u")],
+        vec![rename_table("t", "s1.t", "s2.u")],
+    );
+    let (ops, slots) = slot_analysis(&plan, &Slotted { exact: true });
+    let complete = slots.effects().expect("every step is readable");
+    let (rows, unread) = slots.effects_with_unread();
+    assert_eq!(complete, rows);
+    assert_eq!(rows.len(), ops.len());
+    assert_eq!(rows[0].intermediate.len(), 1);
+    assert!(unread.unowned.is_empty());
+    assert!(unread.unlowered.is_empty());
+}
+
+#[test]
+fn replacing_slot_rows_keeps_both_unread_lists_and_catalog_owners() {
+    let plan = Plan::new(
+        &[("t", "s1.t")],
+        &[("t", "s2.u")],
+        vec![
+            rename_table("t", "s1.t", "s2.u"),
+            drop_check_on_undeclared_table(),
+        ],
+    );
+    let (ops, mut slots) = slot_analysis(&plan, &MinimalDialect);
+    let (rows, unread) = slots.effects_with_unread();
+    assert_eq!(unread.unowned[0].0, ops.as_slice()[1].id());
+    assert_eq!(unread.unlowered, &[ops.as_slice()[0].id()]);
+    let unowned = unread.unowned.to_vec();
+    let unlowered = unread.unlowered.to_vec();
+    let (slot, holder) = rows[0].releases[0].clone();
+    let mut replacement = rows.to_vec();
+    replacement.reverse();
+    slots.catalog_owned.insert(slot.clone(), holder.clone());
+
+    let slots = slots.with_effects(replacement.clone());
+    let (rows, unread) = slots.effects_with_unread();
+    assert_eq!(rows, replacement);
+    assert_eq!(slots.catalog_owned, [(slot, holder)].into());
+    assert_eq!(unread.unowned, unowned);
+    assert_eq!(unread.unlowered, unlowered);
+
+    // The rebuild refusal formats both lists in this order.
+    assert_eq!(
+        format!("{:?} {:?}", unread.unowned, unread.unlowered),
+        format!("{unowned:?} {unlowered:?}")
+    );
+}
+
 /// A catalog occupant at `at` (`schema.name`) that belongs to `owner`.
 fn occupant(at: &str, owner: &str, column: Option<&str>) -> pbps_dialect::slots::Occupant {
     let at = name(at);
@@ -403,10 +528,13 @@ fn a_claim_on_an_intermediate_name_held_at_that_statement_is_refused() {
         ids: &plan.before_ids,
     };
     let ops = crate::order::reordered_operations(&logical, &[1, 0]);
-    let mut slots = analyse(ops.as_slice(), &owners, before, &exact);
-    for fx in &mut slots.effects {
+    let slots = analyse(ops.as_slice(), &owners, before, &exact);
+    let (rows, _) = slots.effects_with_unread();
+    let mut rows = rows.to_vec();
+    for fx in &mut rows {
         fx.intermediate.clear();
     }
+    let slots = slots.with_effects(rows);
     let (unguarded, _) = verify(ops.as_slice(), &slots, &exact, None, &owners, before).unwrap();
     assert!(unguarded.is_empty(), "{unguarded:?}");
 }
@@ -1394,7 +1522,8 @@ fn a_non_carrier_with_an_unreadable_key_leaves_catalog_movement_and_collisions_u
 
     let replay = |operations: &Operations| {
         let slots = analyse(operations.as_slice(), &owners, before, &dialect);
-        assert!(slots.unowned.is_empty(), "{:?}", slots.unowned);
+        let (_, unread) = slots.effects_with_unread();
+        assert!(unread.unowned.is_empty(), "{:?}", unread.unowned);
         verify(
             operations.as_slice(),
             &slots,

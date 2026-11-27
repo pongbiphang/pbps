@@ -229,8 +229,9 @@ fn preparation_keeps_typed_parts_reserved_uids_and_readonly_target_state() {
     );
     assert_eq!(p.addresses().len(), 4);
     let ops = p.operations();
-    assert_eq!(ops.len(), p.slots().effects.len());
-    assert!(p.slots().unowned.is_empty() && p.slots().unlowered.is_empty());
+    let (rows, unread) = p.slots().effects_with_unread();
+    assert_eq!(ops.len(), rows.len());
+    assert!(unread.unowned.is_empty() && unread.unlowered.is_empty());
     assert!(matches!(
         part(&p, Purpose::Tree),
         Change::Table(TableChange::CreateTable { table, .. }) if table.indexes.is_empty()

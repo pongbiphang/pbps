@@ -118,6 +118,9 @@ impl<'a> Allocation<'a> {
         name: &ObjectLocalName,
         constraint: bool,
     ) -> Result<bool, String> {
+        // Catalog names stay occupied without a proven release.
+        // An unread owner supplies no release.
+        let (rows, _unread) = self.slots.effects_with_unread();
         let spellings = self
             .catalog
             .spellings
@@ -135,14 +138,15 @@ impl<'a> Allocation<'a> {
                     .table_uid(&relation.name)
                     .cloned()
                     .or_else(|| self.identities.table_uid(&relation.name).cloned());
-                return Ok(self.slots.effects.iter().flat_map(|fx| &fx.releases).any(
-                    |(slot, holder)| {
+                return Ok(rows
+                    .iter()
+                    .flat_map(|fx| &fx.releases)
+                    .any(|(slot, holder)| {
                         matches!(holder,ObjectKey::Table(t) if Some(t.uid())==uid.as_ref())
                             && self.released.contains(holder)
                             && slot.namespace == Namespace::Relations(schema.into())
                             && slot.name == name.raw()
-                    },
-                ));
+                    }));
             }
             return Ok(false);
         };
@@ -167,9 +171,7 @@ impl<'a> Allocation<'a> {
             same_domain
                 && slot.name == name.raw()
                 && self.released.contains(holder)
-                && self
-                    .slots
-                    .effects
+                && rows
                     .iter()
                     .any(|fx| fx.releases.contains(&(slot.clone(), holder.clone())))
         }))
@@ -188,6 +190,8 @@ impl<'a> Allocation<'a> {
         let replacement_index = replacements.index();
         let mut out = Vec::new();
         let mut allocated = self.reserved.clone();
+        // Unread claims reserve no new names from these rows.
+        let (rows, _unread) = self.slots.effects_with_unread();
         for (leaf, shape) in &self.root.after {
             if shape.partition_of.is_none() {
                 continue;
@@ -212,7 +216,7 @@ impl<'a> Allocation<'a> {
                     unavailable.insert(name.raw().to_owned());
                 }
             }
-            for (slot, _) in self.slots.effects.iter().flat_map(|fx| &fx.claims) {
+            for (slot, _) in rows.iter().flat_map(|fx| &fx.claims) {
                 let schema = match &slot.namespace {
                     Namespace::Relations(s) => Some(s),
                     Namespace::Table(uid, TableSpace::Constraints) => Some(

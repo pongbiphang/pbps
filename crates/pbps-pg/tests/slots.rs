@@ -374,8 +374,9 @@ fn an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_release
                     .filter(|(_, h)| matches!(h, ObjectKey::Module(_)))
                     .count()
             };
+            let (rows, _) = slots.effects_with_unread();
             assert_eq!(
-                clones(&slots.effects[0]),
+                clones(&rows[0]),
                 usize::from(was),
                 "attach={attach}, was={was}, will={will}, check={check}"
             );
@@ -410,8 +411,9 @@ fn an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_release
             } else {
                 assert!(violations.is_empty(), "{violations:?}");
                 if handover {
+                    let (rows, _) = slots.effects_with_unread();
                     assert_eq!(
-                        clones(&slots.effects[1]),
+                        clones(&rows[1]),
                         0,
                         "the ordinary parent creates no constraint clone"
                     );

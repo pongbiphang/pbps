@@ -978,10 +978,12 @@ pub(super) fn judge_slots(
             s.held
         )));
     }
-    for (id, error) in &slots.unowned {
+    // After replay succeeds, unread slot effects are recorded as notes.
+    let (_, unread) = slots.effects_with_unread();
+    for (id, error) in unread.unowned {
         findings.push(Finding::note(format!("slot unowned {id}: {error}")));
     }
-    for id in &slots.unlowered {
+    for id in unread.unlowered {
         findings.push(Finding::note(format!(
             "slot unlowered {} {id}",
             dialect.name()

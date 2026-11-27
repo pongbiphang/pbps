@@ -126,7 +126,7 @@ fn policy_release_schedule(
         schedule.edge(edge.before, edge.after, edge.source, edge.reason);
     }
     let slots = pbps_diff::order::slots::analyse(operations.as_slice(), &owners, before, dialect);
-    if !slots.unowned.is_empty() || !slots.unlowered.is_empty() {
+    if slots.effects().is_err() {
         return Err(Refusal(
             "policy release has unread name-slot effects".into(),
         ));

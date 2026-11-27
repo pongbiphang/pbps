@@ -2412,3 +2412,24 @@ Rejected:
 - Changing the callers' rules for unread steps belongs to a later measurement.
 
 The rewrite trigger scan reads an unread step as having no trigger before its refusal check. Whether an accepted plan relies on that rule remains unmeasured. The name-slot analysis still exposes the same pair of lists. Settlement in release builds is also open.
+
+<a id="dec-2993-8"></a>
+
+**DEC-2993.8. Name-slot analysis couples the rows with both answers about unread steps (#2993).** The ordinary door gives the position-aligned rows when both unread lists are empty. Otherwise it gives both lists. The second door pairs the rows with both lists so callers can apply their own rules. The row storage and both lists are private. One step can have both an unread owner lookup and a failed lowering. The rebuild refusal prints both lists.
+
+The two doors preserve the order, refusal text and recorded notes. The recorder counts, existing text assertions, and new tests for complete access, unread steps and row replacement pin those results. A compile-fail example pins row privacy.
+
+The second-door readers use unread steps as follows.
+
+- `judge_slots` records both lists as notes after a successful replay.
+- `handovers_of` builds edges from available names. A missing intermediate name adds no passing holder.
+- `groups` groups the spellings from the rows and carried facts. Unread names add no spelling.
+- `verify` replays the names present in each row. It still applies separate catalog actions.
+- `unavailable_names` keeps occupants without a proven release. Missing claims add no names.
+- Rebuild `prepare` extracts teardown releases after its description has refused unread steps.
+- `Rule::slots` selects rows from a prepared rebuild that has already refused unread steps.
+- PostgreSQL `Allocation::released` keeps a name occupied without a proven release.
+- PostgreSQL `Allocation::clones` reserves the claims present in the rows. Missing claims add no names.
+- SQLite `catalog_facts` compares the spellings present in the rows, baseline and catalog. Unread names add no spelling from their step.
+
+Refusing inside `edges`, `handovers` or `verify` would change results for plans accepted today. The number of affected plans is unmeasured. Measuring those plans comes before deciding whether these readers should refuse. Settlement in release builds remains open.

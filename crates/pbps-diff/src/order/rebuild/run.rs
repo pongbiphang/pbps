@@ -107,9 +107,11 @@ impl Rule<'_> {
             .map_err(|e| e.to_string())
     }
     fn slots(&self, indices: &[usize]) -> slots::Slots {
-        let mut slots = self.prepared.slots.clone();
-        slots.effects = indices.iter().map(|&i| slots.effects[i].clone()).collect();
-        slots
+        let slots = &self.prepared.slots;
+        // Preparation refused unread steps before these rows were selected.
+        let (rows, _unread) = slots.effects_with_unread();
+        let ordered = indices.iter().map(|&i| rows[i].clone()).collect();
+        slots.clone().with_effects(ordered)
     }
     fn key(&self, d: &Dependent, spelling: Spelling) -> Result<Option<ObjectKey>, String> {
         if spelling == Spelling::Final
