@@ -287,6 +287,7 @@ mod tests {
                 bound: PartitionBound::Default,
                 key: vec![],
                 shape: Box::new(member()),
+                rehearsal: None,
             })
         } else {
             Change::Partition(PartitionChange::DetachPartition {

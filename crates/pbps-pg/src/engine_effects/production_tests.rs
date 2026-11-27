@@ -124,6 +124,7 @@ fn attach(s: &Scene) -> Change {
         bound: bound(),
         key: Default::default(),
         shape: Box::new(s.after.tables[&"app.a".parse::<TableName>().unwrap()].clone()),
+        rehearsal: None,
     })
 }
 fn read(s: &Scene, steps: Vec<Change>) -> (Vec<usize>, pbps_diff::order::Graph) {

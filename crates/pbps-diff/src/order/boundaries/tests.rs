@@ -32,6 +32,7 @@ fn fixture() -> (PlanningPlan, Operations, Vec<Effects>, State) {
                 },
                 key: Default::default(),
                 shape: Box::default(),
+                rehearsal: None,
             })),
             PlannedChange::new(Change::Role(RoleChange::CreateRole {
                 uid: "r_aaaaaa".parse().unwrap(),
@@ -335,6 +336,7 @@ fn only_a_parent_whose_columns_change_beside_its_members_is_read() {
             bound: PartitionBound::Default,
             key: Default::default(),
             shape: Box::default(),
+            rehearsal: None,
         })];
         if column_change {
             changes.push(Change::Column(ColumnChange::AlterColumnDefault {
@@ -463,6 +465,7 @@ fn logical_name_positions_survive_permutation_and_appended_input() {
                 bound: pbps_model::PartitionBound::Default,
                 key: vec![],
                 shape: Box::default(),
+                rehearsal: None,
             })),
         ],
     };
@@ -643,6 +646,7 @@ fn a_changed_physical_spelling_requires_boundary_recertification() {
         bound: pbps_model::PartitionBound::Default,
         key: vec![],
         shape: Box::default(),
+        rehearsal: None,
     }));
     let ordered =
         Operations::from_operations([ops.as_slice()[1].clone(), ops.as_slice()[0].clone()]);

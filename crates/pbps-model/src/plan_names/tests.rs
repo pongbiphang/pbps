@@ -605,6 +605,7 @@ fn an_attach_retires_known_column_identities_without_dropping_its_table() {
             bound: crate::PartitionBound::Default,
             key: Vec::new(),
             shape: Box::new(Table::default()),
+            rehearsal: None,
         })),
     ];
     let after = ids(&[(&a, t("a"))], &[]);
@@ -641,6 +642,7 @@ fn a_final_detachs_column_identity_does_not_leak_into_an_earlier_ownership_scope
             bound: crate::PartitionBound::Default,
             key: Vec::new(),
             shape: Box::new(shape.clone()),
+            rehearsal: None,
         }))
     };
     let after = ids(&[(&owner, t("leaf"))], &[(&fresh, t("leaf").column("c"))]);

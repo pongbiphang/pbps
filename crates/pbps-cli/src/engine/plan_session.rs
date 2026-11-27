@@ -2401,6 +2401,7 @@ mod tests {
                         unlogged,
                         ..Default::default()
                     }),
+                    rehearsal: None,
                 },
             )])
         };

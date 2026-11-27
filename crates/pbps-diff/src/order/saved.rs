@@ -444,6 +444,7 @@ pub fn validate_saved_plan(
         refuse!("this saved plan {foreign}. {}", foreign.remedy());
     }
     pbps_model::retained::validate(plan).map_err(AdmissionError::message)?;
+    pbps_model::adoption::validate(plan).map_err(AdmissionError::message)?;
     // A lineage record stays in the identity file after its rewrite, so one is
     // not a reason to refuse. A broken one fails the identity validation below
     // (DEC-2298.12); a rewrite still to run is refused change by change.

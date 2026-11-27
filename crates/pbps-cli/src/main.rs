@@ -7584,6 +7584,7 @@ mod tests {
             bound: pbps_model::PartitionBound::Default,
             key: vec!["id".into()],
             shape: Box::new(Table::default()),
+            rehearsal: None,
         }));
         attached.changes.changes.insert(1, attach.clone());
         let encoded = serde_json::to_vec(&attached).unwrap();
@@ -7702,6 +7703,7 @@ mod tests {
                             bound: pbps_model::PartitionBound::Default,
                             key: vec![],
                             shape: Box::new(shape),
+                            rehearsal: None,
                         }),
                         _ => Change::Partition(PartitionChange::DetachPartition {
                             uid,

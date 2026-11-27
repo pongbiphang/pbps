@@ -7499,6 +7499,7 @@ mod tests {
                 bound,
                 key: Vec::new(),
                 shape: Box::new(partition),
+                rehearsal: None,
             }),
             alter(&s, "app.f(integer)"),
         ]);
@@ -8642,6 +8643,7 @@ mod tests {
             bound,
             key: Vec::new(),
             shape: Box::new(plain),
+            rehearsal: None,
         });
         let mut cs = plan(vec![attach, alter(&s, "app.f(integer)")]);
         weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect("woven");
@@ -10211,6 +10213,7 @@ mod tests {
             },
             key: vec![],
             shape: Box::default(),
+            rehearsal: None,
         });
         let key = Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: "parts.n".parse().unwrap(),
@@ -10382,6 +10385,7 @@ mod tests {
                 bound: bound.clone(),
                 key: vec![],
                 shape: Box::default(),
+                rehearsal: None,
             })
         };
         let create = Change::Table(TableChange::CreateTable {

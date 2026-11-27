@@ -10462,3 +10462,73 @@ Pinned by `an_attach_drops_each_own_index_and_key_a_parents_index_might_take`,
 `an_expression_key_matches_a_column_it_may_read`,
 the ordering pass's tests in `dependents.rs`, and on 16 and 18 by
 `support/loose_drop1671.rs`.
+
+<a id="dec-1671-2"></a>
+
+**DEC-1671.2. Apply holds an attach that records a rehearsal to the indexes it
+records (#1671).**
+
+**Context.** DEC-1671.1 drops every own index a parent's might take. The
+maintainer decided on 2026-11-26 that a project which selects a resolver may
+instead have an engine asked which of them it takes, and leave those to the
+attach. Such an answer rests on two facts the model does not hold: what the
+definitions bind to, and the order the indexes were made in, which decides which
+of two the engine takes. So it is not usable without a check of both at apply.
+This entry decides the record and that check. **The planning half, which asks
+the engine and writes the record, follows. Until it does, no plan carries a
+record, and every attach is planned as DEC-1671.1 says.**
+
+**The record.** `AttachPartition` may hold `rehearsal`: the parent's indexes and
+the table's, each list in object-number order with every index's name,
+`pg_get_indexdef` and, under a key, unique or exclusion constraint,
+`pg_get_constraintdef`; and `kept`, each of the table's indexes the plan leaves
+standing with the parent's index the engine gave it to. It is not
+`ResolverEvidence` and is not sealed (DEC-2354.1): apply checks it against the
+target itself. The report names what is kept. The plan's format changes with the
+field, which the format fingerprint catches; no version number moves
+(DEC-2412.3).
+
+**Admission** refuses a record on another engine, one that keeps nothing,
+repeats a name in either list or gives one index of the parent's two, one whose
+kept index is not a plain index of the table taken by a plain index of the
+parent's, and one that keeps an index the plan drops or the declaration holds as
+the partition's own.
+It also refuses a record in a plan that renames a table, a column, a type or an
+enum label, rebuilds an enum, moves or updates an extension, or alters or drops a
+routine
+(`adoption::unsettles`). Each can change what a recorded definition prints, or
+what it binds to, before the attach, so either apply would refuse the plan only
+because a resolver answered, or the record would be compared under names it no
+longer holds. The planning half asks nothing for such a plan, and its attach
+is planned as DEC-1671.1 says.
+
+**Apply** compares the database with the record twice, reading both relations
+from the catalog under the canonical path, and refuses by the relation and the
+first difference: names, definitions, constraint definitions, order and
+validity.
+
+1. Before the first statement, both recorded lists in full. The drift check
+   cannot see an index made again, which changes only the order.
+2. Just before each recorded `ATTACH`, in its transaction, under
+   `SHARE UPDATE EXCLUSIVE` on the parent and `ACCESS EXCLUSIVE` on the table:
+   each list less what earlier changes of the plan drop from that relation. The
+   plan's own drops run between the first comparison and the attach. Nothing in
+   a plan adds an index to either relation ahead of the attach, so an addition
+   shows as a difference.
+
+A resumed staged apply makes only the second, since it has run some of the
+plan's changes. A staged step holding a recorded `ATTACH` runs in a transaction
+of its own. An engine other than PostgreSQL refuses a plan that holds a record.
+An invalid index fails both: an attach never takes one, and its definition does
+not show it. An index made again that leaves names, definitions and order as
+they were, as the newest of a relation's does, is no difference: the engine's
+choice is the same.
+
+**Measured** on 16.15 and 18.6 (`~/gate1671/pr2/measure1671b.py`):
+`REINDEX CONCURRENTLY` moves the order; an attach passes over an invalid index,
+whose definition does not say it is one; the two locks hold off every statement
+that adds, drops or rebuilds an index of either relation, but not a rename.
+
+Pinned by the tests of `pbps-model/src/adoption.rs`, by
+`an_attach_that_records_a_rehearsal_marks_its_attach_statement_alone`, and on
+16 and 18 by `support/adoption1671.rs`.

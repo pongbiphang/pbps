@@ -934,6 +934,7 @@ fn partition_column_bindings_survive_attachment_and_detachment() {
                 bound: pbps_model::PartitionBound::Default,
                 key: vec![],
                 shape: Box::new(attached.tables[&leaf].clone()),
+                rehearsal: None,
             })
         } else {
             Change::Partition(PartitionChange::DetachPartition {

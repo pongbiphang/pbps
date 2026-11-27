@@ -559,6 +559,7 @@ fn diff_surviving_table<D: Dialect + ?Sized>(
                         &declared.schema.types,
                     ),
                     shape: Box::new(declared_table.clone()),
+                    rehearsal: None,
                 }));
                 // Compared as this plan leaves them: an own foreign key
                 // to a table renamed in the same plan is declared under

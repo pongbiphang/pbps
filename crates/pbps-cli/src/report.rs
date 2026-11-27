@@ -1956,6 +1956,7 @@ pub fn describe(c: &Change) -> String {
             table,
             parent,
             bound,
+            rehearsal,
             ..
         }) => {
             let partition = if *bound == pbps_model::PartitionBound::Default {
@@ -1963,11 +1964,21 @@ pub fn describe(c: &Change) -> String {
             } else {
                 "a partition"
             };
-            format!(
+            let mut line = format!(
                 "~ attach table {table} to {parent} as {partition}, keeping its rows",
                 table = table.shown(),
                 parent = parent.shown()
-            )
+            );
+            // What stands that a plan without a resolver would drop and have
+            // built again (DEC-1671.2).
+            for (own, by) in rehearsal.iter().flat_map(|r| &r.kept) {
+                line.push_str(&format!(
+                    ", and its index {own} as the copy of {by}",
+                    own = own.shown(),
+                    by = by.shown()
+                ));
+            }
+            line
         }
         // Said, because the detach is a statement of its own and locks the
         // parent (#1171).
@@ -3012,6 +3023,7 @@ mod tests {
             bound: pbps_model::PartitionBound::Default,
             key: Vec::new(),
             shape: Box::default(),
+            rehearsal: None,
         });
         assert_eq!(
             super::describe(&attach),
@@ -3027,10 +3039,26 @@ mod tests {
             },
             key: Vec::new(),
             shape: Box::default(),
+            rehearsal: None,
         });
         assert_eq!(
             super::describe(&ranged),
             "~ attach table app.t to app.ev as a partition, keeping its rows"
+        );
+        // What a recorded rehearsal leaves standing is said, so the approver
+        // sees it (#1671).
+        let mut kept = ranged;
+        if let Change::Partition(PartitionChange::AttachPartition { rehearsal, .. }) = &mut kept {
+            *rehearsal = Some(Box::new(pbps_model::adoption::AttachRehearsal {
+                parent: Vec::new(),
+                table: Vec::new(),
+                kept: [("t_m".into(), "ev_m".into()), ("t_n".into(), "ev_n".into())].into(),
+            }));
+        }
+        assert_eq!(
+            super::describe(&kept),
+            "~ attach table app.t to app.ev as a partition, keeping its rows, and its index t_m \
+             as the copy of ev_m, and its index t_n as the copy of ev_n"
         );
     }
 

@@ -85,6 +85,7 @@ fn changes(detach: bool, rebuild_first: bool) -> ChangeSet {
             bound: PartitionBound::Default,
             key: Vec::new(),
             shape: Box::new(partition()),
+            rehearsal: None,
         })
     };
     let rebuild = Change::Module(ModuleChange::AlterModule {
@@ -484,6 +485,7 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
         bound: PartitionBound::Default,
         key: Vec::new(),
         shape: Box::new(attached),
+        rehearsal: None,
     });
     let changes = if rebuild_first {
         vec![rebuild, attach]

@@ -269,6 +269,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             bound: PartitionBound::Default,
             key: vec![],
             shape: shape.clone(),
+            rehearsal: None,
         }),
         vec![&table, &parent],
         vec![&table, &parent],

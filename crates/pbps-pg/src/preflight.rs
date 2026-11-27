@@ -6035,6 +6035,7 @@ mod tests {
                         bound,
                         key: Vec::new(),
                         shape: Box::default(),
+                        rehearsal: None,
                     },
                 ))],
             })
@@ -6214,6 +6215,7 @@ mod tests {
             bound: list("b"),
             key: vec![],
             shape: Box::new(partition(list("b"))),
+            rehearsal: None,
         }));
         // The finding's plan: `b` becomes `c`, `a` becomes `b`, and a partition
         // takes `b`, the label the rows now called `a` will have.
@@ -6288,6 +6290,7 @@ mod tests {
                 bound: PartitionBound::Default,
                 key: vec![],
                 shape: Box::new(partition(PartitionBound::Default)),
+                rehearsal: None,
             }));
         for (case, renames, partitions) in [
             ("renamed", chain("app.mood"), key("app.mood")),

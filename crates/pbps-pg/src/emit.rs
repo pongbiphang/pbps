@@ -4479,11 +4479,7 @@ pub(crate) fn staged_attach(change: &Change) -> Option<Sql> {
                 &name,
                 ScanCheckStep::Validate,
             ),
-            Statement::new(format!(
-                "ALTER TABLE {} ATTACH PARTITION {on} {};",
-                qualified(parent)?,
-                bound_clause(bound)
-            )),
+            partition::attach(change, table, parent, bound)?,
             Statement::new(format!("ALTER TABLE {on} DROP CONSTRAINT {check};")),
         ])
     })())
@@ -6322,6 +6318,7 @@ mod tests {
                     },
                     key: Vec::new(),
                     shape: Box::default(),
+                    rehearsal: None,
                 }),
                 Default::default(),
             )
@@ -6357,6 +6354,7 @@ mod tests {
                     .map(|k| pbps_model::ColumnName::from(*k))
                     .collect(),
                 shape: Box::default(),
+                rehearsal: None,
             })
         };
         let staged = |change: &Change| -> Vec<pbps_dialect::Statement> {
@@ -6482,6 +6480,48 @@ mod tests {
             ),
         ] {
             single(&change, staged(&change));
+        }
+    }
+
+    /// Apply compares both relations with a recorded rehearsal just before the
+    /// statement that carries its change: the `ATTACH`, alone or among the four
+    /// of a staged attach, and no other (#1671, DEC-1671.2).
+    #[test]
+    fn an_attach_that_records_a_rehearsal_marks_its_attach_statement_alone() {
+        let attach = |rehearsal: Option<Box<pbps_model::adoption::AttachRehearsal>>| {
+            Change::Partition(PartitionChange::AttachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: "app.t".parse().unwrap(),
+                parent: "app.ev".parse().unwrap(),
+                bound: pbps_model::PartitionBound::Range {
+                    from: vec![pbps_model::BoundDatum::Value("1".into())],
+                    to: vec![pbps_model::BoundDatum::Value("5".into())],
+                },
+                key: vec!["a".into()],
+                shape: Box::default(),
+                rehearsal,
+            })
+        };
+        let recorded = attach(Some(Box::new(pbps_model::adoption::AttachRehearsal {
+            parent: Vec::new(),
+            table: Vec::new(),
+            kept: Default::default(),
+        })));
+        for (change, marked) in [(recorded, true), (attach(None), false)] {
+            let pg = Postgres::new();
+            for statements in [
+                pg.fixture_emit(&change, Default::default()).unwrap(),
+                pg.fixture_emit_staged(&change, Default::default()).unwrap(),
+            ] {
+                for statement in statements {
+                    let carries = marked && statement.sql.contains("ATTACH PARTITION");
+                    assert_eq!(
+                        statement.attach_pin.as_deref(),
+                        carries.then_some(&change),
+                        "{statement:?}"
+                    );
+                }
+            }
         }
     }
 

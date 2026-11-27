@@ -454,6 +454,7 @@ fn a_detach_preserves_the_roots_usage_and_an_attach_checks_its_new_marker() {
             bound: PartitionBound::Default,
             key: vec![],
             shape: Box::new(before.tables[&"dbo.p1".parse().unwrap()].clone()),
+            rehearsal: None,
         }),
         Change::Permission(GrantChange::Grant {
             role: "writer".into(),

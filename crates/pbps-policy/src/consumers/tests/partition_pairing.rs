@@ -72,6 +72,7 @@ fn attachment_pairs_retiring_column_uids_before_comparing_nullability() {
                 bound: pbps_model::PartitionBound::Default,
                 key: vec!["old".into()],
                 shape: Box::new(attached.tables[&leaf].clone()),
+                rehearsal: None,
             }),
             Change::Partition(PartitionChange::SetPartitionNotNull {
                 uid: uid("t_bbbbbb"),

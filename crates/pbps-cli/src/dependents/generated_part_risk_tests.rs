@@ -163,6 +163,7 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
                 bound: PartitionBound::Default,
                 key: vec!["id".into()],
                 shape: Box::default(),
+                rehearsal: None,
             })
         }
         "detach" => {

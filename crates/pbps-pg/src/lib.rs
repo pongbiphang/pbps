@@ -41,6 +41,7 @@ use pbps_model::{
 };
 
 pub mod admission;
+pub mod adoption;
 mod ambiguity;
 pub mod assertions;
 pub mod catalog;
@@ -3306,6 +3307,7 @@ mod tests {
                 },
                 key: pg.attach_scan_key(&uid, &typed, &Default::default()),
                 shape: Box::default(),
+                rehearsal: None,
             });
             // Only the optional proof key is sealed. A fresh emitter at apply
             // must reproduce the planning choice without another catalog read.
@@ -8886,6 +8888,7 @@ mod certified_emission_tests {
             },
             key: vec!["id".into()],
             shape: Box::default(),
+            rehearsal: None,
         }));
         let transactional = emit::emit(&dialect, &change.change, change.strategy).unwrap();
         let staged = emit::staged_attach(&change.change).unwrap().unwrap();

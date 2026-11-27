@@ -1550,6 +1550,7 @@ mod tests {
                 bound: crate::PartitionBound::Default,
                 key: Vec::new(),
                 shape: Box::new(shape),
+                rehearsal: None,
             },
         )]));
         assert_eq!(
