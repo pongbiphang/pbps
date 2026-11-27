@@ -92,6 +92,21 @@ impl Dialect for Sqlite {
         lexis::layout(definition)
     }
 
+    /// What the plan wrote against what is read back, in the comparison form
+    /// and not byte for byte: SQLite keeps the statement's text, which ends
+    /// where the statement does, so a body declared with a closing line
+    /// ending (`definition: |`) reads back without it. Exact equality refused
+    /// every such view as changed by someone else.
+    fn module_matches_declaration(
+        &self,
+        wrote: &pbps_model::Module,
+        now: &pbps_model::Module,
+    ) -> bool {
+        wrote.kind == now.kind
+            && wrote.options == now.options
+            && lexis::layout(&wrote.definition) == lexis::layout(&now.definition)
+    }
+
     fn qualified_calls(&self, _text: &str) -> Vec<(String, String)> {
         Vec::new()
     }
@@ -617,6 +632,31 @@ mod tests {
 
     /// The trait's two refusals the dialect crate must answer for itself: a
     /// role (the default would accept it) and every module kind but a view.
+    #[test]
+    fn a_view_read_back_matches_what_was_written_up_to_layout_only() {
+        let d = Sqlite::default();
+        let view = |definition: &str| Module {
+            kind: ModuleKind::View,
+            description: None,
+            options: ModuleOptions::default(),
+            definition: definition.into(),
+        };
+        // A block scalar's closing line ending is not kept by SQLite.
+        assert!(d.module_matches_declaration(
+            &view("SELECT id\n  FROM app\n"),
+            &view("SELECT id\n  FROM app")
+        ));
+        // Negative: another body, or text inside a string, is not layout.
+        assert!(!d.module_matches_declaration(
+            &view("SELECT id FROM app\n"),
+            &view("SELECT name FROM app")
+        ));
+        assert!(!d.module_matches_declaration(
+            &view("SELECT 'a  b' FROM app"),
+            &view("SELECT 'a b' FROM app")
+        ));
+    }
+
     #[test]
     fn the_defaults_that_would_accept_are_overridden() {
         let d = Sqlite::default();

@@ -146,6 +146,8 @@ pub struct Rehearsal {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scratch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub library: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout: Option<String>,

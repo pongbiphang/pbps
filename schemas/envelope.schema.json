@@ -323,7 +323,8 @@
       "type": "string",
       "enum": [
         "mssql",
-        "postgres"
+        "postgres",
+        "sqlite"
       ]
     },
     "ConsumedFile": {
@@ -1861,7 +1862,14 @@
           ]
         },
         "scratch": {
-          "description": "`server` or `docker`.",
+          "description": "`server`, `docker` or `in-process`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "library": {
+          "description": "The library that ran an in-process rehearsal, e.g. `SQLite 3.54.1`.",
           "type": [
             "string",
             "null"

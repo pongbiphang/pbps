@@ -116,7 +116,7 @@ fn every_declaration_the_loader_accepts_is_held_by_an_engine() {
     let keys = loader_keys();
     assert_eq!(keys, support::DECLARATIONS, "the loader's leading keys");
     for key in &keys {
-        let held = [Engine::Postgres, Engine::SqlServer]
+        let held = [Engine::Postgres, Engine::SqlServer, Engine::Sqlite]
             .into_iter()
             .filter_map(|engine| support::declared_tier(engine, key))
             .collect::<Vec<_>>();
@@ -145,6 +145,33 @@ fn every_declaration_the_loader_accepts_is_held_by_an_engine() {
         support::declared_tier(Engine::Postgres, "enum"),
         Some(Tier::Managed)
     );
+    assert_eq!(
+        support::declared_tier(Engine::Sqlite, "table"),
+        Some(Tier::Managed)
+    );
+    assert_eq!(
+        support::declared_tier(Engine::Sqlite, "view"),
+        Some(Tier::Managed)
+    );
+    for refused in [
+        "procedure",
+        "function",
+        "trigger",
+        "extension",
+        "role",
+        "enum",
+        "domain",
+        "text_search_config",
+        "text_search_dictionary",
+        "sequence",
+        "dependency",
+    ] {
+        assert_eq!(
+            support::declared_tier(Engine::Sqlite, refused),
+            None,
+            "SQLite must mark `{refused}:` refused"
+        );
+    }
 }
 
 /// `text` with each generated region replaced by its table.

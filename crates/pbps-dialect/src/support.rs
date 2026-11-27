@@ -21,6 +21,7 @@ use std::fmt::Write as _;
 pub enum Engine {
     Postgres,
     SqlServer,
+    Sqlite,
 }
 
 /// What happens to an object of the kind.
@@ -112,7 +113,7 @@ const SEARCH: &str = "[#2728](https://github.com/pongbiphang/pbps/issues/2728)";
 const SEQUENCE: &str = "[#2721](https://github.com/pongbiphang/pbps/issues/2721)";
 const MSSQL_CENSUS: &str = "[#2794](https://github.com/pongbiphang/pbps/issues/2794)";
 
-use Engine::{Postgres, SqlServer};
+use Engine::{Postgres, SqlServer, Sqlite};
 use Tier::{Managed, Named, NotRead, Partly};
 
 /// The leading keys of a declaration file, in the order the loader names them.
@@ -137,8 +138,10 @@ pub const RECORDS: &[Record] = &[
     // What a project declares and no table below lists.
     declared(Postgres, &["table"], Managed),
     declared(SqlServer, &["table"], Managed),
+    declared(Sqlite, &["table"], Managed),
     declared(Postgres, &["view"], Managed),
     declared(SqlServer, &["view"], Managed),
+    declared(Sqlite, &["view"], Managed),
     declared(Postgres, &["procedure"], Managed),
     declared(SqlServer, &["procedure"], Managed),
     declared(Postgres, &["function"], Managed),
@@ -280,6 +283,16 @@ pub const RECORDS: &[Record] = &[
         NotRead,
         MSSQL_CENSUS,
     ),
+    // SQLite: what the pull names and leaves out; `validate` refuses what is not built yet.
+    issue(Sqlite, "Triggers", Named, "#2950"),
+    issue(
+        Sqlite,
+        "Virtual tables (including FTS and R-Tree)",
+        Named,
+        "",
+    ),
+    issue(Sqlite, "Views with a column list", Named, ""),
+    issue(Sqlite, "Objects in `temp` or attached databases", Named, ""),
 ];
 
 /// The records of one engine, in table order.
@@ -304,18 +317,21 @@ pub fn status_tables() -> Vec<(&'static str, String)> {
         ("postgres-silent", silent_table()),
         ("postgres-census", census_table()),
         ("sqlserver", sqlserver_table()),
+        ("sqlite", sqlite_table()),
     ]
 }
 
 fn declared_table() -> String {
     let cell = |engine, key| declared_tier(engine, key).map_or("refused", Tier::word);
-    let mut out = String::from("| Declaration | PostgreSQL | SQL Server |\n|---|---|---|\n");
+    let mut out =
+        String::from("| Declaration | PostgreSQL | SQL Server | SQLite |\n|---|---|---|---|\n");
     for key in DECLARATIONS {
         let _ = writeln!(
             out,
-            "| `{key}:` | {} | {} |",
+            "| `{key}:` | {} | {} | {} |",
             cell(Postgres, key),
-            cell(SqlServer, key)
+            cell(SqlServer, key),
+            cell(Sqlite, key),
         );
     }
     out
@@ -352,6 +368,20 @@ fn census_table() -> String {
 fn sqlserver_table() -> String {
     let mut out = String::from("| Kind | Today | Tracking |\n|---|---|---|\n");
     for record in records(SqlServer).filter(|r| r.declared_as.is_empty()) {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} |",
+            record.label,
+            record.tier.word(),
+            record.tracking
+        );
+    }
+    out
+}
+
+fn sqlite_table() -> String {
+    let mut out = String::from("| Kind | Today | Tracking |\n|---|---|---|\n");
+    for record in records(Sqlite).filter(|r| r.declared_as.is_empty()) {
         let _ = writeln!(
             out,
             "| {} | {} | {} |",

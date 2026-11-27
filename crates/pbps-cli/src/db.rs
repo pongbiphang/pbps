@@ -105,6 +105,7 @@ pub const fn driver_for(dialect: DialectName) -> pbps_db::Driver {
     match dialect {
         DialectName::Mssql => pbps_db::Driver::Mssql,
         DialectName::Postgres => pbps_db::Driver::Postgres,
+        DialectName::Sqlite => pbps_db::Driver::Sqlite,
     }
 }
 

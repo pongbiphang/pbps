@@ -13,9 +13,12 @@ pub struct RehearsalDetail {
     /// The `pbps.yml` resolver entry that supplied the scratch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<Text>,
-    /// `server` or `docker`.
+    /// `server`, `docker` or `in-process`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scratch: Option<&'static str>,
+    /// The library that ran an in-process rehearsal, e.g. `SQLite 3.54.1`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library: Option<Text>,
     /// A docker scratch's image reference as configured: unverified, since
     /// the content behind a tag can change.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,19 +44,18 @@ pub fn detail(record: &Rehearsal) -> RehearsalDetail {
             outcome: "off",
             entry: None,
             scratch: None,
+            library: None,
             image: None,
             layout: None,
             spelling: Vec::new(),
             authorization: None,
             authorization_reason: None,
         },
-        Rehearsal::InProcess {
-            library: _,
-            spelling,
-        } => RehearsalDetail {
+        Rehearsal::InProcess { library, spelling } => RehearsalDetail {
             outcome: "converged",
             entry: None,
             scratch: Some("in-process"),
+            library: Some(library.clone()),
             image: None,
             layout: None,
             spelling: spelling.clone(),
@@ -75,6 +77,7 @@ pub fn detail(record: &Rehearsal) -> RehearsalDetail {
                 outcome: "converged",
                 entry: Some(entry.clone()),
                 scratch: Some(scratch),
+                library: None,
                 image,
                 layout: Some(match layout {
                     ScratchLayout::RunOwned => "run-owned",

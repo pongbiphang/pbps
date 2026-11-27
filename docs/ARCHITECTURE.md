@@ -30,13 +30,12 @@ pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
 pbps-pg        PostgreSQL: the same responsibilities as pbps-mssql, as far as
                Phase 5 has built them. Everything unbuilt refuses by name
 pbps-sqlite    SQLite, the third engine (#2950): the same responsibilities as
-               pbps-pg, filled item by item (dialect, emitter, catalog reader,
-               state SQL, preflight). It is built before it is wired
-               (DEC-2950.1), over the connection in `pbps_db::sqlite`, and names
-               no driver type. Its functions are synchronous. Depends on
-               pbps-diff for sealed plan emission inputs, as pbps-pg does
-               (DEC-1959.5). Nothing depends on it yet, and `pbps-cli` does
-               not name it
+               pbps-pg (dialect, emitter, catalog reader, state SQL, preflight,
+               in-process rehearsal), over the connection in `pbps_db::sqlite`,
+               and names no driver type. Its functions are synchronous. Depends
+               on pbps-diff for sealed plan emission inputs, as pbps-pg does
+               (DEC-1959.5). Wired into `pbps-cli` and selectable via
+               `dialect: sqlite`
 pbps-db        Connections plus transaction framing. Owns "there is a network";
                the shapes a connected command consumes — ledger types and
                prune policy, what a pull found (`catalog`), what a rename
@@ -54,8 +53,8 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
                output is the one typed findings envelope every read-only
                command speaks; prompt is the TTY intent channel of SPEC 6.3.
                engine is the connected seam: one function per question a
-               command asks a database, routed to pbps-mssql or pbps-pg by
-               the connection's driver (DECISIONS 417)
+               command asks a database, routed to pbps-mssql, pbps-pg or
+               pbps-sqlite by the connection's driver (DECISIONS 417)
 ```
 
 - Only `pbps-db` and the engine modules that take a `Conn` (`catalog`, `state`,
@@ -70,7 +69,7 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 - `plan --db` reaches the engine's steps (the reads before the resolver, the
   ones inside the planning transaction, the site vetting, the support rows, the
   seals and the proofs after it) through `engine::plan_session::PlanSession`,
-  implemented for the two concrete dialects `with_plan_dialect!` selects: named
+  implemented for the concrete dialects `with_plan_dialect!` selects: named
   positions the pipeline calls in a fixed order, an engine-owned state value
   carried between them (the site admission among it), and provided methods that
   refuse or report `not_applicable` where an engine has no step (DEC-2798.2,
@@ -82,12 +81,12 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   those facts from that type and adds no `Driver` comparison for them
   (DEC-2798.5).
 - `pbps-sqlite` depends on `pbps-db`, `pbps-dialect` and `pbps-diff` (the
-  sealed plan its emitter reads, as `pbps-pg` does) and on nothing else in the
-  workspace so far, and no crate depends on it until the engine is wired
-  (the last of the plan in #2950). `Driver` and `Conn` have a `Sqlite`
-  variant; no project can select it until `DialectName` has the value. The
-  crate calls `pbps_db::sqlite::Connection`, a synchronous type, and the async
-  `Conn` calls it in the calling thread (DEC-2950.17).
+  sealed plan its emitter reads, as `pbps-pg` does). `DialectName`, `Driver`,
+  `Conn`, `PlanSession`, `ApplySession` and `Profile` all carry SQLite, so
+  `dialect: sqlite` routes through the same selection points (`dialect_for` and
+  `db::driver_for`) as the server engines. The crate calls
+  `pbps_db::sqlite::Connection`, a synchronous type, and the async `Conn` calls
+  it in the calling thread (DEC-2950.17).
 - `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
 - Pure module and RLS policy dependency facts live in `pbps-diff::order::catalog`.
   PostgreSQL owns their reads and re-exports the shared value types. The

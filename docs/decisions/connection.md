@@ -1703,3 +1703,39 @@ Pinned by the tests of `plan_session::sqlite`, `apply_session::sqlite` and
 `profile`: each call into real code runs on a real file, each refusal names
 SQLite and what is not supported, and the lock remedy never contains a
 statement.
+
+<a id="dec-2950-21"></a>
+
+**DEC-2950.21. `dialect: sqlite` is selectable, and the list of dialects is written once (#2950).** `DialectName::Sqlite` is the switch: the two
+selections the compiler asks for (`db::driver_for`, `main::dialect_for`), and
+nothing else compares a dialect by name.
+
+- **One list.** `DialectName::ALL` is what `init --dialect` offers, what the
+  published config schema lists and what the tests over every dialect loop on.
+  `init` kept its own list of two names; a fourth engine would have been
+  missing from it without a compile error.
+- **`init --dialect sqlite` writes what the other engines' `init` writes**: the
+  project file and an empty `schema/`, and never a database. A starter table
+  would make `init` then `pull` refuse a directory that "already has
+  declarations", and would be a branch on the engine in `init`. Creating the
+  file stays with `bootstrap --create`.
+- **What the plan wrote is compared with what is read back in the comparison
+  form** (`lexis::layout`), not byte for byte. SQLite keeps a statement's text,
+  which ends where the statement does, so a body declared with a closing line
+  ending (`definition: |`, the usual way to write one) reads back without it,
+  and exact equality rolled every such apply back as changed by another
+  session. Found by running the real binary, which is what the switch is for.
+  Another body, and white space inside a string, still differ.
+- **`explain --format json` names the library** that ran an in-process
+  rehearsal (`library`, absent for a server rehearsal, so the server engines'
+  output is unchanged). The published envelope schema gains the field and
+  `sqlite` among the dialects; no format number moves (DEC-2412.3).
+- **`--staged` needed nothing.** Measured through the binary: a one-change
+  staged plan applies and records its checkpoint and closing entry, `--resume`
+  with nothing to resume is refused naming the newest entry, and a view edit is
+  refused because SQLite replaces a view by drop and create.
+
+Pinned by `crates/pbps-cli/tests/flow_sqlite.rs`, which runs the binary on real
+files with no container: each server-only command and flag refuses by name, a
+mistyped path never creates a file, and
+`a_view_declared_with_a_closing_line_ending_applies_and_verifies_clean`.
