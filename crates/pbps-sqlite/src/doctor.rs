@@ -59,54 +59,77 @@ pub(crate) fn permissions_within(c: &Connection, wait: Duration) -> Result<Permi
 
     // The file is not opened a second time to ask: closing any descriptor of
     // a file drops this process's POSIX locks on it, SQLite's own included.
+    let mut unasked = Vec::new();
     if let Some(path) = path.as_deref() {
-        let shown = |p: &Path| Escaped(&p.display().to_string()).to_string();
-        if !asked(path, false)? {
-            gaps.push(PermissionGap {
-                permission: "WRITE",
-                securable: format!("database file `{}`", shown(path)),
-                why: "the operating system does not let this process write the file".to_owned(),
-            });
-        }
-        let directory = path
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        if !asked(directory, true)? {
-            gaps.push(PermissionGap {
-                permission: "WRITE",
-                securable: format!("database directory `{}`", shown(directory)),
-                why: "SQLite creates its journal beside the database file, and the operating \
-                      system does not let this process create a file in this directory"
-                    .to_owned(),
-            });
-        }
+        ask_the_system(path, may_write, &mut gaps, &mut unasked)?;
     }
 
     Ok(Permissions {
         gaps,
+        unasked,
         ..Permissions::default()
     })
 }
 
-/// The operating system's answer, with "nothing to ask on this platform" read
-/// as no gap found and everything else that is not an answer as an error.
-fn asked(path: &Path, directory: bool) -> Result<bool, DbError> {
-    match may_write(path, directory) {
-        Ok(answer) => Ok(answer.unwrap_or(true)),
-        // Nothing was learnt about the file a deployment would open.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err(DbError::Refused(format!(
-                "`{}` was moved or removed while the database was open; what this process may \
-                 do to it could not be read",
-                Escaped(&path.display().to_string())
-            )))
-        }
-        Err(error) => Err(DbError::Refused(format!(
-            "what this process may do to `{}` could not be read: {error}",
-            Escaped(&path.display().to_string())
-        ))),
+/// Asks `may` about the file and its directory. Three answers stay three: no
+/// is a gap, "this platform cannot be asked" is said and never read as yes,
+/// and a question that failed is an error.
+fn ask_the_system(
+    path: &Path,
+    may: impl Fn(&Path, bool) -> std::io::Result<Option<bool>>,
+    gaps: &mut Vec<PermissionGap>,
+    unasked: &mut Vec<PermissionGap>,
+) -> Result<(), DbError> {
+    let shown = |p: &Path| Escaped(&p.display().to_string()).to_string();
+    let directory = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let asked = |p: &Path, is_directory: bool| {
+        may(p, is_directory).map_err(|error| {
+            DbError::Refused(if error.kind() == std::io::ErrorKind::NotFound {
+                // Nothing was learnt about the file a deployment would open.
+                format!(
+                    "`{}` was moved or removed while the database was open; what this \
+                     process may do to it could not be read",
+                    shown(p)
+                )
+            } else {
+                format!(
+                    "what this process may do to `{}` could not be read: {error}",
+                    shown(p)
+                )
+            })
+        })
+    };
+    let file = asked(path, false)?;
+    let beside = asked(directory, true)?;
+    if file == Some(false) {
+        gaps.push(PermissionGap {
+            permission: "WRITE",
+            securable: format!("database file `{}`", shown(path)),
+            why: "the operating system does not let this process write the file".to_owned(),
+        });
     }
+    if beside == Some(false) {
+        gaps.push(PermissionGap {
+            permission: "WRITE",
+            securable: format!("database directory `{}`", shown(directory)),
+            why: "SQLite creates its journal beside the database file, and the operating \
+                  system does not let this process create a file in this directory"
+                .to_owned(),
+        });
+    }
+    if file.is_none() || beside.is_none() {
+        unasked.push(PermissionGap {
+            permission: "WRITE",
+            securable: format!("database file `{}` and its directory", shown(path)),
+            why: "this platform answers only an attempt, and this command tries nothing; \
+                  `apply` tries before it changes anything"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn query_only(c: &Connection) -> Result<bool, DbError> {

@@ -6,7 +6,7 @@ use std::time::Duration;
 use pbps_db::DbError;
 use pbps_db::sqlite::{Connection, OpenMode};
 
-use super::{permissions, permissions_within};
+use super::{ask_the_system, permissions, permissions_within};
 use crate::state::ensure_tables;
 use crate::tests::Fresh;
 
@@ -272,4 +272,37 @@ fn a_wal_mode_file_and_a_stranger_view_are_handled_truthfully() {
         .expect("stranger view");
     let held = permissions(view.connection()).expect("view left to ledger_problems");
     assert!(held.gaps.is_empty(), "{held:?}");
+}
+
+#[test]
+fn a_platform_that_cannot_be_asked_is_said_and_never_read_as_writable() {
+    let path = Path::new("dir").join("app.db");
+    let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
+    ask_the_system(&path, |_, _| Ok(None), &mut gaps, &mut unasked).expect("answered");
+    assert!(gaps.is_empty(), "{gaps:?}");
+    assert_eq!(unasked.len(), 1, "{unasked:?}");
+    assert!(unasked[0].why.contains("tries nothing"), "{unasked:?}");
+
+    // Negative: a platform that answers yes says nothing, and one that
+    // answers no has a gap and no advice.
+    let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
+    ask_the_system(&path, |_, _| Ok(Some(true)), &mut gaps, &mut unasked).expect("answered");
+    assert!(
+        gaps.is_empty() && unasked.is_empty(),
+        "{gaps:?} {unasked:?}"
+    );
+    let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
+    ask_the_system(&path, |_, d| Ok(Some(!d)), &mut gaps, &mut unasked).expect("answered");
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert!(gaps[0].securable.contains("directory"), "{gaps:?}");
+    assert!(unasked.is_empty(), "{unasked:?}");
+
+    // A question that failed is an error, never an answer.
+    let failed = ask_the_system(
+        &path,
+        |_, _| Err(std::io::Error::other("no answer")),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    assert!(matches!(failed, Err(DbError::Refused(_))), "{failed:?}");
 }

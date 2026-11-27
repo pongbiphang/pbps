@@ -219,6 +219,7 @@ impl Engine for PostgresEngine {
                 // list does not ask.
                 advised: Vec::new(),
                 absent_schemas: held.absent_schemas,
+                unasked: Vec::new(),
             })
         })
     }

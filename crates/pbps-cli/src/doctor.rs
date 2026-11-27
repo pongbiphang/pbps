@@ -129,6 +129,11 @@ pub struct EnvDiagnosis {
     #[serde(skip)]
     #[schemars(skip)]
     pub advised_permissions: Vec<String>,
+    /// What could not be asked without trying it: said as a warning, never
+    /// read as held. Out of the published `data` like the advice above.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub unchecked_permissions: Vec<String>,
 
     /// Set when the permission query itself failed, so an empty
     /// `missing_permissions` means "not determined" rather than "none".
@@ -261,6 +266,7 @@ impl EnvDiagnosis {
             resolver_discovery_unknown: None,
             missing_permissions: Vec::new(),
             advised_permissions: Vec::new(),
+            unchecked_permissions: Vec::new(),
             permissions_unknown: false,
             absent_schemas: Vec::new(),
             server_capabilities_unknown: None,
@@ -1091,6 +1097,16 @@ async fn examine(
                 .into_iter()
                 .map(|g| format!("{} on {} — {}", g.permission, g.securable, g.why))
                 .collect();
+            d.unchecked_permissions = held
+                .unasked
+                .into_iter()
+                .map(|g| {
+                    format!(
+                        "{} on {} was not checked: {}",
+                        g.permission, g.securable, g.why
+                    )
+                })
+                .collect();
             d.absent_schemas = held.absent_schemas.into_iter().collect();
         }
         // Not merely noted in `detail`: with the list left empty, a successful
@@ -1400,6 +1416,14 @@ fn env_findings(
         out.push(output::Finding::warning(
             "permission.advised",
             format!("{}: the {subject} does not hold {advice}", d.environment),
+        ));
+    }
+    // A warning, in words that claim neither answer: the question could not be
+    // asked, so it is neither a gap nor part of an all-clear.
+    for unchecked in &d.unchecked_permissions {
+        out.push(output::Finding::warning(
+            "permission.unchecked",
+            format!("{}: whether the {subject} holds {unchecked}", d.environment),
         ));
     }
     for schema in &d.absent_schemas {
@@ -2412,6 +2436,48 @@ mod tests {
             .unwrap();
         assert!(lock.message.contains("sys.schemas"), "{}", lock.message);
         assert!(lock.message.contains("__pbps_lock"), "{}", lock.message);
+    }
+
+    /// A permission that could not be asked is a warning that claims neither
+    /// answer: not a gap, and not silence that reads as an all-clear.
+    #[test]
+    fn an_unasked_permission_is_a_warning_that_claims_neither_answer() {
+        let mut d =
+            EnvDiagnosis::unknown("local".to_owned(), Some("local".to_owned()), "unreachable");
+        d.unchecked_permissions = vec![
+            "WRITE on database file `app.db` and its directory was not checked: tries nothing"
+                .to_owned(),
+        ];
+        let sqlite = pbps_sqlite::dialect::Sqlite::default();
+        let findings = env_findings(&d, false, &sqlite, pbps_db::Driver::Sqlite);
+        let unchecked: Vec<&output::Finding> = findings
+            .iter()
+            .filter(|f| f.id == "permission.unchecked")
+            .collect();
+        assert_eq!(unchecked.len(), 1, "{findings:?}");
+        assert_eq!(unchecked[0].severity, output::Severity::Warning);
+        assert!(
+            unchecked[0]
+                .message
+                .contains("whether the process holds WRITE")
+                && unchecked[0].message.contains("was not checked"),
+            "{}",
+            unchecked[0].message
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.id != "permission.missing" && f.id != "permission.advised"),
+            "{findings:?}"
+        );
+
+        // Negative: with nothing left unasked, nothing is said.
+        d.unchecked_permissions.clear();
+        let findings = env_findings(&d, false, &sqlite, pbps_db::Driver::Sqlite);
+        assert!(
+            findings.iter().all(|f| f.id != "permission.unchecked"),
+            "{findings:?}"
+        );
     }
 
     /// #306, #821, #822: a failed lock read is remedied in the connected
