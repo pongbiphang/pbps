@@ -128,6 +128,14 @@ mapped AS (
             LEFT JOIN pg_catalog.pg_namespace treln ON treln.oid = trel.relnamespace
            WHERE d.refclassid = 'pg_catalog.pg_type'::pg_catalog.regclass AND tt.oid = d.refobjid
           UNION ALL
+          -- An array type is also a name of its own: written as a function
+          -- (`_mood(x)`), it is a cast until a routine of that name arrives.
+          SELECT 'type'::text, an.nspname::text, at.typname::text, NULL::text, NULL::text, NULL::text, at.typnamespace
+            FROM pg_catalog.pg_type at
+            JOIN pg_catalog.pg_type ae ON ae.oid = at.typelem AND ae.typarray = at.oid
+            JOIN pg_catalog.pg_namespace an ON an.oid = at.typnamespace
+           WHERE d.refclassid = 'pg_catalog.pg_type'::pg_catalog.regclass AND at.oid = d.refobjid
+          UNION ALL
           SELECT 'routine'::text, n.nspname::text, p.proname::text, NULL::text, NULL::text, NULL::text, p.pronamespace
             FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
            WHERE d.refclassid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND p.oid = d.refobjid

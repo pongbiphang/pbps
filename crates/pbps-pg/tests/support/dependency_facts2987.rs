@@ -622,6 +622,64 @@ fn corpus() -> Vec<Case> {
         });
     }
 
+    // An array type written as a function is a cast until a routine of its
+    // name arrives: the recorded dependency is on the array type itself.
+    {
+        let mut base = Schema::default();
+        base.tables
+            .insert("app.t".parse().unwrap(), plain_table(&[("txt", "text")]));
+        base.modules.insert(
+            "app.v_moods".parse().unwrap(),
+            view_mod("SELECT _mood(txt) AS r FROM app.t"),
+        );
+        base.modules.insert(
+            "app.v_plain".parse().unwrap(),
+            view_mod("SELECT txt FROM app.t"),
+        );
+        let mut desired = base.clone();
+        desired.modules.insert(
+            "early._mood(text)".parse().unwrap(),
+            routine_mod(ModuleKind::Function, "RETURNS text LANGUAGE sql RETURN 'x'"),
+        );
+        cases.push(Case {
+            name: "array_type_called_as_function",
+            min_version: 0,
+            search_path: "early, app, public",
+            setup_sql: vec![
+                "CREATE SCHEMA early; CREATE SCHEMA app;".into(),
+                "CREATE TYPE app.mood AS ENUM ('a', 'b'); CREATE TABLE app.t (txt text);".into(),
+                "CREATE VIEW app.v_moods AS SELECT _mood(txt) AS r FROM app.t;".into(),
+                "CREATE VIEW app.v_plain AS SELECT txt FROM app.t;".into(),
+            ],
+            base,
+            desired,
+            changes: vec![Change::Module(ModuleChange::CreateModule {
+                id: "early._mood(text)".parse().unwrap(),
+                module: Box::new(routine_mod(
+                    ModuleKind::Function,
+                    "RETURNS text LANGUAGE sql RETURN 'x'",
+                )),
+            })],
+            change_sql: vec![
+                "CREATE FUNCTION early._mood(text) RETURNS text LANGUAGE sql RETURN 'x';".into(),
+            ],
+            tracked: vec![
+                TrackedSurface::kept_same(
+                    mod_surface("app.v_moods"),
+                    "DROP VIEW app.v_moods",
+                    "CREATE VIEW app.v_moods AS SELECT _mood(txt) AS r FROM app.t",
+                    Expect::Resolve,
+                ),
+                TrackedSurface::kept_same(
+                    mod_surface("app.v_plain"),
+                    "DROP VIEW app.v_plain",
+                    "CREATE VIEW app.v_plain AS SELECT txt FROM app.t",
+                    Expect::UnaffectedByDep,
+                ),
+            ],
+        });
+    }
+
     // 3. built-in aggregate name `max` arriving captures `max(txt)`.
     {
         let mut base = Schema::default();
