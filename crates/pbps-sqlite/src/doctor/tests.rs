@@ -278,7 +278,14 @@ fn a_wal_mode_file_and_a_stranger_view_are_handled_truthfully() {
 fn a_platform_that_cannot_be_asked_is_said_and_never_read_as_writable() {
     let path = Path::new("dir").join("app.db");
     let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
-    ask_the_system(&path, |_, _| Ok(None), &mut gaps, &mut unasked).expect("answered");
+    ask_the_system(
+        &path,
+        &["-journal"],
+        |_, _| Ok(None),
+        &mut gaps,
+        &mut unasked,
+    )
+    .expect("answered");
     assert!(gaps.is_empty(), "{gaps:?}");
     assert_eq!(unasked.len(), 1, "{unasked:?}");
     assert!(unasked[0].why.contains("tries nothing"), "{unasked:?}");
@@ -286,13 +293,27 @@ fn a_platform_that_cannot_be_asked_is_said_and_never_read_as_writable() {
     // Negative: a platform that answers yes says nothing, and one that
     // answers no has a gap and no advice.
     let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
-    ask_the_system(&path, |_, _| Ok(Some(true)), &mut gaps, &mut unasked).expect("answered");
+    ask_the_system(
+        &path,
+        &["-journal"],
+        |_, _| Ok(Some(true)),
+        &mut gaps,
+        &mut unasked,
+    )
+    .expect("answered");
     assert!(
         gaps.is_empty() && unasked.is_empty(),
         "{gaps:?} {unasked:?}"
     );
     let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
-    ask_the_system(&path, |_, d| Ok(Some(!d)), &mut gaps, &mut unasked).expect("answered");
+    ask_the_system(
+        &path,
+        &["-journal"],
+        |_, d| Ok(Some(!d)),
+        &mut gaps,
+        &mut unasked,
+    )
+    .expect("answered");
     assert_eq!(gaps.len(), 1, "{gaps:?}");
     assert!(gaps[0].securable.contains("directory"), "{gaps:?}");
     assert!(unasked.is_empty(), "{unasked:?}");
@@ -300,6 +321,7 @@ fn a_platform_that_cannot_be_asked_is_said_and_never_read_as_writable() {
     // A question that failed is an error, never an answer.
     let failed = ask_the_system(
         &path,
+        &["-journal"],
         |_, _| Err(std::io::Error::other("no answer")),
         &mut Vec::new(),
         &mut Vec::new(),
@@ -308,7 +330,7 @@ fn a_platform_that_cannot_be_asked_is_said_and_never_read_as_writable() {
 }
 
 #[test]
-fn a_journal_file_kept_beside_the_database_is_asked_when_it_exists() {
+fn a_journal_file_the_journal_mode_writes_is_asked_when_it_exists() {
     let path = Path::new("dir").join("app.db");
     let absent = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
     let ends = |p: &Path, suffix: &str| p.to_string_lossy().ends_with(suffix);
@@ -318,9 +340,10 @@ fn a_journal_file_kept_beside_the_database_is_asked_when_it_exists() {
     let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
     ask_the_system(
         &path,
+        &["-wal", "-shm"],
         |p, _| match p {
             p if ends(p, "-wal") => Ok(Some(false)),
-            p if ends(p, "-shm") || ends(p, "-journal") => absent(),
+            p if ends(p, "-shm") => absent(),
             _ => Ok(Some(true)),
         },
         &mut gaps,
@@ -336,6 +359,7 @@ fn a_journal_file_kept_beside_the_database_is_asked_when_it_exists() {
         let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
         ask_the_system(
             &path,
+            &["-wal", "-shm"],
             |p, _| match (journal(p), kept) {
                 (false, _) => Ok(Some(true)),
                 (true, None) => absent(),
@@ -351,9 +375,27 @@ fn a_journal_file_kept_beside_the_database_is_asked_when_it_exists() {
         );
     }
 
+    // Negative: a read-only `-wal` file left beside a rollback-journal
+    // database is not written, so it is not asked and is no gap.
+    let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
+    ask_the_system(
+        &path,
+        &["-journal"],
+        |p, _| match p {
+            p if ends(p, "-wal") || ends(p, "-shm") => Ok(Some(false)),
+            p if ends(p, "-journal") => absent(),
+            _ => Ok(Some(true)),
+        },
+        &mut gaps,
+        &mut unasked,
+    )
+    .expect("answered");
+    assert!(gaps.is_empty(), "{gaps:?}");
+
     // A journal file whose question failed is an error, never an answer.
     let failed = ask_the_system(
         &path,
+        &["-wal", "-shm"],
         |p, _| {
             if ends(p, "-shm") {
                 Err(std::io::Error::other("no answer"))
@@ -365,4 +407,39 @@ fn a_journal_file_kept_beside_the_database_is_asked_when_it_exists() {
         &mut Vec::new(),
     );
     assert!(matches!(failed, Err(DbError::Refused(_))), "{failed:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_wal_file_is_a_gap_in_wal_mode_and_none_in_rollback_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for (mode, gap) in [("wal", true), ("delete", false)] {
+        let mut fresh = Fresh::file();
+        let path = fresh.path().to_path_buf();
+        fresh
+            .connection()
+            .query(&format!("PRAGMA journal_mode = {mode}"), &[])
+            .expect("journal mode");
+        fresh
+            .connection()
+            .execute_batch("CREATE TABLE app (id INTEGER PRIMARY KEY)")
+            .expect("table");
+        let mut name = path.as_os_str().to_owned();
+        name.push("-wal");
+        let wal = std::path::PathBuf::from(name);
+        if !wal.exists() {
+            std::fs::write(&wal, b"").expect("a leftover file");
+        }
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o444)).expect("chmod ro");
+        // A process that may write anything (root) has no "no" to be given.
+        let refused = pbps_db::sqlite::may_write(&wal, false).expect("asked") == Some(false);
+        let result = permissions(fresh.connection());
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).expect("chmod rw");
+        let held = result.expect("answered");
+        assert_eq!(
+            held.gaps.iter().any(|g| g.securable.contains("-wal")),
+            gap && refused,
+            "{mode}: {held:?}"
+        );
+    }
 }

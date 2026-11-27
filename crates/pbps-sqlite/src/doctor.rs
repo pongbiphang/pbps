@@ -61,7 +61,14 @@ pub(crate) fn permissions_within(c: &Connection, wait: Duration) -> Result<Permi
     // a file drops this process's POSIX locks on it, SQLite's own included.
     let mut unasked = Vec::new();
     if let Some(path) = path.as_deref() {
-        ask_the_system(path, may_write, &mut gaps, &mut unasked)?;
+        // Only the files this journal mode writes: a `-wal` file left beside
+        // a rollback-journal database is not written, and may be read-only.
+        let kept: &[&str] = if write_ahead(c)? {
+            &["-wal", "-shm"]
+        } else {
+            &["-journal"]
+        };
+        ask_the_system(path, kept, may_write, &mut gaps, &mut unasked)?;
     }
 
     Ok(Permissions {
@@ -76,6 +83,7 @@ pub(crate) fn permissions_within(c: &Connection, wait: Duration) -> Result<Permi
 /// and a question that failed is an error.
 fn ask_the_system(
     path: &Path,
+    kept: &[&str],
     may: impl Fn(&Path, bool) -> std::io::Result<Option<bool>>,
     gaps: &mut Vec<PermissionGap>,
     unasked: &mut Vec<PermissionGap>,
@@ -111,10 +119,10 @@ fn ask_the_system(
             why: "the operating system does not let this process write the file".to_owned(),
         });
     }
-    // SQLite also writes the files it already keeps beside the database: a
-    // commit in WAL mode goes to the `-wal` file. Each is asked when it
-    // exists; one that does not is created in the directory, asked above.
-    for suffix in ["-wal", "-shm", "-journal"] {
+    // SQLite also writes the files its journal mode keeps beside the database
+    // (`kept`): a commit in WAL mode goes to the `-wal` file. Each is asked
+    // when it exists; one that does not is created in the directory.
+    for suffix in kept {
         let mut name = path.as_os_str().to_owned();
         name.push(suffix);
         let kept = std::path::PathBuf::from(name);
@@ -152,6 +160,16 @@ fn ask_the_system(
         });
     }
     Ok(())
+}
+
+/// Whether this connection journals to a write-ahead log.
+fn write_ahead(c: &Connection) -> Result<bool, DbError> {
+    match c.query("PRAGMA journal_mode", &[])?.first() {
+        Some(row) => Ok(row.text(0)?.eq_ignore_ascii_case("wal")),
+        None => Err(DbError::BadRow(
+            "`PRAGMA journal_mode` returned no row".into(),
+        )),
+    }
 }
 
 fn query_only(c: &Connection) -> Result<bool, DbError> {
