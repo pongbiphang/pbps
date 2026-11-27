@@ -89,14 +89,17 @@ impl Dialect for Sqlite {
     /// layout may separate two bodies that compare equal (the shared scanner
     /// nests block comments, so it would read some of the text as one).
     fn normalize_definition(&self, definition: &str) -> String {
-        lexis::layout(definition)
+        // Of what SQLite keeps (`lexis::kept`): a body declared with its `;`
+        // is the body SQLite stores without it, for the differ as for the
+        // read-back below.
+        lexis::layout(lexis::kept(definition))
     }
 
     /// What the plan wrote against what is read back, in the comparison form
     /// and not byte for byte: SQLite keeps the statement's text, which ends
     /// where the statement does, so a body declared with a closing line
-    /// ending (`definition: |`) reads back without it. Exact equality refused
-    /// every such view as changed by someone else.
+    /// ending (`definition: |`) or its `;` reads back without it. Exact
+    /// equality refused every such view as changed by someone else.
     fn module_matches_declaration(
         &self,
         wrote: &pbps_model::Module,
@@ -104,7 +107,8 @@ impl Dialect for Sqlite {
     ) -> bool {
         wrote.kind == now.kind
             && wrote.options == now.options
-            && lexis::layout(&wrote.definition) == lexis::layout(&now.definition)
+            && self.normalize_definition(&wrote.definition)
+                == self.normalize_definition(&now.definition)
     }
 
     fn qualified_calls(&self, _text: &str) -> Vec<(String, String)> {
@@ -646,6 +650,19 @@ mod tests {
             &view("SELECT id\n  FROM app\n"),
             &view("SELECT id\n  FROM app")
         ));
+        // Nor is the statement's terminator, or a comment after it.
+        assert!(d.module_matches_declaration(
+            &view("SELECT id FROM app;\n"),
+            &view("SELECT id FROM app")
+        ));
+        assert!(d.module_matches_declaration(
+            &view("SELECT id FROM app ; -- done\n"),
+            &view("SELECT id FROM app")
+        ));
+        assert_eq!(
+            d.normalize_definition("SELECT id FROM app;"),
+            d.normalize_definition("SELECT id FROM app")
+        );
         // Negative: another body, or text inside a string, is not layout.
         assert!(!d.module_matches_declaration(
             &view("SELECT id FROM app\n"),

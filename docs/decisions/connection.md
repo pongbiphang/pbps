@@ -1722,9 +1722,11 @@ nothing else compares a dialect by name.
 - **What the plan wrote is compared with what is read back in the comparison
   form** (`lexis::layout`), not byte for byte. SQLite keeps a statement's text,
   which ends where the statement does, so a body declared with a closing line
-  ending (`definition: |`, the usual way to write one) reads back without it,
-  and exact equality rolled every such apply back as changed by another
-  session. Found by running the real binary, which is what the switch is for.
+  ending (`definition: |`, the usual way to write one) or with its `;` reads
+  back without it, and exact equality rolled every such apply back as changed
+  by another session. The comparison form is taken of what SQLite keeps
+  (`lexis::kept`: up to the statement's `;`, measured on the library), for
+  the differ too, so the next plan does not see a change either. Found by running the real binary, which is what the switch is for.
   Another body, and white space inside a string, still differ.
 - **`explain --format json` names the library** that ran an in-process
   rehearsal (`library`, absent for a server rehearsal, so the server engines'
@@ -1738,4 +1740,4 @@ nothing else compares a dialect by name.
 Pinned by `crates/pbps-cli/tests/flow_sqlite.rs`, which runs the binary on real
 files with no container: each server-only command and flag refuses by name, a
 mistyped path never creates a file, and
-`a_view_declared_with_a_closing_line_ending_applies_and_verifies_clean`.
+`a_view_declared_with_a_terminator_and_a_closing_line_ending_applies_and_verifies_clean`.

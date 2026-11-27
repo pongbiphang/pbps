@@ -1471,16 +1471,16 @@ fn validate_matches_every_declared_object_kind_in_the_sqlite_support_table() {
     }
 }
 
-/// SQLite keeps a view's text without the line ending a `definition: |` block
-/// closes with, and the apply's read-back must not call that someone else's
-/// change.
+/// SQLite keeps a view's text without its `;` and without the line ending a
+/// `definition: |` block closes with, and neither the apply's read-back nor
+/// the next plan may call that a change.
 #[test]
-fn a_view_declared_with_a_closing_line_ending_applies_and_verifies_clean() {
+fn a_view_declared_with_a_terminator_and_a_closing_line_ending_applies_and_verifies_clean() {
     let p = SqliteProject::new("view-block");
     p.bootstrap_starter();
     p.write_schema(
         "main.v_items.yml",
-        "view: main.v_items\ndefinition: |\n  SELECT id\n    FROM main.items\n",
+        "view: main.v_items\ndefinition: |\n  SELECT id\n    FROM main.items;\n",
     );
     assert_eq!(code(&p.pbps(&["plan"])), 0);
     let plan_file = p.dir.join("view.plan.json");
