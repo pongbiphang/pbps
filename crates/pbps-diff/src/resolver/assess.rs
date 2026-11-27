@@ -553,6 +553,11 @@ impl PlanEffects {
                 self.touched_relations.insert(rel);
             }
         }
+        // A sequence a column owns under a declared name is a relation the
+        // table brings or takes with it, and no implicit name.
+        for (column, spec) in &table.columns {
+            self.record_column_sequence(table_name, column, spec, hooks, arriving);
+        }
     }
 
     fn record_pk(&mut self, schema: &str, pk: Option<&PrimaryKey>, arriving: bool) {
@@ -573,6 +578,7 @@ impl PlanEffects {
         name: &pbps_model::ColumnName,
         column: &pbps_model::Column,
         hooks: &Hooks<'_>,
+        arriving: bool,
     ) {
         let names = match &column.value_source {
             ValueSource::Sequence(seq) => (hooks.owned_sequence)(table, name.raw(), seq)
@@ -587,7 +593,12 @@ impl PlanEffects {
         };
         self.exclude_narrowing |= names.is_empty();
         for s in names {
-            self.arrive_rel_or_type(ObjectName::new(&table.schema, s));
+            let sequence = ObjectName::new(&table.schema, s);
+            if arriving {
+                self.arrive_rel_or_type(sequence);
+            } else {
+                self.touched_relations.insert(sequence);
+            }
         }
     }
 
@@ -715,13 +726,24 @@ impl PlanEffects {
                 self.moves_bindings = true;
                 self.touched_relations.insert(table.clone());
                 if engine.indexes_are_relations {
-                    self.record_column_sequence(table, name, column, hooks);
+                    self.record_column_sequence(table, name, column, hooks, true);
                 }
             }
-            Change::Column(
-                ColumnChange::DropColumn { column, .. }
-                | ColumnChange::AlterColumnType { column, .. },
-            ) => {
+            Change::Column(ColumnChange::DropColumn { column, .. }) => {
+                self.moves_bindings = true;
+                self.touched_relations.insert(column.table.clone());
+                // The sequence the column owns goes with it.
+                if engine.indexes_are_relations
+                    && let Some(spec) = base
+                        .schema
+                        .tables
+                        .get(&column.table)
+                        .and_then(|t| t.columns.get(&column.name))
+                {
+                    self.record_column_sequence(&column.table, &column.name, spec, hooks, false);
+                }
+            }
+            Change::Column(ColumnChange::AlterColumnType { column, .. }) => {
                 self.moves_bindings = true;
                 self.touched_relations.insert(column.table.clone());
             }
@@ -2770,5 +2792,144 @@ mod dependency_facts_tests {
             found.questions[&module_surface("app.v_u")],
             Answer::Unaffected
         );
+    }
+
+    /// A sequence a column owns is a relation the column and its table bring
+    /// and take with them: a surface with an edge on it is not proven when the
+    /// column or the table is dropped, nor when a table arrives with one of
+    /// that name. Negative: with a name the dialect cannot say, nothing is.
+    #[test]
+    fn an_owned_sequence_is_touched_and_arrives_with_its_column_and_table() {
+        let serial = || {
+            let mut column = Column::new("int".parse().unwrap());
+            column.value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+            column
+        };
+        let mut schema = two_table_schema();
+        let t: TableName = "app.t".parse().unwrap();
+        schema
+            .tables
+            .get_mut(&t)
+            .unwrap()
+            .columns
+            .insert("n".into(), serial());
+        let base_ids = resolve_ids(&schema, &IdsFile::default());
+        let side = crate::Side {
+            schema: &schema,
+            ids: &base_ids,
+        };
+        let facts = DependencyFacts {
+            surfaces: BTreeMap::from([
+                (
+                    module_surface("app.v_t"),
+                    parsed([DependencyEdge::Relation("app.t_n_seq".parse().unwrap())]),
+                ),
+                (
+                    module_surface("app.v_u"),
+                    parsed([DependencyEdge::Column(
+                        "app.u".parse::<TableName>().unwrap().column("id"),
+                    )]),
+                ),
+            ]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::from([
+                ("t".into(), CatalogName::Clear),
+                ("t_n_seq".into(), CatalogName::Clear),
+            ]),
+        };
+        let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
+        let eng = Engine {
+            indexes_are_relations: true,
+            normalize: &normalize,
+            filter_binds: true,
+        };
+        let named = |table: &TableName, column: &str, _: &pbps_model::OwnedSequence| {
+            Some(format!("{}_{column}_seq", table.name))
+        };
+        let unnamed = |_: &TableName, _: &str, _: &pbps_model::OwnedSequence| None;
+        let assessed = |changes: Vec<Change>,
+                        owned_sequence: &dyn Fn(
+            &TableName,
+            &str,
+            &pbps_model::OwnedSequence,
+        ) -> Option<String>| {
+            assessed_with_facts(
+                side,
+                side,
+                &ChangeSet {
+                    changes: changes.into_iter().map(PlannedChange::new).collect(),
+                },
+                &eng,
+                &Hooks {
+                    lexis: &pbps_model::module::SHARED,
+                    implicit_relations: &|_, _| Vec::new(),
+                    owned_sequence,
+                },
+                Some(&facts),
+            )
+        };
+        let drop_column = || {
+            vec![Change::Column(ColumnChange::DropColumn {
+                uid: Uid::generate(UidKind::Column),
+                column: t.column("n"),
+            })]
+        };
+        let mut arriving = Table::default();
+        arriving.columns.insert("n".into(), serial());
+        let plans = [
+            ("drop column", drop_column()),
+            (
+                "drop table",
+                vec![Change::Table(TableChange::DropTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: "app.u".parse().unwrap(),
+                    detach_from: None,
+                })],
+            ),
+            (
+                "create table",
+                vec![Change::Table(TableChange::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    // In another schema: only the sequence's name can match.
+                    name: "early.t".parse().unwrap(),
+                    table: Box::new(arriving),
+                    beside_default: None,
+                    moves_at_most: None,
+                })],
+            ),
+        ];
+        for (label, changes) in plans {
+            let found = assessed(changes, &named);
+            let (hit, miss) = if label == "drop table" {
+                // `app.u` holds no sequence: its reader is touched by the
+                // drop, and the sequence's reader is proven.
+                ("app.v_u", "app.v_t")
+            } else {
+                ("app.v_t", "app.v_u")
+            };
+            assert_eq!(
+                found.questions[&module_surface(hit)],
+                Answer::Resolve,
+                "{label}"
+            );
+            assert_eq!(
+                found.unaffected_reason(&module_surface(miss)),
+                Some(UnaffectedReason::ByDependency),
+                "{label}"
+            );
+        }
+        // A table holding the sequence takes it when it goes.
+        let found = assessed(
+            vec![Change::Table(TableChange::DropTable {
+                uid: Uid::generate(UidKind::Table),
+                name: t.clone(),
+                detach_from: None,
+            })],
+            &named,
+        );
+        assert_eq!(found.questions[&module_surface("app.v_t")], Answer::Resolve);
+        // A name the dialect cannot say proves nothing for any surface.
+        let found = assessed(drop_column(), &unnamed);
+        assert_eq!(found.count(Answer::Unaffected), 0);
     }
 }
