@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use pbps_db::{Conn, DbError, FromColumn, Param, Row};
 use pbps_diff::resolver::FactsNeeded;
 use pbps_model::resolver::{
-    Ancestor, CatalogName, DependencyEdge, DependencyFacts, NameAvailability, ReadFact, Surface,
-    SurfaceDependencies,
+    Ancestor, CandidateName, CatalogName, DependencyEdge, DependencyFacts, EngineNamedRelation,
+    NameAvailability, NameSlotKind, ReadFact, Surface, SurfaceDependencies,
 };
 use pbps_model::{ModuleId, ObjectName, TableName};
 use serde::Serialize;
@@ -199,6 +199,34 @@ SELECT cn.nspname::text, c.relname::text, 'type'::text, tn.nspname::text, t.typn
    AND cn.nspname NOT IN ('pg_catalog', 'information_schema') AND pg_catalog.left(cn.nspname, 3) <> 'pg_'
 "#;
 
+const ENGINE_NAMED_SQL: &str = r#"
+WITH req AS (
+    SELECT idx, kind, schema_name, table_name, col_name
+      FROM pg_catalog.jsonb_to_recordset($1::pg_catalog.text::pg_catalog.jsonb)
+        AS r(idx int4, kind text, schema_name text, table_name text, col_name text)
+)
+SELECT req.idx, in_ns.nspname::text AS rel_schema, ic.relname::text AS rel_name
+  FROM req
+  JOIN pg_catalog.pg_namespace n ON n.nspname = req.schema_name
+  JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = req.table_name
+  JOIN pg_catalog.pg_constraint con ON con.conrelid = c.oid AND con.contype = 'p'
+  JOIN pg_catalog.pg_class ic ON ic.oid = con.conindid
+  JOIN pg_catalog.pg_namespace in_ns ON in_ns.oid = ic.relnamespace
+ WHERE req.kind = 'pk'
+UNION ALL
+SELECT req.idx, sn.nspname::text, sc.relname::text
+  FROM req
+  JOIN pg_catalog.pg_namespace n ON n.nspname = req.schema_name
+  JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = req.table_name
+  JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attname = req.col_name AND a.attnum > 0 AND NOT a.attisdropped
+  JOIN pg_catalog.pg_depend d
+    ON d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = c.oid AND d.refobjsubid = a.attnum
+   AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objsubid = 0 AND d.deptype IN ('a', 'i')
+  JOIN pg_catalog.pg_class sc ON sc.oid = d.objid AND sc.relkind = 'S'
+  JOIN pg_catalog.pg_namespace sn ON sn.oid = sc.relnamespace
+ WHERE req.kind = 'col_seq'
+"#;
+
 const CATALOG_NAMES_SQL: &str = r#"
 WITH req AS (
     SELECT name FROM pg_catalog.jsonb_to_recordset($1::pg_catalog.text::pg_catalog.jsonb) AS r(name text)
@@ -210,16 +238,24 @@ SELECT req.name,
   FROM req
 "#;
 
-const COMPANION_TYPES_SQL: &str = r#"
+const CANDIDATE_NAMES_SQL: &str = r#"
 WITH req AS (
-    SELECT idx, schema_name, type_name
+    SELECT idx, kind, schema_name, obj_name
       FROM pg_catalog.jsonb_to_recordset($1::pg_catalog.text::pg_catalog.jsonb)
-        AS r(idx int4, schema_name text, type_name text)
+        AS r(idx int4, kind text, schema_name text, obj_name text)
 )
 SELECT req.idx,
-       (n.oid IS NOT NULL
-        AND EXISTS (SELECT 1 FROM pg_catalog.pg_type t
-                     WHERE t.typnamespace = n.oid AND t.typname = req.type_name)) AS held
+       (n.oid IS NOT NULL AND CASE req.kind
+         WHEN 'relation' THEN
+           EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.relnamespace = n.oid AND c.relname = req.obj_name)
+           OR EXISTS (SELECT 1 FROM pg_catalog.pg_type t WHERE t.typnamespace = n.oid AND t.typname = req.obj_name)
+         WHEN 'constraint_relation' THEN
+           EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.relnamespace = n.oid AND c.relname = req.obj_name)
+           OR EXISTS (SELECT 1 FROM pg_catalog.pg_constraint con WHERE con.connamespace = n.oid AND con.conname = req.obj_name)
+         WHEN 'companion_type' THEN
+           EXISTS (SELECT 1 FROM pg_catalog.pg_type t WHERE t.typnamespace = n.oid AND t.typname = req.obj_name)
+         ELSE true
+       END) AS held
   FROM req
   LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = req.schema_name
 "#;
@@ -237,11 +273,20 @@ pub async fn read(conn: &mut Conn, needed: &FactsNeeded) -> Result<DependencyFac
 
 async fn read_in(conn: &mut Conn, needed: &FactsNeeded) -> Result<DependencyFacts, DbError> {
     conn.query(CANONICAL_PATH).await?;
+    let surfaces = read_surfaces(conn, &needed.surfaces).await?;
+    let relation_ancestors = ReadFact::Known(read_ancestors(conn).await?);
+    let (engine_named_relations, moved_names) =
+        read_engine_named(conn, &needed.touched_engine_named).await?;
+    let mut all_arriving = needed.arriving_names.clone();
+    all_arriving.extend(moved_names);
+    let catalog_names = read_catalog_names(conn, &all_arriving).await?;
+    let candidate_names = read_candidate_names(conn, &needed.arriving_candidates).await?;
     Ok(DependencyFacts {
-        surfaces: read_surfaces(conn, &needed.surfaces).await?,
-        relation_ancestors: ReadFact::Known(read_ancestors(conn).await?),
-        catalog_names: read_catalog_names(conn, &needed.arriving_names).await?,
-        companion_types: read_companion_types(conn, &needed.arriving_companion_types).await?,
+        surfaces,
+        relation_ancestors,
+        catalog_names,
+        engine_named_relations,
+        candidate_names,
     })
 }
 
@@ -378,6 +423,72 @@ async fn read_ancestors(
 }
 
 #[derive(Serialize)]
+struct EngineNamedReq<'a> {
+    idx: i32,
+    kind: &'static str,
+    schema_name: &'a str,
+    table_name: &'a str,
+    col_name: &'a str,
+}
+
+async fn read_engine_named(
+    conn: &mut Conn,
+    requested: &BTreeMap<EngineNamedRelation, bool>,
+) -> Result<
+    (
+        BTreeMap<EngineNamedRelation, ReadFact<ObjectName>>,
+        BTreeSet<String>,
+    ),
+    DbError,
+> {
+    if requested.is_empty() {
+        return Ok((BTreeMap::new(), BTreeSet::new()));
+    }
+    let list: Vec<(EngineNamedRelation, bool)> =
+        requested.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let mut reqs = Vec::with_capacity(list.len());
+    for (i, (enr, _)) in list.iter().enumerate() {
+        let idx =
+            i32::try_from(i).map_err(|_| DbError::BadRow("engine-named index overflow".into()))?;
+        let (kind, schema_name, table_name, col_name) = match enr {
+            EngineNamedRelation::PrimaryKey(t) => ("pk", t.schema.as_str(), t.name.as_str(), ""),
+            EngineNamedRelation::ColumnSequence(c) => (
+                "col_seq",
+                c.table.schema.as_str(),
+                c.table.name.as_str(),
+                c.name.raw(),
+            ),
+        };
+        reqs.push(EngineNamedReq {
+            idx,
+            kind,
+            schema_name,
+            table_name,
+            col_name,
+        });
+    }
+    let rows = query_json(conn, ENGINE_NAMED_SQL, &reqs).await?;
+    let mut raw = Vec::with_capacity(rows.len());
+    for row in &rows {
+        raw.push(RawEngineNamedRow {
+            idx: req_col::<i32>(row, "idx")?,
+            rel_schema: req_col::<&str>(row, "rel_schema")?.to_owned(),
+            rel_name: req_col::<&str>(row, "rel_name")?.to_owned(),
+        });
+    }
+    let keys: Vec<EngineNamedRelation> = list.iter().map(|(k, _)| k.clone()).collect();
+    let resolved = assemble_engine_named(&keys, &raw);
+    let moved_names = list
+        .iter()
+        .filter_map(|(enr, moves)| match (*moves, resolved.get(enr)) {
+            (true, Some(ReadFact::Known(actual))) => Some(actual.name.clone()),
+            _ => None,
+        })
+        .collect();
+    Ok((resolved, moved_names))
+}
+
+#[derive(Serialize)]
 struct NameReq<'a> {
     name: &'a str,
 }
@@ -402,36 +513,43 @@ async fn read_catalog_names(
 }
 
 #[derive(Serialize)]
-struct CompanionTypeReq<'a> {
+struct CandidateReq<'a> {
     idx: i32,
+    kind: &'static str,
     schema_name: &'a str,
-    type_name: &'a str,
+    obj_name: &'a str,
 }
 
-async fn read_companion_types(
+async fn read_candidate_names(
     conn: &mut Conn,
-    types: &BTreeSet<ObjectName>,
-) -> Result<BTreeMap<ObjectName, NameAvailability>, DbError> {
-    if types.is_empty() {
+    candidates: &BTreeSet<CandidateName>,
+) -> Result<BTreeMap<CandidateName, NameAvailability>, DbError> {
+    if candidates.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let list: Vec<ObjectName> = types.iter().cloned().collect();
+    let list: Vec<CandidateName> = candidates.iter().cloned().collect();
     let mut reqs = Vec::with_capacity(list.len());
-    for (i, obj) in list.iter().enumerate() {
-        let idx = i32::try_from(i)
-            .map_err(|_| DbError::BadRow("companion type index overflow".into()))?;
-        reqs.push(CompanionTypeReq {
+    for (i, cand) in list.iter().enumerate() {
+        let idx =
+            i32::try_from(i).map_err(|_| DbError::BadRow("candidate index overflow".into()))?;
+        let kind = match cand.kind {
+            NameSlotKind::Relation => "relation",
+            NameSlotKind::ConstraintRelation => "constraint_relation",
+            NameSlotKind::CompanionType => "companion_type",
+        };
+        reqs.push(CandidateReq {
             idx,
-            schema_name: &obj.schema,
-            type_name: &obj.name,
+            kind,
+            schema_name: &cand.name.schema,
+            obj_name: &cand.name.name,
         });
     }
-    let rows = query_json(conn, COMPANION_TYPES_SQL, &reqs).await?;
+    let rows = query_json(conn, CANDIDATE_NAMES_SQL, &reqs).await?;
     let mut raw = Vec::with_capacity(rows.len());
     for row in &rows {
         raw.push((req_col::<i32>(row, "idx")?, row.try_get::<bool>("held")?));
     }
-    Ok(assemble_companion_types(&list, &raw))
+    Ok(assemble_candidate_names(&list, &raw))
 }
 
 // --- Pure mapping and assembly (unit-tested without an engine) ---
@@ -456,6 +574,13 @@ struct RawSurfaceRow {
     root_oid: i64,
     parsed: bool,
     edge: RawEdgeRow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawEngineNamedRow {
+    idx: i32,
+    rel_schema: String,
+    rel_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,6 +760,34 @@ fn assemble_ancestors(
     Ok(out)
 }
 
+fn assemble_engine_named(
+    requested: &[EngineNamedRelation],
+    rows: &[RawEngineNamedRow],
+) -> BTreeMap<EngineNamedRelation, ReadFact<ObjectName>> {
+    let mut by_idx: BTreeMap<usize, Vec<ObjectName>> = BTreeMap::new();
+    for row in rows {
+        if let Ok(idx) = usize::try_from(row.idx)
+            && idx < requested.len()
+        {
+            by_idx
+                .entry(idx)
+                .or_default()
+                .push(ObjectName::new(&row.rel_schema, &row.rel_name));
+        }
+    }
+    requested
+        .iter()
+        .enumerate()
+        .map(|(idx, key)| {
+            let fact = match by_idx.remove(&idx).as_deref() {
+                Some([only]) => ReadFact::Known(only.clone()),
+                _ => ReadFact::Unreadable,
+            };
+            (key.clone(), fact)
+        })
+        .collect()
+}
+
 fn assemble_catalog_names(
     requested: &BTreeSet<String>,
     rows: &[(String, Option<bool>)],
@@ -653,10 +806,10 @@ fn assemble_catalog_names(
         .collect()
 }
 
-fn assemble_companion_types(
-    requested: &[ObjectName],
+fn assemble_candidate_names(
+    requested: &[CandidateName],
     rows: &[(i32, Option<bool>)],
-) -> BTreeMap<ObjectName, NameAvailability> {
+) -> BTreeMap<CandidateName, NameAvailability> {
     let seen: BTreeMap<usize, Option<bool>> = rows
         .iter()
         .filter_map(|&(idx, h)| Some((usize::try_from(idx).ok()?, h)))
@@ -664,13 +817,13 @@ fn assemble_companion_types(
     requested
         .iter()
         .enumerate()
-        .map(|(i, obj)| {
+        .map(|(i, cand)| {
             let avail = match seen.get(&i).copied().flatten() {
                 Some(false) => NameAvailability::Free,
                 Some(true) => NameAvailability::Held,
                 None => NameAvailability::Unreadable,
             };
-            (obj.clone(), avail)
+            (cand.clone(), avail)
         })
         .collect()
 }
@@ -911,7 +1064,39 @@ mod tests {
     }
 
     #[test]
-    fn assemble_catalog_and_companion_types_fail_closed_on_missing_or_null() {
+    fn assemble_engine_named_catalog_and_candidates_fail_closed_on_missing_or_ambiguous() {
+        let pk = EngineNamedRelation::PrimaryKey("app.t".parse().unwrap());
+        let seq_missing =
+            EngineNamedRelation::ColumnSequence("app.t".parse::<TableName>().unwrap().column("id"));
+        let seq_ambig =
+            EngineNamedRelation::ColumnSequence("app.u".parse::<TableName>().unwrap().column("id"));
+        let resolved = assemble_engine_named(
+            &[pk.clone(), seq_missing.clone(), seq_ambig.clone()],
+            &[
+                RawEngineNamedRow {
+                    idx: 0,
+                    rel_schema: "app".into(),
+                    rel_name: "t_pkey1".into(),
+                },
+                RawEngineNamedRow {
+                    idx: 2,
+                    rel_schema: "app".into(),
+                    rel_name: "u_id_seq".into(),
+                },
+                RawEngineNamedRow {
+                    idx: 2,
+                    rel_schema: "app".into(),
+                    rel_name: "u_id_seq1".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            resolved[&pk],
+            ReadFact::Known("app.t_pkey1".parse().unwrap())
+        );
+        assert_eq!(resolved[&seq_missing], ReadFact::Unreadable);
+        assert_eq!(resolved[&seq_ambig], ReadFact::Unreadable);
+
         let names = BTreeSet::from([
             "clear".into(),
             "held".into(),
@@ -931,16 +1116,45 @@ mod tests {
         assert_eq!(cat["missing"], CatalogName::Unreadable);
         assert_eq!(cat["null"], CatalogName::Unreadable);
 
-        let c0: ObjectName = "early._t".parse().unwrap();
-        let c1: ObjectName = "early._u".parse().unwrap();
-        let c2: ObjectName = "early._v".parse().unwrap();
-        let avail = assemble_companion_types(
-            &[c0.clone(), c1.clone(), c2.clone()],
-            &[(0, Some(false)), (1, Some(true))],
+        let c0 = CandidateName {
+            kind: NameSlotKind::CompanionType,
+            name: "early._t".parse().unwrap(),
+        };
+        let c1 = CandidateName {
+            kind: NameSlotKind::ConstraintRelation,
+            name: "early.t_pkey".parse().unwrap(),
+        };
+        let c2 = CandidateName {
+            kind: NameSlotKind::Relation,
+            name: "early.t_id_seq".parse().unwrap(),
+        };
+        let c3 = CandidateName {
+            kind: NameSlotKind::Relation,
+            name: "early.t_n_seq".parse().unwrap(),
+        };
+        let avail = assemble_candidate_names(
+            &[c0.clone(), c1.clone(), c2.clone(), c3.clone()],
+            &[(0, Some(false)), (1, Some(true)), (3, None)],
         );
         assert_eq!(avail[&c0], NameAvailability::Free);
         assert_eq!(avail[&c1], NameAvailability::Held);
         assert_eq!(avail[&c2], NameAvailability::Unreadable);
+        assert_eq!(avail[&c3], NameAvailability::Unreadable);
+    }
+
+    #[test]
+    fn json_parameter_queries_cast_text_to_jsonb_on_the_server() {
+        for (label, sql) in [
+            ("SURFACES_SQL", SURFACES_SQL),
+            ("ENGINE_NAMED_SQL", ENGINE_NAMED_SQL),
+            ("CATALOG_NAMES_SQL", CATALOG_NAMES_SQL),
+            ("CANDIDATE_NAMES_SQL", CANDIDATE_NAMES_SQL),
+        ] {
+            assert!(
+                sql.contains("$1::pg_catalog.text::pg_catalog.jsonb"),
+                "{label} must bind JSON as text and cast to jsonb on the server"
+            );
+        }
     }
 
     #[test]

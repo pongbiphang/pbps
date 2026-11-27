@@ -2510,6 +2510,14 @@ impl Dialect for Postgres {
         Some(emit::owned_sequence(table, column, sequence).name)
     }
 
+    fn unnamed_primary_key_name(&self, table: &TableName) -> Option<String> {
+        Some(generated_name(&table.name, None, "pkey"))
+    }
+
+    fn identity_sequence_name(&self, table: &TableName, column: &str) -> Option<String> {
+        Some(generated_name(&table.name, Some(column), "seq"))
+    }
+
     /// Every relation with a row type and every user type brings an auto-named
     /// array type in the same schema: `_<name>` clipped to 63 bytes when free
     /// (`makeArrayTypeName`).

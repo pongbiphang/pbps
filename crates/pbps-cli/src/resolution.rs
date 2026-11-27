@@ -1381,7 +1381,8 @@ mod tests {
                 "t".into(),
                 pbps_model::resolver::CatalogName::Clear,
             )]),
-            companion_types: Default::default(),
+            engine_named_relations: Default::default(),
+            candidate_names: Default::default(),
         };
         let (ok_facts, no_note) = unwrap_dependency_facts(Ok(Some(good_facts)));
         assert!(no_note.is_none());
