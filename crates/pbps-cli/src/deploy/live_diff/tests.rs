@@ -263,3 +263,102 @@ fn the_text_report_escapes_what_it_prints_and_is_empty_for_none() {
     assert!(report.contains("declared: id > 0\n"), "{report}");
     assert!(!report.contains('\u{1b}'), "{report:?}");
 }
+
+/// A declared module the read could not express (an encrypted procedure, say)
+/// stands in the database: it is reported as not compared, never as a create.
+#[test]
+fn a_declared_module_the_read_could_not_express_is_no_create() {
+    let id: ModuleId = "app.v".parse().unwrap();
+    let other: ModuleId = "app.w".parse().unwrap();
+    let mut declared = one_table(&["id"]);
+    declared
+        .modules
+        .insert(id.clone(), view("SELECT id FROM app.t"));
+    let unreadable = [(
+        pbps_db::catalog::LimitationTarget::module(id.clone()),
+        "view app.v (encrypted)".to_owned(),
+    )];
+    let found = compared(
+        &without_the_unreadable(&declared, &unreadable),
+        &one_table(&["id"]),
+    );
+    assert!(found.changes.is_empty(), "{:?}", found.changes);
+
+    // Negative: a declared module the database lacks, and that the read did
+    // not leave out, is still a create.
+    declared
+        .modules
+        .insert(other.clone(), view("SELECT 1 AS one"));
+    let found = compared(
+        &without_the_unreadable(&declared, &unreadable),
+        &one_table(&["id"]),
+    );
+    let [only] = found.changes.changes.as_slice() else {
+        panic!("one change, got {:?}", found.changes);
+    };
+    assert!(
+        matches!(&only.change, Change::Module(pbps_model::change::ModuleChange::CreateModule { id: created, .. }) if *created == other),
+        "{only:?}"
+    );
+    // Negative: an unreadable module nobody declared sets nothing aside.
+    let elsewhere = [(
+        pbps_db::catalog::LimitationTarget::module("app.x".parse().unwrap()),
+        "view app.x (encrypted)".to_owned(),
+    )];
+    assert_eq!(
+        without_the_unreadable(&declared, &elsewhere).modules.len(),
+        2
+    );
+}
+
+fn domain(base: &str, default: Option<&str>) -> pbps_model::ManagedType {
+    pbps_model::ManagedType::Domain {
+        base: base.parse().unwrap(),
+        not_null: false,
+        default: default.map(str::to_owned),
+        checks: Default::default(),
+        collation: None,
+    }
+}
+
+/// `app.base` and `app.derived` over it, with the derived domain's default.
+fn domains(base_default: Option<&str>, derived_default: Option<&str>) -> Schema {
+    let mut schema = Schema::default();
+    schema
+        .types
+        .insert("app.base".parse().unwrap(), domain("integer", base_default));
+    schema.types.insert(
+        "app.derived".parse().unwrap(),
+        domain("app.base", derived_default),
+    );
+    schema
+}
+
+fn compared_on_postgres(declared: &Schema, live: &Schema) -> Compared {
+    compare(
+        declared,
+        &Hints::default(),
+        &scope_ids(declared, &IdsFile::default()),
+        live,
+        None,
+        &pbps_pg::Postgres::new(),
+    )
+}
+
+/// With no record, a derived domain's default is taken for the engine's copy
+/// of its base's only when it equals the base's: any other is compared.
+#[test]
+fn a_derived_domain_default_is_a_difference_unless_it_is_the_base_default() {
+    let declared = domains(Some("1"), None);
+    // The copy the engine made at creation: no difference.
+    let found = compared_on_postgres(&declared, &domains(Some("1"), Some("1")));
+    assert!(found.changes.is_empty(), "{:?}", found.changes);
+    assert_eq!(found.text_differences, []);
+
+    // A default of the domain's own is the database's, and differs.
+    let found = compared_on_postgres(&declared, &domains(Some("1"), Some("99")));
+    assert_eq!(found.changes.changes.len(), 1, "{:?}", found.changes);
+    // Negative: a base with no default explains no default of the derived one.
+    let found = compared_on_postgres(&domains(None, None), &domains(None, Some("5")));
+    assert_eq!(found.changes.changes.len(), 1, "{:?}", found.changes);
+}

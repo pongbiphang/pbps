@@ -212,6 +212,14 @@ direction. It never reads `__pbps_state`, takes no lock and writes nothing.
   expression grammar, and a wrong "equal" here would hide a real difference.
   Both lists count as findings, since the command cannot tell a respelling
   from a changed rule.
+- **No record, so no recorded projection.** The overlay takes a derived
+  domain's DEFAULT, when its declaration omits one, for the copy the engine
+  made of its base's at creation (DEC-2537.1). Without a record, only a
+  default equal to the base domain's own is taken for that copy; any other is
+  compared.
+- **What the read left out is no difference.** A declared module the read
+  could not express (an encrypted procedure) is set aside before the
+  comparison and reported as `diff.not-compared`, never as a create.
 - **Declaration problems are exit 1.** Exit 2 means the database differs;
   declarations that do not load leave the question unanswered.
 - **Outside the comparison:** roles, grants, row security and declared rows.

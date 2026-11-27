@@ -155,8 +155,9 @@ pub fn cmd_live_diff(project: &Project, target: &Target, json: bool) -> anyhow::
         }
     };
 
+    let declared = without_the_unreadable(&loaded.schema, &managed.unreadable);
     let mut compared = compare(
-        &loaded.schema,
+        &declared,
         &loaded.hints,
         &scope,
         &managed.scoped.schema,
@@ -367,6 +368,58 @@ fn without_the_parts_not_compared(schema: &mut Schema) {
     }
 }
 
+/// The declarations without the modules the read could not express.
+///
+/// Such a module stands in the database but is absent from the schema read
+/// back, so compared as read it would be a create. The read already says it
+/// was left out (`diff.not-compared`); here it is no difference either way,
+/// as `plan --db` refuses to plan around it (ADR-0002).
+fn without_the_unreadable(
+    declared: &Schema,
+    unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
+) -> Schema {
+    let mut declared = declared.clone();
+    declared.modules.retain(|id, _| {
+        !unreadable
+            .iter()
+            .any(|(target, _)| target.matches_module(id))
+    });
+    declared
+}
+
+/// Puts back a derived domain's DEFAULT that the overlay took for a copy.
+///
+/// The overlay reads an omitted DEFAULT on a derived domain as the copy the
+/// engine made of its base's at creation (DEC-2537.1). That holds for a domain
+/// pbps created and recorded. Here nothing is recorded, so only a default
+/// equal to the base domain's own is taken for that copy; any other one is the
+/// database's, and is compared.
+fn keep_the_defaults_no_base_explains(overlaid: &mut Schema, live: &Schema) {
+    let base_default =
+        |base: &pbps_model::ColumnType| match base.type_ref().and_then(|name| live.types.get(name))
+        {
+            Some(pbps_model::ManagedType::Domain { default, .. }) => default.as_ref(),
+            _ => None,
+        };
+    for (name, definition) in &mut overlaid.types {
+        if let (
+            pbps_model::ManagedType::Domain {
+                base,
+                default: default @ None,
+                ..
+            },
+            Some(pbps_model::ManagedType::Domain {
+                default: Some(stored),
+                ..
+            }),
+        ) = (definition, live.types.get(name))
+            && base_default(base) != Some(stored)
+        {
+            *default = Some(stored.clone());
+        }
+    }
+}
+
 fn compare(
     declared: &Schema,
     hints: &pbps_model::Hints,
@@ -394,7 +447,8 @@ fn compare(
     // Structure first, with every declared text put over the engine's
     // spelling of it wherever the object stands on both sides; compared as
     // read, an unchanged check is dropped and re-added on SQL Server.
-    let overlaid = Declared::from_schema(&declared).overlay(&live);
+    let mut overlaid = Declared::from_schema(&declared).overlay(&live);
+    keep_the_defaults_no_base_explains(&mut overlaid, &live);
     let text_differences = text_differences(
         &Declared::from_schema(&live),
         &Declared::from_schema(&overlaid),
