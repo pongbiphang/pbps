@@ -34,6 +34,7 @@ pub(crate) async fn bootstrap(
         &project,
         Some(session.target()),
         None,
+        false,
         declarations(input),
         crate::dialect(&project)?,
         "pbps-test",

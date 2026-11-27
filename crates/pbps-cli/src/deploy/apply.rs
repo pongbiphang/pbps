@@ -941,6 +941,9 @@ pub(crate) async fn preflight<D: crate::engine::ApplySession>(
             verdict.runs
         );
     }
+    for warning in &verdict.warnings {
+        services::notice(progress, "apply.preflight", format!("warning: {warning}"));
+    }
 
     // A dropped role's members were listed at plan time, and the ledger's
     // checksum cannot see a membership change — membership is each

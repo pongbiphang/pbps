@@ -47,6 +47,19 @@ pub fn detail(record: &Rehearsal) -> RehearsalDetail {
             authorization: None,
             authorization_reason: None,
         },
+        Rehearsal::InProcess {
+            library: _,
+            spelling,
+        } => RehearsalDetail {
+            outcome: "converged",
+            entry: None,
+            scratch: Some("in-process"),
+            image: None,
+            layout: None,
+            spelling: spelling.clone(),
+            authorization: None,
+            authorization_reason: None,
+        },
         Rehearsal::Converged {
             entry,
             scratch,
@@ -83,14 +96,17 @@ pub fn detail(record: &Rehearsal) -> RehearsalDetail {
 
 /// The one line in the plan's summary.
 pub fn line(detail: &RehearsalDetail) -> String {
-    let (Some(entry), Some(scratch), Some(layout)) = (&detail.entry, detail.scratch, detail.layout)
-    else {
+    if detail.outcome == "off" {
         return "off (this plan was not rehearsed)".to_owned();
+    }
+    let mut out = match (&detail.entry, detail.scratch, detail.layout) {
+        (Some(entry), Some(scratch), Some(layout)) => format!(
+            "converged on {} ({scratch} scratch, {layout})",
+            entry.shown()
+        ),
+        (None, Some(scratch), None) => format!("converged ({scratch} scratch)"),
+        _ => return "off (this plan was not rehearsed)".to_owned(),
     };
-    let mut out = format!(
-        "converged on {} ({scratch} scratch, {layout})",
-        entry.shown()
-    );
     if let Some(image) = &detail.image {
         out.push_str(&format!(
             "; image {}, as configured, not verified",

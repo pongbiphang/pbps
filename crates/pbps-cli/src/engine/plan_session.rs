@@ -925,6 +925,39 @@ pub(crate) trait PlanSession: crate::emission::Engine {
     /// has nothing to report.
     async fn maintained_partitions(&self, conn: &mut Conn)
     -> anyhow::Result<Vec<MaintainedParent>>;
+
+    /// What a connected plan does about its rehearsal.
+    fn rehearsal_course(
+        &self,
+        scratch_available: bool,
+        switched_off: bool,
+    ) -> crate::rehearsal::connected::Course {
+        crate::rehearsal::connected::course(scratch_available, switched_off)
+    }
+
+    /// Runs the connected rehearsal and releases any scratch it opened.
+    async fn rehearse_connected(
+        &self,
+        entry: Option<&mut crate::resolution::Entry<'_>>,
+        conn: &mut Conn,
+        target: &crate::db::Target,
+        plan: &crate::rehearsal::connected::Plan<'_, Self>,
+        _on_note: &mut dyn FnMut(String),
+    ) -> anyhow::Result<Option<crate::rehearsal::connected::Verdict>>
+    where
+        Self: pbps_cli::resolver::server::PlanningDialect,
+    {
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        let verdict = crate::rehearsal::connected::run(entry, conn, target, plan).await;
+        let released = entry.finish().await;
+        let verdict = verdict?;
+        if let Err(crate::resolution::Refused::Unanswerable(error)) = released {
+            return Err(error);
+        }
+        Ok(Some(verdict))
+    }
 }
 
 /// The order the `connected_checks` rows of a plan are printed and saved in,

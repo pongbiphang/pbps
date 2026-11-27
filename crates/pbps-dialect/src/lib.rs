@@ -4010,6 +4010,17 @@ pub trait Dialect {
     /// caller (DEC-1916.1). An engine with no session zone ignores it.
     fn transaction_framing(&self, zone: &SessionZone) -> TransactionFraming;
 
+    /// The statements that open, commit and roll back a read-only planning
+    /// transaction in this dialect.
+    ///
+    /// Defaults to [`Dialect::transaction_framing`] so server engines keep
+    /// their exact session pins and isolation level unchanged. SQLite overrides
+    /// this with `BEGIN` (`pbps_sqlite::READ`) rather than `BEGIN IMMEDIATE`,
+    /// holding a consistent read snapshot without taking the write lock.
+    fn read_transaction_framing(&self, zone: &SessionZone) -> TransactionFraming {
+        self.transaction_framing(zone)
+    }
+
     /// The settings a deployment must run under, for a mode that opens no
     /// transaction to carry them.
     ///

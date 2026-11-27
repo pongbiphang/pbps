@@ -36,6 +36,10 @@ pub fn cmd_extend(
     until: &str,
     from: Option<&str>,
 ) -> anyhow::Result<()> {
+    crate::engine::require_command_feature(
+        crate::db::driver_for(project.config.dialect),
+        crate::engine::CommandFeature::Partitions,
+    )?;
     let parent: TableName = table
         .parse()
         .with_context(|| format!("`{table}` is not a table name; write it as `schema.table`"))?;

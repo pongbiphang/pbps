@@ -435,6 +435,14 @@ pub(crate) fn command(
                 return publish(data.finish(), json);
             }
         };
+        if let Ok(project) = pbps_config::Project::discover(&start)
+            && crate::engine::require_owned_test(crate::db::driver_for(project.config.dialect))
+                .is_err()
+        {
+            data.phases[0].elapsed_ms = elapsed(started);
+            let _ = admit(&mut data, project.config.dialect);
+            return publish(data.finish(), json);
+        }
         let (root, manifest) = locate(&start, manifest);
         let root = root.as_path();
         let checked = super::validate_recorded(root, &manifest, &mut data.observed_input);

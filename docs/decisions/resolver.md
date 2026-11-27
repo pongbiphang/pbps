@@ -7146,3 +7146,19 @@ lists, on a partition no change of the plan touches. Refused as before.
 Pinned by `partition_copy_tests.rs` (pbps-pg),
 `an_attached_tables_copies_are_the_attachs_and_an_unrelated_index_is_not`, and
 on 16 and 18 by `support/resolved_attach3075.rs`.
+
+<a id="dec-2950-20"></a>
+
+**DEC-2950.20. A connected SQLite plan is rehearsed in process by default, and the plan records it as its own kind of rehearsal (#2950).** The wiring that DEC-2950.16 left: the course, the hook around the plan's statements, and the record.
+
+- **On by default, with the switches the other engines have.** `plan --db` on a SQLite file copies the database's pages into memory, runs the plan's statements on the copy and compares the result with the declarations, with no resolver entry to select. `--no-rehearse` and an environment's `rehearse: false` turn it off and the plan is sealed as not rehearsed. The other engines rehearse only when a resolver entry is selected, because their scratch is a server someone has to provide; a SQLite scratch costs the user nothing, so asking for it would only leave plans unrehearsed.
+- **The session decides the course and runs it.** `PlanSession::rehearsal_course` and `rehearse_connected` default to what the server engines did, moved and not changed: the course from the selected entry, the run on its scratch, the scratch released before the plan goes on. SQLite's session answers both itself. `plan --db` holds no branch on the engine.
+- **Refused as on the other engines**: a statement the copy refuses (`rehearsal.statement`), a result that differs from the declarations (`rehearsal.structural`), and an object that resolved before the plan and does not after it (`rehearsal.resolution`). An object already broken before the plan, and one that could not be asked before it, are notes.
+- **The record is `Rehearsal::InProcess`**: the library that ran it, and the spelling differences that are the engine's normalization. It is not a `Converged` record with empty fields: that record's entry, image, layout and authorization are what `apply` and `explain` read to say what the scratch was, and an in-process copy has none of them. A record with the library missing is incomplete and the plan is refused.
+- **The plan's fingerprint moves and its number does not** (DEC-2412.3). The number DEC-2950.16 expected to be reserved is not taken. `explain` reports it as `converged (in-process scratch)` through the fields its report already has, so nothing under `schemas/` changes.
+- **`--resolve-with` and `resolve_with:` are refused on SQLite by name**, also with the rehearsal off: there is no resolver to select, and accepting the flag would say one was used.
+
+Rejected:
+- **Rehearsing only when asked.** The plan most likely to break a file, a rename beside a view or a trigger, is the one whose author does not expect to need a rehearsal.
+- **A resolver entry of a new kind for the in-process copy.** It would make the user declare and name something that has no settings, to get what is safe to do always.
+- **Reusing `Converged` with a scratch kind of "in-process".** Every reader of that record would have to learn that its entry and image may be absent.

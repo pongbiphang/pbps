@@ -788,6 +788,132 @@ impl PlanSession for Sqlite {
         let _ = sqlite_conn(conn)?;
         Ok(Vec::new())
     }
+
+    async fn external_role_renames(
+        &self,
+        _conn: &mut Conn,
+        recorded: &IdsFile,
+        declared: &IdsFile,
+    ) -> anyhow::Result<ExternalRoleRenames> {
+        defaults::external_role_renames("SQLite", recorded, declared)
+    }
+
+    fn reconcile_cluster_roles(
+        &self,
+        recorded: &IdsFile,
+        queried: &IdsFile,
+        renames: &BTreeMap<pbps_model::RoleName, pbps_model::RoleName>,
+        _live: &Schema,
+        _expected: &mut Schema,
+    ) -> anyhow::Result<ConnectedCheck> {
+        defaults::cluster_roles("SQLite", recorded, queried, renames)
+    }
+
+    fn rehearsal_course(
+        &self,
+        _scratch_available: bool,
+        switched_off: bool,
+    ) -> crate::rehearsal::connected::Course {
+        crate::rehearsal::connected::course(true, switched_off)
+    }
+
+    /// Runs the plan on an in-memory page copy of the SQLite file (DEC-2950.16).
+    async fn rehearse_connected(
+        &self,
+        _entry: Option<&mut crate::resolution::Entry<'_>>,
+        conn: &mut Conn,
+        _target: &crate::db::Target,
+        plan: &crate::rehearsal::connected::Plan<'_, Self>,
+        on_note: &mut dyn FnMut(String),
+    ) -> anyhow::Result<Option<crate::rehearsal::connected::Verdict>> {
+        use crate::output::Finding;
+        use crate::rehearsal::{Base, Execution, Rejected, connected::Verdict};
+        use pbps_sqlite::rehearsal as sq;
+
+        let c = sqlite_conn(conn)?;
+        let library = format!("SQLite {}", c.version()?);
+        let mut scratch = Conn::Sqlite(Box::new(sq::scratch(c, sq::SCRATCH_LIMIT)?));
+        let before = sq::resolution(sqlite_conn(&mut scratch)?)?;
+        let zone = pbps_model::SessionZone::utc();
+        let statements = crate::rehearsal::all_statements(plan.statements);
+        let base = Base::Target {
+            statements: &[],
+            ids: plan.base.ids,
+            execution: Execution {
+                zone: &zone,
+                transactional: !plan.staged,
+            },
+            roles: None,
+        };
+        let opt_out = "fix the declarations or the plan, or turn the rehearsal off with `rehearse: false` or `--no-rehearse`";
+        let findings = match crate::rehearsal::rehearse_in::<Sqlite>(
+            &mut scratch,
+            None,
+            base,
+            &statements,
+            plan.declared,
+            plan.desired.ids,
+            self,
+            plan.hints,
+        )
+        .await
+        {
+            Ok(findings) => findings,
+            Err(error) => match error.downcast_ref::<Rejected>() {
+                Some(r) => {
+                    return Ok(Some(Verdict::Refused(
+                        Finding::error("rehearsal.statement", r.to_string()).remedy(opt_out),
+                    )));
+                }
+                None => return Err(error.context("the rehearsal could not be completed")),
+            },
+        };
+        if !findings.converged() {
+            let msg = format!(
+                "the plan does not converge on the declarations: after applying it to a copy of the database, the scratch still differs:\n  {}",
+                findings.structural.join("\n  ")
+            );
+            return Ok(Some(Verdict::Refused(
+                Finding::error("rehearsal.structural", msg)
+                    .remedy("fix the declarations or the plan; nothing was written"),
+            )));
+        }
+        let after = sq::resolution(sqlite_conn(&mut scratch)?)?;
+        let renamed = sq::Renamed::of(plan.ordered.changes());
+        for line in before.failing() {
+            on_note(format!(
+                "pre-existing unresolved object on scratch copy: {line}"
+            ));
+        }
+        for line in after.not_compared(&before, &renamed) {
+            on_note(format!(
+                "unresolved object on scratch copy (could not be asked before the plan): {line}"
+            ));
+        }
+        let broken = after.new_since(&before, &renamed);
+        if !broken.is_empty() {
+            let msg = format!(
+                "the plan leaves objects that no longer resolve on the scratch copy:\n  {}",
+                broken.join("\n  ")
+            );
+            return Ok(Some(Verdict::Refused(
+                Finding::error("rehearsal.resolution", msg).remedy(opt_out),
+            )));
+        }
+        let spelling = findings
+            .spelling
+            .iter()
+            .map(|s| pbps_model::Text::from(s.as_str()))
+            .collect();
+        let record = pbps_model::Rehearsal::InProcess {
+            library: pbps_model::Text::from(library),
+            spelling,
+        };
+        Ok(Some(Verdict::Sealed(
+            record,
+            crate::rehearsal::connected::Manifests::new(),
+        )))
+    }
 }
 
 #[cfg(test)]

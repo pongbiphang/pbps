@@ -21,6 +21,25 @@
 
 use super::*;
 
+/// A command or flag feature whose availability is a static fact about the
+/// engine, checked through [`Profile`] before demanding environment variables,
+/// project files or database connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommandFeature {
+    Resolver,
+    TargetAssertions,
+    DevPreview,
+    Roles,
+    Extensions,
+    TextSearch,
+    ExclusionConstraints,
+    Partitions,
+    DeclaredTypes,
+    ManagedData,
+    TableRebuild,
+    DatabaseCreate,
+}
+
 /// One engine's answers to the questions that need no connection.
 ///
 /// A plain value where the fact is a constant, and a `fn` pointer only where
@@ -73,6 +92,18 @@ pub(crate) struct Profile {
     /// What `pbps test` needs of an engine that owns its scratch server, or
     /// `None` where this engine has none (read by [`require_owned_test`]).
     pub owned_test: Option<&'static OwnedTest>,
+    /// Why a command or flag feature is refused early for this engine, or
+    /// `None` when supported (read by [`require_command_feature`]).
+    pub unsupported_command: fn(CommandFeature) -> Option<&'static str>,
+    /// Finding id attached to `ServerLimits::edition.warnings` in `plan --db`.
+    pub preflight_warning_id: &'static str,
+    /// Whether an empty `apply` plan still connects under the lock because
+    /// identity-only or cluster-scoped state outside `plan.changes` may need
+    /// checking (PostgreSQL cluster roles, types, extensions, search).
+    pub checks_empty_plan_under_lock: bool,
+    /// Whether the target's `--db` string is a local file path (carrying no
+    /// secret and shown as given) rather than a server connection string.
+    pub connection_is_path: bool,
 }
 
 /// The profile of the engine `driver` names.
@@ -110,6 +141,10 @@ static MSSQL: Profile = Profile {
     capabilities_unknown_message: mssql_capabilities_unknown_message,
     impact_notes: mssql_impact_notes,
     owned_test: Some(&owned_test::MSSQL),
+    unsupported_command: mssql_unsupported_command,
+    preflight_warning_id: "plan.edition",
+    checks_empty_plan_under_lock: false,
+    connection_is_path: false,
 };
 
 static POSTGRES: Profile = Profile {
@@ -131,6 +166,10 @@ static POSTGRES: Profile = Profile {
     capabilities_unknown_message: postgres_capabilities_unknown_message,
     impact_notes: pbps_pg::impact::notes,
     owned_test: Some(&owned_test::POSTGRES),
+    unsupported_command: postgres_unsupported_command,
+    preflight_warning_id: "plan.edition",
+    checks_empty_plan_under_lock: true,
+    connection_is_path: false,
 };
 
 static SQLITE: Profile = Profile {
@@ -157,7 +196,63 @@ static SQLITE: Profile = Profile {
     capabilities_unknown_message: sqlite_capabilities_unknown_message,
     impact_notes: sqlite_impact_notes,
     owned_test: None,
+    unsupported_command: sqlite_unsupported_command,
+    preflight_warning_id: "plan.version-floor",
+    checks_empty_plan_under_lock: false,
+    connection_is_path: true,
 };
+
+fn mssql_unsupported_command(feature: CommandFeature) -> Option<&'static str> {
+    (feature == CommandFeature::DatabaseCreate).then_some(
+        "SQL Server does not support `--create`: a server's database is created by its administrator",
+    )
+}
+
+fn postgres_unsupported_command(feature: CommandFeature) -> Option<&'static str> {
+    (feature == CommandFeature::DatabaseCreate).then_some(
+        "PostgreSQL does not support `--create`: a server's database is created by its administrator",
+    )
+}
+
+fn sqlite_unsupported_command(feature: CommandFeature) -> Option<&'static str> {
+    match feature {
+        CommandFeature::DatabaseCreate => None,
+        CommandFeature::Resolver => {
+            Some("SQLite has no resolver; remove `--resolve-with` and `resolve_with:`")
+        }
+        CommandFeature::TargetAssertions => Some("SQLite does not support plan target assertions"),
+        CommandFeature::DevPreview => Some(
+            "SQLite does not support `--dev` preview rehearsal; use `pbps plan --db` to rehearse \
+             on an in-process copy, or remove `--dev` and `dev:`",
+        ),
+        CommandFeature::Roles => {
+            Some("SQLite has no database roles, so role rename and drop commands do not apply")
+        }
+        CommandFeature::Extensions => {
+            Some("SQLite has no extensions, so extension commands and flags do not apply")
+        }
+        CommandFeature::TextSearch => Some(
+            "SQLite has no text search configurations or dictionaries, so text search commands \
+             do not apply",
+        ),
+        CommandFeature::ExclusionConstraints => {
+            Some("SQLite has no exclusion constraints, so `drop-exclusion` does not apply")
+        }
+        CommandFeature::Partitions => {
+            Some("SQLite has no partitioned tables, so partition commands and flags do not apply")
+        }
+        CommandFeature::DeclaredTypes => {
+            Some("SQLite has no declared enum or domain types, so type intents do not apply")
+        }
+        CommandFeature::ManagedData => {
+            Some("SQLite does not support managed reference data (`--data`) yet")
+        }
+        CommandFeature::TableRebuild => Some(
+            "SQLite has no partitioned tables, so `rebuild-table` (partitioned-table rewrite) \
+             does not apply",
+        ),
+    }
+}
 
 fn mssql_identity_unread(error: DbError) -> crate::resolution::Refused {
     crate::resolution::Refused::Unanswerable(anyhow::anyhow!(
@@ -419,6 +514,19 @@ mod tests {
             assert_eq!(version_label(driver), facts.version_label);
             assert_eq!(has_resolver(driver), facts.owned_test.is_some());
             assert!(has_resolver(driver));
+            assert_eq!(preflight_warning_id(driver), "plan.edition");
+            assert!(!connection_is_path(driver));
+            assert_eq!(
+                checks_empty_plan_under_lock(driver),
+                driver == Driver::Postgres
+            );
+            assert!(
+                require_command_feature(driver, CommandFeature::DatabaseCreate)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(of(driver).name())
+            );
+            assert!(require_command_feature(driver, CommandFeature::Resolver).is_ok());
             assert_eq!(
                 capabilities_unknown_message(driver, "boom"),
                 (facts.capabilities_unknown_message)("boom")
@@ -488,6 +596,26 @@ mod tests {
         assert_eq!(permission_subject(Driver::Sqlite), "process");
         assert_eq!(version_label(Driver::Sqlite), "library");
         assert!(!has_resolver(Driver::Sqlite));
+        assert_eq!(preflight_warning_id(Driver::Sqlite), "plan.version-floor");
+        assert!(!checks_empty_plan_under_lock(Driver::Sqlite));
+        assert!(connection_is_path(Driver::Sqlite));
+        assert!(require_command_feature(Driver::Sqlite, CommandFeature::DatabaseCreate).is_ok());
+        for feature in [
+            CommandFeature::Resolver,
+            CommandFeature::TargetAssertions,
+            CommandFeature::DevPreview,
+            CommandFeature::Roles,
+            CommandFeature::Extensions,
+            CommandFeature::TextSearch,
+            CommandFeature::ExclusionConstraints,
+            CommandFeature::Partitions,
+            CommandFeature::DeclaredTypes,
+            CommandFeature::ManagedData,
+            CommandFeature::TableRebuild,
+        ] {
+            let err = require_command_feature(Driver::Sqlite, feature).unwrap_err();
+            assert!(err.to_string().contains("SQLite"), "{feature:?}: {err}");
+        }
         assert!(
             unreachable_remedy(Driver::Sqlite).contains("path")
                 && !unreachable_remedy(Driver::Sqlite).contains("firewall")

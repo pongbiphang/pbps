@@ -8,7 +8,6 @@ use crate::deploy::{
 use crate::engine::ApplySession as _;
 use anyhow::{Context as _, bail};
 use pbps_config::Project;
-use pbps_dialect::Dialect as _;
 
 /// Everything `apply` does once it knows which artifact it is holding.
 ///
@@ -83,9 +82,11 @@ pub(in crate::deploy) async fn apply_async(
 
         // A cluster role's rename has no SQL, but its approved identity mapping
         // still has to be checked and recorded. Additions and removal of the last
-        // role need the same check (421). SQL Server keeps its connection-free
-        // empty path; PostgreSQL decides whether the role map moved under the lock.
-        if plan.changes.is_empty() && dialect.manages_roles() {
+        // role need the same check (421). Engines with no cluster-scoped or
+        // identity-only checks outside `plan.changes` (SQL Server, SQLite) keep
+        // the connection-free empty path; PostgreSQL checks under the lock.
+        if plan.changes.is_empty() && !crate::engine::checks_empty_plan_under_lock(target.driver())
+        {
             return Ok(Attempt::Empty);
         }
 

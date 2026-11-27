@@ -1360,6 +1360,7 @@ fn d2a1165_composed_service_futures_stay_below_256_kib() {
                 &project,
                 Some(&target),
                 None,
+                false,
                 declarations(&input),
                 crate::dialect(&project).unwrap(),
                 "measure",

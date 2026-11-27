@@ -48,6 +48,12 @@ pub enum Spec {
 /// The flag wins over the file, as it does for `--db`: a developer trying a
 /// different engine version should not have to edit a committed file to do it.
 pub fn spec(project: &Project, flag: Option<&str>) -> anyhow::Result<Option<Spec>> {
+    if flag.is_some() || project.config.dev.is_some() {
+        crate::engine::require_command_feature(
+            db::driver_for(project.config.dialect),
+            crate::engine::CommandFeature::DevPreview,
+        )?;
+    }
     if let Some(raw) = flag {
         return Ok(Some(parse(raw)));
     }

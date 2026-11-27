@@ -1845,3 +1845,50 @@ fn missing_unknown_or_contradictory_authorization_evidence_is_not_explained() {
         assert_eq!(artifact.explain("json").status.code(), Some(1));
     }
 }
+
+#[test]
+fn an_in_process_rehearsal_is_explained_in_text_and_json_and_empty_library_is_refused() {
+    let record = pbps_model::Rehearsal::InProcess {
+        library: "SQLite 3.54.1".into(),
+        spelling: vec![],
+    };
+    let (text, value) = explained(&rehearsed_plan(record));
+    assert!(
+        text.contains("rehearsal   converged (in-process scratch)\n"),
+        "{text}"
+    );
+    assert_eq!(
+        value["data"]["rehearsal"],
+        serde_json::json!({
+            "outcome": "converged",
+            "scratch": "in-process",
+        })
+    );
+
+    let spelt = pbps_model::Rehearsal::InProcess {
+        library: "SQLite 3.54.1".into(),
+        spelling: vec!["check c on main.t: declared `a > 0`, stored `(a > 0)`".into()],
+    };
+    let (text, value) = explained(&rehearsed_plan(spelt));
+    assert!(
+        text.contains("rehearsal   converged (in-process scratch); 1 spelling difference\n"),
+        "{text}"
+    );
+    assert_eq!(
+        value["data"]["rehearsal"]["spelling"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Negative: an in-process record with an empty library name is refused.
+    let bad = serde_json::to_value(rehearsed_plan(pbps_model::Rehearsal::InProcess {
+        library: "".into(),
+        spelling: vec![],
+    }))
+    .unwrap();
+    let artifact = Artifact::new(&bad);
+    assert_eq!(artifact.explain("text").status.code(), Some(1));
+    assert_eq!(artifact.explain("json").status.code(), Some(1));
+}
