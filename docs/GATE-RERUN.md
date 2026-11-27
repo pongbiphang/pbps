@@ -24,9 +24,11 @@ proof's input digest, and the resume would refuse it. With the flag, `proof`
 sources the proved tree's `scripts/resolver-mssql-fixtures.sh`, as a SQL Server
 shard does, and only the test sees what it exports. It starts two SQL Servers
 and removes both when the proof ends, including a failed or interrupted one. It
-refuses a container that already has one of its names. The defaults are
-`pbps-proofs0-mssql` and `pbps-proofs0-mssql-scratch` on ports 26330 and 26332,
-which are also a default gate's first shard ports. While those are taken, set
+refuses a container that already has one of its names. The default names carry
+the proof's process id, `pbps-proof<pid>-s0-mssql` and
+`pbps-proof<pid>-s0-mssql-scratch`, so two proofs never share a server; the
+default ports are 26330 and 26332, which are also a default gate's first shard
+ports, and a second proof on them fails to start and removes only its own. While those are taken, set
 `PBPS_LIVE_PREFIX`, `PBPS_TEST_PORT` and `PBPS_TEST_MSSQL_SCRATCH_PORT`; none of
 these changes the digest. The flag does not start the Express fixture or any
 PostgreSQL fixture.

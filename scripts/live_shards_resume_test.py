@@ -912,7 +912,10 @@ class ResolverFixtureProofs(Harness):
     """
 
     SCRIPT = "scripts/resolver-mssql-fixtures.sh"
+    # The names a proof takes under an explicit prefix; by default the prefix
+    # carries the proof's process id (`owned`).
     OWNED = ("pbps-proofs0-mssql", "pbps-proofs0-mssql-scratch")
+    DEFAULT_NAME = re.compile(r"pbps-proof([0-9]+)-s0-mssql(-scratch)?")
     OTHER_IMAGE = "example/another-server@sha256:" + "5" * 64
 
     @classmethod
@@ -979,6 +982,14 @@ class ResolverFixtureProofs(Harness):
     def started(self):
         return {c[c.index("--name") + 1]: c[-1] for c in self.docker_calls("run")}
 
+    def assertOwned(self, names):
+        """Both default names of one proof: its process id, shard zero."""
+        matches = [self.DEFAULT_NAME.fullmatch(n) for n in names]
+        self.assertTrue(all(matches), names)
+        self.assertEqual(len(names), 2, names)
+        self.assertEqual(len({m[1] for m in matches}), 1, names)
+        self.assertEqual({bool(m[2]) for m in matches}, {False, True}, names)
+
     def remaining(self):
         return sorted(p.name for p in self.containers.iterdir())
 
@@ -1010,7 +1021,8 @@ class ResolverFixtureProofs(Harness):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             proof = json.loads(path.read_text())
             self.assertEqual((proof["status"], proof["inputs"]), ("ok", manifest["inputs"]))
-            self.assertEqual(self.started(), dict.fromkeys(self.OWNED, self.image))
+            self.assertOwned(set(self.started()))
+            self.assertEqual(set(self.started().values()), {self.image})
             self.assertEqual(self.remaining(), [])
             data["names"][0][label + "_pass"] = str(path)
         evidence.write_text(json.dumps(data))
@@ -1086,7 +1098,7 @@ class ResolverFixtureProofs(Harness):
         result, path = self.proof(env={"FAKE_FAIL": '["a05"]'})
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(json.loads(path.read_text())["status"], "FAILED")
-        self.assertEqual(set(self.started()), set(self.OWNED))
+        self.assertOwned(set(self.started()))
         self.assertEqual(self.remaining(), [])
 
     def test_an_interrupted_proof_removes_its_fixtures_and_records_nothing(self):
@@ -1096,7 +1108,7 @@ class ResolverFixtureProofs(Harness):
                 result, path = self.proof(env={"FAKE_SIGNAL_PARENT": str(int(signum))})
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("fixture run interrupted", result.stderr)
-                self.assertEqual(set(self.started()), set(self.OWNED))
+                self.assertOwned(set(self.started()))
                 self.assertEqual(self.remaining(), [])
                 self.assertFalse(path.exists())
 
@@ -1104,7 +1116,7 @@ class ResolverFixtureProofs(Harness):
         for name in self.OWNED:
             with self.subTest(name=name):
                 (self.containers / name).write_text("another owner")
-                result, path = self.proof()
+                result, path = self.proof(env={"PBPS_LIVE_PREFIX": "pbps-proof"})
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("fixture containers already exist: " + name, result.stderr)
                 self.assertEqual(self.remaining(), [name])
@@ -1112,12 +1124,26 @@ class ResolverFixtureProofs(Harness):
                 self.assertFalse(path.exists())
                 (self.containers / name).unlink()
 
+    def test_a_concurrent_proofs_default_containers_are_neither_reused_nor_removed(self):
+        # Another proof's servers, under the default names its own process id
+        # gives them (draft review round 1).
+        others = ("pbps-proof1-s0-mssql", "pbps-proof1-s0-mssql-scratch")
+        for name in others:
+            (self.containers / name).write_text("another proof")
+        result, path = self.proof()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(path.read_text())["status"], "ok")
+        self.assertOwned(set(self.started()))
+        self.assertFalse(set(self.started()) & set(others))
+        self.assertEqual(self.remaining(), sorted(others))
+        self.assertFalse({c[-1] for c in self.docker_calls("rm")} & set(others))
+
     def test_an_inherited_name_cannot_point_the_proof_at_another_container(self):
         (self.containers / "unrelated").write_text("another owner")
         result, _ = self.proof(env={"NAME": "unrelated"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(set(self.started()), set(self.OWNED))
-        self.assertEqual({c[1] for c in self.docker_calls("exec")}, set(self.OWNED))
+        self.assertOwned(set(self.started()))
+        self.assertEqual({c[1] for c in self.docker_calls("exec")}, set(self.started()))
         self.assertEqual(self.remaining(), ["unrelated"])
 
     def test_caller_chosen_fixture_names_and_ports_do_not_change_the_inputs(self):
