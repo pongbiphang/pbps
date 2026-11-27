@@ -7162,3 +7162,29 @@ Rejected:
 - **Rehearsing only when asked.** The plan most likely to break a file, a rename beside a view or a trigger, is the one whose author does not expect to need a rehearsal.
 - **A resolver entry of a new kind for the in-process copy.** It would make the user declare and name something that has no settings, to get what is safe to do always.
 - **Reusing `Converged` with a scratch kind of "in-process".** Every reader of that record would have to learn that its entry and image may be absent.
+
+<a id="dec-2987-1"></a>
+
+**DEC-2987.1. A kept surface of a plan that moves names is unaffected when the dependencies the engine recorded prove it; everything unproven stays a question.**
+
+DEC-1515.1 answers per plan: one change a name lookup could reach sends every surface the plan does not rebuild to the resolver. It said that narrowing by dependency needs the engine's own reasoning, and that holds for a guess from the text. This entry narrows from what the engine recorded when it created each surface, with the maintainer's agreement on #2987, and only where measurements on PostgreSQL 16 and 18 showed the record to be complete. With no facts every answer is DEC-1515.1's.
+
+A kept surface is `Unaffected` when all of these hold, and `Resolve` otherwise:
+
+- **The plan is of a class the facts describe.** A partition change, a type rebuild, a package arriving, a computed column, a schema's visibility and a relation whose name the engine chooses keep the plan-level answer. The last is an unnamed key's index, an identity column's sequence and a sequence declared without a name: the engine's first choice is not the name it takes when that one is held, so no name can be matched.
+- **No recorded edge points at an object the plan touches, a column of one, or a descendant of one.** Edges are read from every object the surface owns (a view's rewrite rule and its output columns, a default, a constraint, an index, a routine), and a descendant is a table that inherits from, is a partition of, or is typed as the touched object.
+- **No arriving name is the name of anything the surface has an edge on, nor one the engine's own catalog holds.** A dropped object cannot change a binding it is not the target of; an arriving one can, by being found earlier on the path, and a function can be called in column notation, so a column's name counts.
+- **The surface's text mentions no arriving relation or type name.** Three forms bind at creation and record nothing (a cast of an empty array, a type in a JSON `RETURNING` clause, a name read from a string at run time); the first two are words in the text. The scanner is the one the no-resolver path finds its rebuild candidates with.
+
+**Granularity is the relation.** A `MERGE` target records an edge on the table and none on the columns it assigns, and a row-type reference reads every column, so a column change touches its table.
+
+**A body the engine did not bind at creation is unaffected, and reported apart.** A string-bodied or procedural routine has no creation-time binding to move, which is the question the assessment asks. What it finds when it runs is the resolver's documented observation limit, and the assessment's answer carries the reason (`Unparsed`) so a report can count it separately from a proof. Its header (its parameter and return types and its parameter defaults) is bound at creation whatever the body's language, so the facts carry the header's edges and every test applies to them as to a parsed surface's; only the body is left out.
+
+**Absent, empty and unreadable are three answers.** A surface the facts do not cover and one whose read failed stay `Resolve`; a parsed surface with no edges is a fact. An arriving name the catalog was not asked about is not a clear one.
+
+**One classification of changes.** What moves names, what is touched, what arrives and what is excluded are decided in one exhaustive match, so a new kind of change cannot be given one answer and not the others.
+
+Rejected:
+- **Narrowing by column.** It is sound for a view's ordinary reads and wrong for the forms above, and telling them apart is parsing SQL.
+- **Dropping the text test and trusting the edges alone.** The two forms it catches were measured to rebind with no edge.
+- **Sending unparsed bodies to the resolver.** The resolver re-creates a surface and compares what it bound; an unbound body gives it nothing to compare, so the run would cost a scratch and prove nothing.

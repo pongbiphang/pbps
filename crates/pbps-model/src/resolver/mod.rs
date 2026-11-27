@@ -33,3 +33,8 @@ pub use evidence::{
     DependencyShape, EvidenceError, EvidenceHandling, OutsideWrites, PlanAnalysis, Qualification,
     ResolverEvidence, ResolverRuntime, SameInstance, ScratchLayout, ScratchSource, TargetScope,
 };
+
+mod facts;
+pub use facts::{
+    Ancestor, CatalogName, DependencyEdge, DependencyFacts, ReadFact, SurfaceDependencies,
+};
