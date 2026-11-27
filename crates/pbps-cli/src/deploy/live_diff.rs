@@ -120,6 +120,8 @@ pub fn cmd_live_diff(project: &Project, target: &Target, json: bool) -> anyhow::
             &BTreeMap::new(),
             crate::engine::Read::Snapshot,
             CatalogWarnings::for_output(json, &catalog),
+            // No attach rehearsal asks this read about any relation.
+            &BTreeSet::new(),
         )
         .await
         .map_err(|error| Failure::at("environment.unreadable", error))?;
