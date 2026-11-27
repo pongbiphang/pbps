@@ -141,14 +141,7 @@ pub fn assess_with_facts(
     };
     let hooks = Hooks {
         lexis: &lexis,
-        implicit_relations: &|name, table| {
-            dialect
-                .implicit_relation_names(name, table)
-                .into_iter()
-                .map(|r| r.name)
-                .collect()
-        },
-        owned_sequence: &|table, col, seq| dialect.owned_sequence_name(table, col, seq),
+        chooses_a_name: &|name, table| !dialect.implicit_relation_names(name, table).is_empty(),
     };
     assessed_with_facts(
         base,
@@ -180,10 +173,10 @@ struct Hooks<'a> {
     /// The scanner the rebuild candidates are found with; the text test must
     /// read a body as that does.
     lexis: &'a Lexis<'a>,
-    /// The relations the engine creates with a table under names it chooses.
-    implicit_relations: &'a dyn Fn(&TableName, &Table) -> Vec<String>,
-    /// The name of the sequence a column owns, where it can be known.
-    owned_sequence: &'a dyn Fn(&TableName, &str, &OwnedSequence) -> Option<String>,
+    /// Whether the engine creates a relation with this table under a name it
+    /// chooses. Its first choice is not the name it takes when that one is
+    /// held, so such a relation is never matched by name.
+    chooses_a_name: &'a dyn Fn(&TableName, &Table) -> bool,
 }
 
 /// [`assess`], with the engine facts it reads.
@@ -201,8 +194,7 @@ fn assessed_with(
         engine,
         &Hooks {
             lexis: &pbps_model::module::SHARED,
-            implicit_relations: &|_, _| Vec::new(),
-            owned_sequence: &|_, _, _| None,
+            chooses_a_name: &|_, _| false,
         },
         None,
     )
@@ -546,8 +538,7 @@ impl PlanEffects {
             .chain(table.unique.keys())
             .chain(table.exclude.keys())
             .chain(table.primary_key.as_ref().and_then(|pk| pk.name.as_ref()))
-            .map(|n| n.raw().to_owned())
-            .chain((hooks.implicit_relations)(table_name, table));
+            .map(|n| n.raw().to_owned());
         for name in names {
             let rel = ObjectName::new(&table_name.schema, name);
             if arriving {
@@ -556,10 +547,15 @@ impl PlanEffects {
                 self.touched_relations.insert(rel);
             }
         }
-        // A sequence a column owns under a declared name is a relation the
-        // table brings or takes with it, and no implicit name.
-        for (column, spec) in &table.columns {
-            self.record_column_sequence(table_name, column, spec, hooks, arriving);
+        self.exclude_narrowing |= (hooks.chooses_a_name)(table_name, table)
+            || table
+                .primary_key
+                .as_ref()
+                .is_some_and(|pk| pk.name.is_none());
+        // A sequence a column owns is a relation the table brings or takes
+        // with it.
+        for spec in table.columns.values() {
+            self.record_column_sequence(table_name, spec, arriving);
         }
     }
 
@@ -575,33 +571,30 @@ impl PlanEffects {
         }
     }
 
+    /// A sequence the column owns under a declared name is touched or
+    /// arrives with it. One the engine names (an identity column's, or a
+    /// sequence declared without a name) may take another name than its first
+    /// choice, so it is matched by none and the facts are not used.
     fn record_column_sequence(
         &mut self,
         table: &TableName,
-        name: &pbps_model::ColumnName,
         column: &pbps_model::Column,
-        hooks: &Hooks<'_>,
         arriving: bool,
     ) {
-        let names = match &column.value_source {
-            ValueSource::Sequence(seq) => (hooks.owned_sequence)(table, name.raw(), seq)
-                .into_iter()
-                .collect::<Vec<_>>(),
-            ValueSource::Identity(_) => {
-                let mut one = Table::default();
-                one.columns.insert(name.clone(), column.clone());
-                (hooks.implicit_relations)(table, &one)
-            }
+        let declared = match &column.value_source {
+            ValueSource::Sequence(OwnedSequence { name, .. }) => name.as_deref(),
+            ValueSource::Identity(_) => None,
             ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => return,
         };
-        self.exclude_narrowing |= names.is_empty();
-        for s in names {
-            let sequence = ObjectName::new(&table.schema, s);
-            if arriving {
-                self.arrive_rel_or_type(sequence);
-            } else {
-                self.touched_relations.insert(sequence);
-            }
+        let Some(declared) = declared else {
+            self.exclude_narrowing = true;
+            return;
+        };
+        let sequence = ObjectName::new(&table.schema, declared);
+        if arriving {
+            self.arrive_rel_or_type(sequence);
+        } else {
+            self.touched_relations.insert(sequence);
         }
     }
 
@@ -720,16 +713,11 @@ impl PlanEffects {
             // A column change touches its table, not the column: a statement
             // can bind a table's columns and record an edge on the table only
             // (a `MERGE` target), and a row-type reference reads every column.
-            Change::Column(ColumnChange::AddColumn {
-                table,
-                name,
-                column,
-                ..
-            }) => {
+            Change::Column(ColumnChange::AddColumn { table, column, .. }) => {
                 self.moves_bindings = true;
                 self.touched_relations.insert(table.clone());
                 if engine.indexes_are_relations {
-                    self.record_column_sequence(table, name, column, hooks, true);
+                    self.record_column_sequence(table, column, true);
                 }
             }
             Change::Column(ColumnChange::DropColumn { column, .. }) => {
@@ -743,7 +731,7 @@ impl PlanEffects {
                         .get(&column.table)
                         .and_then(|t| t.columns.get(&column.name))
                 {
-                    self.record_column_sequence(&column.table, &column.name, spec, hooks, false);
+                    self.record_column_sequence(&column.table, spec, false);
                 }
             }
             Change::Column(ColumnChange::AlterColumnType { column, .. }) => {
@@ -2802,8 +2790,7 @@ mod dependency_facts_tests {
         };
         let hooks = Hooks {
             lexis: &lexis,
-            implicit_relations: &|_, _| Vec::new(),
-            owned_sequence: &|_, _, _| None,
+            chooses_a_name: &|_, _| false,
         };
 
         let drop_ix = ChangeSet {
@@ -2849,14 +2836,20 @@ mod dependency_facts_tests {
     /// A sequence a column owns is a relation the column and its table bring
     /// and take with them: a surface with an edge on it is not proven when the
     /// column or the table is dropped, nor when a table arrives with one of
-    /// that name. Negative: with a name the dialect cannot say, nothing is.
+    /// that name. Negative: a sequence the engine names, and a table with a
+    /// relation the engine names, are matched by no name, so nothing is
+    /// proven.
     #[test]
     fn an_owned_sequence_is_touched_and_arrives_with_its_column_and_table() {
-        let serial = || {
+        let owning = |name: Option<&str>| {
             let mut column = Column::new("int".parse().unwrap());
-            column.value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+            column.value_source = ValueSource::Sequence(pbps_model::OwnedSequence {
+                name: name.map(str::to_owned),
+                ..pbps_model::OwnedSequence::serial()
+            });
             column
         };
+        let serial = || owning(Some("t_n_seq"));
         let mut schema = two_table_schema();
         let t: TableName = "app.t".parse().unwrap();
         schema
@@ -2865,11 +2858,6 @@ mod dependency_facts_tests {
             .unwrap()
             .columns
             .insert("n".into(), serial());
-        let base_ids = resolve_ids(&schema, &IdsFile::default());
-        let side = crate::Side {
-            schema: &schema,
-            ids: &base_ids,
-        };
         let facts = DependencyFacts {
             surfaces: BTreeMap::from([
                 (
@@ -2895,16 +2883,12 @@ mod dependency_facts_tests {
             normalize: &normalize,
             filter_binds: true,
         };
-        let named = |table: &TableName, column: &str, _: &pbps_model::OwnedSequence| {
-            Some(format!("{}_{column}_seq", table.name))
-        };
-        let unnamed = |_: &TableName, _: &str, _: &pbps_model::OwnedSequence| None;
-        let assessed = |changes: Vec<Change>,
-                        owned_sequence: &dyn Fn(
-            &TableName,
-            &str,
-            &pbps_model::OwnedSequence,
-        ) -> Option<String>| {
+        let assessed = |base: &Schema, changes: Vec<Change>, chooses_a_name: bool| {
+            let ids = resolve_ids(base, &IdsFile::default());
+            let side = crate::Side {
+                schema: base,
+                ids: &ids,
+            };
             assessed_with_facts(
                 side,
                 side,
@@ -2914,8 +2898,7 @@ mod dependency_facts_tests {
                 &eng,
                 &Hooks {
                     lexis: &pbps_model::module::SHARED,
-                    implicit_relations: &|_, _| Vec::new(),
-                    owned_sequence,
+                    chooses_a_name: &|_, _| chooses_a_name,
                 },
                 Some(&facts),
             )
@@ -2951,7 +2934,7 @@ mod dependency_facts_tests {
             ),
         ];
         for (label, changes) in plans {
-            let found = assessed(changes, &named);
+            let found = assessed(&schema, changes, false);
             let (hit, miss) = if label == "drop table" {
                 // `app.u` holds no sequence: its reader is touched by the
                 // drop, and the sequence's reader is proven.
@@ -2971,17 +2954,31 @@ mod dependency_facts_tests {
             );
         }
         // A table holding the sequence takes it when it goes.
-        let found = assessed(
+        let drop_t = || {
             vec![Change::Table(TableChange::DropTable {
                 uid: Uid::generate(UidKind::Table),
                 name: t.clone(),
                 detach_from: None,
-            })],
-            &named,
-        );
+            })]
+        };
+        let found = assessed(&schema, drop_t(), false);
         assert_eq!(found.questions[&module_surface("app.v_t")], Answer::Resolve);
-        // A name the dialect cannot say proves nothing for any surface.
-        let found = assessed(drop_column(), &unnamed);
+        assert_eq!(
+            found.unaffected_reason(&module_surface("app.v_u")),
+            Some(UnaffectedReason::ByDependency)
+        );
+        // A relation the engine names with the table proves nothing.
+        let found = assessed(&schema, drop_t(), true);
+        assert_eq!(found.count(Answer::Unaffected), 0);
+        // Nor does a sequence the engine names.
+        let mut unnamed = schema.clone();
+        unnamed
+            .tables
+            .get_mut(&t)
+            .unwrap()
+            .columns
+            .insert("n".into(), owning(None));
+        let found = assessed(&unnamed, drop_column(), false);
         assert_eq!(found.count(Answer::Unaffected), 0);
     }
 }
