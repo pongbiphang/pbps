@@ -2510,6 +2510,16 @@ impl Dialect for Postgres {
         Some(emit::owned_sequence(table, column, sequence).name)
     }
 
+    /// Every relation with a row type and every user type brings an auto-named
+    /// array type in the same schema: `_<name>` clipped to 63 bytes when free
+    /// (`makeArrayTypeName`).
+    fn companion_type_names(&self, name: &pbps_model::ObjectName) -> Vec<pbps_model::ObjectName> {
+        vec![pbps_model::ObjectName::new(
+            &name.schema,
+            array_type_name(&name.name),
+        )]
+    }
+
     fn owned_sequence_default(
         &self,
         table: &TableName,
@@ -3132,8 +3142,39 @@ pub(crate) fn generated_name(name1: &str, name2: Option<&str>, label: &str) -> S
     out
 }
 
+/// First-choice catalog name PostgreSQL generates for a type or relation's
+/// array type (`makeArrayTypeName`): prepend `_` and clip to `NAMEDATALEN - 1`
+/// (63 bytes) on a UTF-8 character boundary.
+pub(crate) fn array_type_name(name: &str) -> String {
+    const MAX_AFTER_UNDERSCORE: usize = 62;
+    let mut len = name.len().min(MAX_AFTER_UNDERSCORE);
+    while !name.is_char_boundary(len) {
+        len -= 1;
+    }
+    let mut out = String::with_capacity(len + 1);
+    out.push('_');
+    out.push_str(&name[..len]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    /// The array type's first-choice name, as PostgreSQL 16 and 18 made it
+    /// for a 63-byte name and for one whose 63 bytes end inside a character.
+    #[test]
+    fn an_array_type_name_is_clipped_to_the_name_limit_on_a_character_boundary() {
+        assert_eq!(super::array_type_name("t"), "_t");
+        assert_eq!(
+            super::array_type_name(&"a".repeat(63)),
+            format!("_{}", "a".repeat(62))
+        );
+        assert_eq!(
+            super::array_type_name(&"表".repeat(21)),
+            format!("_{}", "表".repeat(20))
+        );
+        assert_ne!(super::array_type_name(&"a".repeat(63)).len(), 64);
+    }
+
     /// A delimited name is one name (#2436): `"Order Details Extended"` is
     /// no reference to `Order Details`. PostgreSQL's `[` is a subscript, so
     /// it delimits nothing and hides nothing.

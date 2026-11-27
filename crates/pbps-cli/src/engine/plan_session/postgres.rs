@@ -1869,6 +1869,14 @@ impl PlanSession for pbps_pg::Postgres {
         )
     }
 
+    async fn dependency_facts(
+        &self,
+        conn: &mut Conn,
+        needed: &pbps_diff::resolver::FactsNeeded,
+    ) -> Result<Option<pbps_model::resolver::DependencyFacts>, DbError> {
+        pbps_pg::resolver::facts::read(conn, needed).await.map(Some)
+    }
+
     fn refuse_occupied_relation_names(
         &self,
         changes: &ChangeSet,

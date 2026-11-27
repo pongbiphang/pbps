@@ -8,7 +8,8 @@ use super::prepare::{forward, invalidates, surfaces};
 use pbps_model::module::Lexis;
 use pbps_model::part_effects::PartEffect;
 use pbps_model::resolver::{
-    Ancestor, CatalogName, DependencyEdge, DependencyFacts, ReadFact, Surface, SurfaceDependencies,
+    Ancestor, CatalogName, DependencyEdge, DependencyFacts, NameAvailability, ReadFact, Surface,
+    SurfaceDependencies,
 };
 use pbps_model::{
     Change, ChangeSet, ColumnChange, ConstraintChange, ExtensionChange, GrantChange, GrantTarget,
@@ -106,6 +107,57 @@ pub fn assess(
     assess_with_facts(base, desired, ordinary, dialect, None)
 }
 
+/// What connected catalog facts [`assess_with_facts`] would consume for a plan.
+///
+/// Returned by [`needed_facts`], computed by the same classification pass as
+/// [`assess_with_facts`]. `None` means no surface would be narrowed, so reading
+/// the catalog costs no query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactsNeeded {
+    /// Kept surfaces in their base (target) spelling that are neither rebuilt
+    /// nor answered without facts.
+    pub surfaces: BTreeSet<Surface>,
+    /// Unqualified names arriving in the plan to test against the system
+    /// catalog (including first-choice companion type names).
+    pub arriving_names: BTreeSet<String>,
+    /// First-choice companion type names for arriving relations and types,
+    /// each to be checked free in its schema.
+    pub arriving_companion_types: BTreeSet<ObjectName>,
+}
+
+/// What connected catalog facts [`assess_with_facts`] would consume for
+/// `ordinary` on `base -> desired`, or `None` when no kept surface would be
+/// narrowed (so callers issue no catalog query).
+///
+/// Computed by the same classification pass as [`assess_with_facts`].
+#[must_use]
+pub fn needed_facts(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    ordinary: &ChangeSet,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
+) -> Option<FactsNeeded> {
+    with_dialect(dialect, |engine, hooks| {
+        let classified = classify(base, desired, ordinary, engine, hooks);
+        if !classified.effects.moves_bindings || classified.effects.exclude_narrowing {
+            return None;
+        }
+        let surfaces: BTreeSet<Surface> = classified
+            .kept
+            .into_iter()
+            .filter_map(|(surface, _, rebuilt)| (!rebuilt).then_some(surface))
+            .collect();
+        if surfaces.is_empty() {
+            return None;
+        }
+        Some(FactsNeeded {
+            surfaces,
+            arriving_names: classified.effects.arriving_names,
+            arriving_companion_types: classified.effects.arriving_companion_types,
+        })
+    })
+}
+
 /// [`assess`], narrowed per kept surface by the dependencies the engine
 /// recorded (DEC-2987.1). With no facts every answer is [`assess`]'s.
 ///
@@ -130,6 +182,15 @@ pub fn assess_with_facts(
     dialect: &(impl pbps_dialect::Dialect + ?Sized),
     facts: Option<&DependencyFacts>,
 ) -> Assessment {
+    with_dialect(dialect, |engine, hooks| {
+        assessed_with_facts(base, desired, ordinary, engine, hooks, facts)
+    })
+}
+
+fn with_dialect<R>(
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
+    run: impl FnOnce(&Engine<'_>, &Hooks<'_>) -> R,
+) -> R {
     let lexicon = dialect.lexicon();
     let code_only = |definition: &str| dialect.code_only(definition);
     let lexis = Lexis {
@@ -139,22 +200,21 @@ pub fn assess_with_facts(
         reserved: lexicon.reserved,
         bare_rank: &pbps_model::module::every_schema,
     };
+    let normalize = |definition: &str| dialect.normalize_definition(definition);
+    let chooses_a_name =
+        |name: &TableName, table: &Table| !dialect.implicit_relation_names(name, table).is_empty();
+    let companion_types = |name: &ObjectName| dialect.companion_type_names(name);
+    let engine = Engine {
+        indexes_are_relations: dialect.indexes_share_namespace_with_tables(),
+        normalize: &normalize,
+        filter_binds: dialect.filter_binds_expression(),
+    };
     let hooks = Hooks {
         lexis: &lexis,
-        chooses_a_name: &|name, table| !dialect.implicit_relation_names(name, table).is_empty(),
+        chooses_a_name: &chooses_a_name,
+        companion_types: &companion_types,
     };
-    assessed_with_facts(
-        base,
-        desired,
-        ordinary,
-        &Engine {
-            indexes_are_relations: dialect.indexes_share_namespace_with_tables(),
-            normalize: &|definition| dialect.normalize_definition(definition),
-            filter_binds: dialect.filter_binds_expression(),
-        },
-        &hooks,
-        facts,
-    )
+    run(&engine, &hooks)
 }
 
 /// The engine facts the assessment reads.
@@ -177,6 +237,8 @@ struct Hooks<'a> {
     /// chooses. Its first choice is not the name it takes when that one is
     /// held, so such a relation is never matched by name.
     chooses_a_name: &'a dyn Fn(&TableName, &Table) -> bool,
+    /// First-choice companion type names for an arriving relation or type.
+    companion_types: &'a dyn Fn(&ObjectName) -> Vec<ObjectName>,
 }
 
 /// [`assess`], with the engine facts it reads.
@@ -195,9 +257,51 @@ fn assessed_with(
         &Hooks {
             lexis: &pbps_model::module::SHARED,
             chooses_a_name: &|_, _| false,
+            companion_types: &|_| Vec::new(),
         },
         None,
     )
+}
+
+struct Classified {
+    effects: PlanEffects,
+    /// `(base_surface, kept_surface, rebuilt)` for every kept surface.
+    kept: Vec<(Surface, Surface, bool)>,
+}
+
+fn classify(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    ordinary: &ChangeSet,
+    engine: &Engine<'_>,
+    hooks: &Hooks<'_>,
+) -> Classified {
+    let after = surfaces(desired.schema, engine.filter_binds);
+    let parts: Vec<_> = ordinary
+        .changes
+        .iter()
+        .map(|p| super::part_effects(&p.change))
+        .collect();
+    let effects = PlanEffects::of(ordinary, base, desired, engine, hooks);
+    // Asked once per base surface: indexed once (#1870).
+    let base_names = base.ids.index();
+    let desired_names = desired.ids.index();
+    let mut kept_list = Vec::new();
+    for surface in surfaces(base.schema, engine.filter_binds) {
+        let kept = forward(&surface, &base_names, desired.ids);
+        if !after.contains(&kept) {
+            continue;
+        }
+        let rebuilt = replaced(&surface, &kept, &base_names, &desired_names)
+            || ordinary.changes.iter().zip(&parts).any(|(p, facts)| {
+                recreates(&p.change, facts, &surface, &kept, base, desired, engine)
+            });
+        kept_list.push((surface, kept, rebuilt));
+    }
+    Classified {
+        effects,
+        kept: kept_list,
+    }
 }
 
 fn assessed_with_facts(
@@ -208,32 +312,16 @@ fn assessed_with_facts(
     hooks: &Hooks<'_>,
     facts: Option<&DependencyFacts>,
 ) -> Assessment {
-    let after = surfaces(desired.schema, engine.filter_binds);
-    let parts: Vec<_> = ordinary
-        .changes
-        .iter()
-        .map(|p| super::part_effects(&p.change))
-        .collect();
-    let effects = PlanEffects::of(ordinary, base, desired, engine, hooks);
-    let narrowing = facts.and_then(|f| Narrowing::prepare(f, &effects));
+    let classified = classify(base, desired, ordinary, engine, hooks);
+    let narrowing = facts.and_then(|f| Narrowing::prepare(f, &classified.effects));
     let mut questions = BTreeMap::new();
     let mut unaffected_reasons = BTreeMap::new();
-    // Asked once per base surface: indexed once (#1870).
-    let base_names = base.ids.index();
-    let desired_names = desired.ids.index();
-    for surface in surfaces(base.schema, engine.filter_binds) {
-        let kept = forward(&surface, &base_names, desired.ids);
-        if !after.contains(&kept) {
-            continue;
-        }
-        let (answer, reason) = if replaced(&surface, &kept, &base_names, &desired_names)
-            || ordinary.changes.iter().zip(&parts).any(|(p, facts)| {
-                recreates(&p.change, facts, &surface, &kept, base, desired, engine)
-            }) {
+    for (surface, kept, rebuilt) in classified.kept {
+        let (answer, reason) = if rebuilt {
             (Answer::Rebuild, None)
-        } else if !effects.moves_bindings {
+        } else if !classified.effects.moves_bindings {
             (Answer::Unaffected, Some(UnaffectedReason::NoNameMoved))
-        } else if effects.exclude_narrowing {
+        } else if classified.effects.exclude_narrowing {
             (Answer::Resolve, None)
         } else if let Some(why) = narrowing.as_ref().and_then(|n| {
             n.prove(
@@ -268,12 +356,20 @@ struct Narrowing<'a> {
 
 impl<'a> Narrowing<'a> {
     /// `None` when no surface of this plan can be proven: the ancestor ties
-    /// were not read, or an arriving name is held by the engine's own catalog
-    /// (every surface may call it and no edge says which), or was not asked.
+    /// were not read, an arriving companion type's first choice is held or
+    /// unchecked, or an arriving name is held by the engine's own catalog (or
+    /// was not asked).
     fn prepare(facts: &'a DependencyFacts, effects: &'a PlanEffects) -> Option<Self> {
         let ReadFact::Known(ancestors) = &facts.relation_ancestors else {
             return None;
         };
+        if !effects
+            .arriving_companion_types
+            .iter()
+            .all(|c| matches!(facts.companion_types.get(c), Some(NameAvailability::Free)))
+        {
+            return None;
+        }
         if !effects
             .arriving_names
             .iter()
@@ -312,7 +408,10 @@ impl<'a> Narrowing<'a> {
         };
         let touched = edges.iter().any(|e| match e {
             DependencyEdge::Relation(r) => self.expanded_relations.contains(r),
-            DependencyEdge::Column(c) => self.expanded_relations.contains(&c.table),
+            DependencyEdge::Column(c) => {
+                self.expanded_relations.contains(&c.table)
+                    || self.effects.touched_types.contains(&c.table)
+            }
             DependencyEdge::Routine(r) => self.effects.touched_routines.contains(r),
             DependencyEdge::Type(t) => {
                 self.effects.touched_types.contains(t) || self.expanded_relations.contains(t)
@@ -485,6 +584,8 @@ struct PlanEffects {
     touched_types: BTreeSet<ObjectName>,
     arriving_names: BTreeSet<String>,
     arriving_relations_and_types: BTreeSet<ObjectName>,
+    /// First-choice companion type names for arriving relations and types.
+    arriving_companion_types: BTreeSet<ObjectName>,
 }
 
 fn is_excluded_table(table: &Table) -> bool {
@@ -509,6 +610,15 @@ impl PlanEffects {
     fn arrive_rel_or_type(&mut self, name: ObjectName) {
         self.arriving_names.insert(name.name.clone());
         self.arriving_relations_and_types.insert(name);
+    }
+
+    fn arrive_with_companions(&mut self, name: ObjectName, hooks: &Hooks<'_>) {
+        let companions = (hooks.companion_types)(&name);
+        self.arrive_rel_or_type(name);
+        for comp in companions {
+            self.arrive_rel_or_type(comp.clone());
+            self.arriving_companion_types.insert(comp);
+        }
     }
 
     fn touch_module(&mut self, id: &ModuleId) {
@@ -590,6 +700,8 @@ impl PlanEffects {
         };
         let sequence = ObjectName::new(&table.schema, declared);
         if arriving {
+            // A sequence has no row type an array type is made for
+            // (measured on PostgreSQL 16 and 18), so it brings no companion.
             self.arrive_rel_or_type(sequence);
         } else {
             self.touched_relations.insert(sequence);
@@ -681,7 +793,7 @@ impl PlanEffects {
             }) => {
                 self.moves_bindings = true;
                 self.exclude_narrowing |= beside_default.is_some() || is_excluded_table(table);
-                self.arrive_rel_or_type(name.clone());
+                self.arrive_with_companions(name.clone(), hooks);
                 if engine.indexes_are_relations {
                     self.record_table_relations(name, table, hooks, true);
                 }
@@ -706,7 +818,7 @@ impl PlanEffects {
                     base.schema.tables.get(from).is_some_and(is_excluded_table)
                         || desired.schema.tables.get(to).is_some_and(is_excluded_table);
                 self.touched_relations.insert(from.clone());
-                self.arrive_rel_or_type(to.clone());
+                self.arrive_with_companions(to.clone(), hooks);
                 // A move to another schema carries the table's indexes, keys
                 // and owned sequences with it: each leaves one schema's
                 // namespace and arrives in the other's.
@@ -755,7 +867,7 @@ impl PlanEffects {
             Change::Module(ModuleChange::CreateModule { id, .. }) => {
                 self.moves_bindings = true;
                 match id {
-                    ModuleId::Named(obj) => self.arrive_rel_or_type(obj.clone()),
+                    ModuleId::Named(obj) => self.arrive_with_companions(obj.clone(), hooks),
                     ModuleId::Routine(r) => {
                         self.arriving_names.insert(r.name.name.clone());
                     }
@@ -834,7 +946,7 @@ impl PlanEffects {
             // answer is kept. Beside a change that does move names, its name
             // is one more that arrives or is touched.
             Change::Type(TypeChange::CreateType { name, .. }) => {
-                self.arrive_rel_or_type(ObjectName::new(name.schema(), name.name()));
+                self.arrive_with_companions(ObjectName::new(name.schema(), name.name()), hooks);
             }
             Change::Type(TypeChange::DropType { name, .. }) => {
                 self.touched_types
@@ -843,7 +955,7 @@ impl PlanEffects {
             Change::Type(TypeChange::RenameType { from, to, .. }) => {
                 self.touched_types
                     .insert(ObjectName::new(from.schema(), from.name()));
-                self.arrive_rel_or_type(ObjectName::new(to.schema(), to.name()));
+                self.arrive_with_companions(ObjectName::new(to.schema(), to.name()), hooks);
             }
             // An expression's own definition is its own question; changing it
             // brings no name anywhere. A check's or foreign key's name is a
@@ -1684,6 +1796,19 @@ mod dependency_facts_tests {
             surfaces,
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::new(),
+            companion_types: BTreeMap::new(),
+        }
+    }
+
+    fn plain_hooks<'a>(lexis: &'a Lexis<'a>, chooses_a_name: bool) -> Hooks<'a> {
+        Hooks {
+            lexis,
+            chooses_a_name: if chooses_a_name {
+                &|_, _| true
+            } else {
+                &|_, _| false
+            },
+            companion_types: &|_| Vec::new(),
         }
     }
 
@@ -1904,6 +2029,7 @@ mod dependency_facts_tests {
             surfaces,
             relation_ancestors: ReadFact::Known(ancestors),
             catalog_names: BTreeMap::new(),
+            companion_types: BTreeMap::new(),
         };
 
         let found = run(
@@ -1993,6 +2119,7 @@ mod dependency_facts_tests {
                 BTreeSet::from([Ancestor::Type(comp)]),
             )])),
             catalog_names: BTreeMap::from([("comp_v2".into(), CatalogName::Clear)]),
+            companion_types: BTreeMap::new(),
         };
 
         // Paired with a moving change on an unrelated third table so the plan
@@ -2093,6 +2220,7 @@ mod dependency_facts_tests {
             surfaces: base_surfaces.clone(),
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::from([("note".into(), CatalogName::Clear)]),
+            companion_types: BTreeMap::new(),
         };
         let found = run(
             &schema,
@@ -2118,6 +2246,7 @@ mod dependency_facts_tests {
             surfaces: base_surfaces.clone(),
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::from([("d".into(), CatalogName::Clear)]),
+            companion_types: BTreeMap::new(),
         };
         let found = run(
             &schema,
@@ -2139,6 +2268,7 @@ mod dependency_facts_tests {
             surfaces: base_surfaces.clone(),
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::from([("calc".into(), CatalogName::Clear)]),
+            companion_types: BTreeMap::new(),
         };
         let found = run(
             &schema,
@@ -2171,6 +2301,7 @@ mod dependency_facts_tests {
                 surfaces: base_surfaces.clone(),
                 relation_ancestors: ReadFact::Known(BTreeMap::new()),
                 catalog_names,
+                companion_types: BTreeMap::new(),
             };
             let found = run(
                 &schema,
@@ -2191,6 +2322,7 @@ mod dependency_facts_tests {
             surfaces: base_surfaces,
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::from([("unrelated_helper".into(), CatalogName::Clear)]),
+            companion_types: BTreeMap::new(),
         };
         let found = run(
             &schema,
@@ -2287,6 +2419,7 @@ mod dependency_facts_tests {
                 ("n".into(), CatalogName::Clear),
                 ("dom".into(), CatalogName::Clear),
             ]),
+            companion_types: BTreeMap::new(),
         };
 
         // Relation `early.n` arrives and type `early.dom` arrives.
@@ -2413,6 +2546,7 @@ mod dependency_facts_tests {
             surfaces,
             relation_ancestors: ReadFact::Unreadable,
             catalog_names: BTreeMap::new(),
+            companion_types: BTreeMap::new(),
         };
         let found = run(
             &schema,
@@ -2782,6 +2916,7 @@ mod dependency_facts_tests {
             ]),
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::from([("ix_new".into(), CatalogName::Clear)]),
+            companion_types: BTreeMap::new(),
         };
         let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
         let eng = Engine {
@@ -2798,10 +2933,7 @@ mod dependency_facts_tests {
             reserved: lexicon.reserved,
             bare_rank: &pbps_model::module::every_schema,
         };
-        let hooks = Hooks {
-            lexis: &lexis,
-            chooses_a_name: &|_, _| false,
-        };
+        let hooks = plain_hooks(&lexis, false);
 
         let drop_ix = ChangeSet {
             changes: vec![PlannedChange::new(Change::Index(IndexChange::DropIndex {
@@ -2886,6 +3018,7 @@ mod dependency_facts_tests {
                 ("t".into(), CatalogName::Clear),
                 ("t_n_seq".into(), CatalogName::Clear),
             ]),
+            companion_types: BTreeMap::new(),
         };
         let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
         let eng = Engine {
@@ -2906,10 +3039,7 @@ mod dependency_facts_tests {
                     changes: changes.into_iter().map(PlannedChange::new).collect(),
                 },
                 &eng,
-                &Hooks {
-                    lexis: &pbps_model::module::SHARED,
-                    chooses_a_name: &|_, _| chooses_a_name,
-                },
+                &plain_hooks(&pbps_model::module::SHARED, chooses_a_name),
                 Some(&facts),
             )
         };
@@ -3016,6 +3146,7 @@ mod dependency_facts_tests {
                 ("g".into(), CatalogName::Clear),
                 ("h".into(), CatalogName::Clear),
             ]),
+            companion_types: BTreeMap::new(),
         };
         let arriving = |sig: &str| {
             vec![Change::Module(ModuleChange::CreateModule {
@@ -3106,6 +3237,7 @@ mod dependency_facts_tests {
                 ("t2".into(), CatalogName::Clear),
                 ("s".into(), CatalogName::Clear),
             ]),
+            companion_types: BTreeMap::new(),
         };
         let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
         let eng = Engine {
@@ -3128,10 +3260,7 @@ mod dependency_facts_tests {
                     ))],
                 },
                 &eng,
-                &Hooks {
-                    lexis: &pbps_model::module::SHARED,
-                    chooses_a_name: &|_, _| false,
-                },
+                &plain_hooks(&pbps_model::module::SHARED, false),
                 Some(&facts),
             )
         };
@@ -3150,6 +3279,159 @@ mod dependency_facts_tests {
                 Some(UnaffectedReason::ByDependency),
                 "{surface}"
             );
+        }
+    }
+
+    #[test]
+    fn needed_facts_returns_none_when_no_surface_can_be_narrowed_and_lists_only_asked_surfaces() {
+        let base = two_table_schema();
+        let base_ids = resolve_ids(&base, &IdsFile::default());
+        let side = crate::Side {
+            schema: &base,
+            ids: &base_ids,
+        };
+        // Non-moving plan -> None (no query needed).
+        let grant_only = ChangeSet {
+            changes: vec![PlannedChange::new(Change::Permission(GrantChange::Grant {
+                role: "r".into(),
+                target: GrantTarget::Object("app.t".parse().unwrap()),
+                permissions: BTreeSet::from([Permission::Select]),
+            }))],
+        };
+        assert_eq!(needed_facts(side, side, &grant_only, &MinimalDialect), None);
+
+        // Excluded class -> None.
+        let schema_grant = ChangeSet {
+            changes: vec![PlannedChange::new(Change::Permission(GrantChange::Grant {
+                role: "r".into(),
+                target: GrantTarget::Schema("app".into()),
+                permissions: BTreeSet::from([Permission::Usage]),
+            }))],
+        };
+        assert_eq!(
+            needed_facts(side, side, &schema_grant, &MinimalDialect),
+            None
+        );
+
+        // Moving plan with one rebuilt view and one kept view -> asks only for the kept view.
+        let mut desired = base.clone();
+        desired
+            .modules
+            .insert("app.v_t".parse().unwrap(), view("SELECT id, k FROM app.t"));
+        let desired_ids = resolve_ids(&desired, &base_ids);
+        let desired_side = crate::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        };
+        let ordinary = ChangeSet {
+            changes: vec![
+                PlannedChange::new(add_column("app.t", "extra")),
+                PlannedChange::new(Change::Module(ModuleChange::AlterModule {
+                    id: "app.v_t".parse().unwrap(),
+                    module: Box::new(view("SELECT id, k FROM app.t")),
+                })),
+            ],
+        };
+        let needed = needed_facts(side, desired_side, &ordinary, &MinimalDialect).unwrap();
+        assert_eq!(needed.surfaces, BTreeSet::from([module_surface("app.v_u")]));
+        assert!(needed.arriving_names.is_empty());
+        assert!(needed.arriving_companion_types.is_empty());
+    }
+
+    #[test]
+    fn arriving_companion_type_name_catches_bound_and_text_readers_and_refuses_when_held() {
+        let mut schema = two_table_schema();
+        schema
+            .modules
+            .insert("app.v_arr".parse().unwrap(), view("SELECT 1 AS a"));
+        schema.modules.insert(
+            "app.v_empty_arr".parse().unwrap(),
+            view("SELECT 1 AS a WHERE ARRAY[]::_t[] IS NULL"),
+        );
+        let base_ids = resolve_ids(&schema, &IdsFile::default());
+        let side = crate::Side {
+            schema: &schema,
+            ids: &base_ids,
+        };
+        let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
+        let eng = Engine {
+            indexes_are_relations: true,
+            normalize: &normalize,
+            filter_binds: true,
+        };
+        let companion_types =
+            |name: &ObjectName| vec![ObjectName::new(&name.schema, format!("_{}", name.name))];
+        let hooks = Hooks {
+            lexis: &pbps_model::module::SHARED,
+            chooses_a_name: &|_, _| false,
+            companion_types: &companion_types,
+        };
+        let create = ChangeSet {
+            changes: vec![PlannedChange::new(Change::Table(
+                TableChange::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: "early.t".parse().unwrap(),
+                    table: Box::new(table_with_columns(&["id"])),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            ))],
+        };
+        let companion: ObjectName = "early._t".parse().unwrap();
+        let make_facts = |avail: Option<NameAvailability>| DependencyFacts {
+            surfaces: BTreeMap::from([
+                (
+                    module_surface("app.v_arr"),
+                    parsed([DependencyEdge::Type("late._t".parse().unwrap())]),
+                ),
+                (module_surface("app.v_empty_arr"), parsed([])),
+                (
+                    module_surface("app.v_u"),
+                    parsed([DependencyEdge::Column(
+                        "app.u".parse::<TableName>().unwrap().column("id"),
+                    )]),
+                ),
+                (
+                    module_surface("app.v_t"),
+                    parsed([DependencyEdge::Column(
+                        "app.t".parse::<TableName>().unwrap().column("id"),
+                    )]),
+                ),
+            ]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::from([
+                ("t".into(), CatalogName::Clear),
+                ("_t".into(), CatalogName::Clear),
+            ]),
+            companion_types: avail
+                .map(|a| BTreeMap::from([(companion.clone(), a)]))
+                .unwrap_or_default(),
+        };
+        // First choice `_t` is free: readers of `late._t` and text mentions of `_t`
+        // stay `Resolve`, while unrelated `v_u` is proven `Unaffected`.
+        let free = make_facts(Some(NameAvailability::Free));
+        let found = assessed_with_facts(side, side, &create, &eng, &hooks, Some(&free));
+        assert_eq!(
+            found.questions[&module_surface("app.v_arr")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_empty_arr")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            found.unaffected_reason(&module_surface("app.v_u")),
+            Some(UnaffectedReason::ByDependency)
+        );
+        // Negative: when `_t` is held, unreadable, or unchecked, nothing is narrowed.
+        for bad in [
+            Some(NameAvailability::Held),
+            Some(NameAvailability::Unreadable),
+            None,
+        ] {
+            let f = make_facts(bad);
+            let found = assessed_with_facts(side, side, &create, &eng, &hooks, Some(&f));
+            assert_eq!(found.count(Answer::Unaffected), 0, "{bad:?}");
         }
     }
 }

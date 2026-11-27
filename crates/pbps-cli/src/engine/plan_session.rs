@@ -507,6 +507,18 @@ pub(crate) trait PlanSession: crate::emission::Engine {
         defaults::type_review(self.name(), trusted, pin_routines)
     }
 
+    /// Reads connected catalog dependency facts for the lightweight binding
+    /// assessment (DEC-2987.1). `Ok(None)` means this engine supplies no facts,
+    /// keeping the plan-level answer (DEC-1515.1). Called only when a resolver
+    /// is selected and [`pbps_diff::resolver::needed_facts`] returns `Some`.
+    async fn dependency_facts(
+        &self,
+        _conn: &mut Conn,
+        _needed: &pbps_diff::resolver::FactsNeeded,
+    ) -> Result<Option<pbps_model::resolver::DependencyFacts>, DbError> {
+        Ok(None)
+    }
+
     /// Refuses a name this plan creates that the target already uses outside
     /// what the project records (#316, #320, #323, DEC-316.1). Asked before
     /// anything is checked against the plan, and before the planning

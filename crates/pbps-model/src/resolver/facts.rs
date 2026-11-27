@@ -83,6 +83,16 @@ pub enum CatalogName {
     Unreadable,
 }
 
+/// Whether a companion type's first-choice name is free in its schema before
+/// the plan runs. Absence from [`DependencyFacts::companion_types`] means
+/// unchecked, never [`Self::Free`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NameAvailability {
+    Free,
+    Held,
+    Unreadable,
+}
+
 /// Connected catalog dependency facts for the lightweight binding assessment.
 ///
 /// Deliberately omits `Default` so callers must explicitly record whether
@@ -95,6 +105,9 @@ pub struct DependencyFacts {
     pub relation_ancestors: ReadFact<BTreeMap<ObjectName, BTreeSet<Ancestor>>>,
     /// System-catalog presence for each unqualified name arriving in the plan.
     pub catalog_names: BTreeMap<String, CatalogName>,
+    /// Availability of each arriving companion type's first-choice name in its
+    /// schema. Absence means unchecked, never [`NameAvailability::Free`].
+    pub companion_types: BTreeMap<ObjectName, NameAvailability>,
 }
 
 #[cfg(test)]
@@ -124,6 +137,7 @@ mod tests {
             surfaces,
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::new(),
+            companion_types: BTreeMap::new(),
         };
 
         assert!(!facts.surfaces.contains_key(&absent));
@@ -146,6 +160,9 @@ mod tests {
         assert_ne!(CatalogName::Clear, CatalogName::Held);
         assert_ne!(CatalogName::Clear, CatalogName::Unreadable);
         assert_ne!(CatalogName::Held, CatalogName::Unreadable);
+        assert_ne!(NameAvailability::Free, NameAvailability::Held);
+        assert_ne!(NameAvailability::Free, NameAvailability::Unreadable);
+        assert_ne!(NameAvailability::Held, NameAvailability::Unreadable);
     }
 
     #[test]

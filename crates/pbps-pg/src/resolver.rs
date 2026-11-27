@@ -6,6 +6,7 @@ pub mod compatibility;
 pub mod draft;
 pub mod environment;
 pub mod externals;
+pub mod facts;
 pub mod reconstruct;
 pub mod recovery;
 pub mod scope_witness;

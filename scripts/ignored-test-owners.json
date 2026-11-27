@@ -3550,7 +3550,8 @@
         "drop_requirements2400::requirements_refuse_nulls_query_errors_rls_and_missing_privilege_on_postgres_16",
         "drop_requirements2400::the_drop_lock_covers_partitions_and_blocks_a_writer_through_the_drop_on_postgres_18",
         "drop_requirements2400::the_drop_lock_covers_partitions_and_blocks_a_writer_through_the_drop_on_postgres_16",
-        "drop_requirements2400::requirements_and_conversions_admit_a_function_with_a_built_in_only_body"
+        "drop_requirements2400::requirements_and_conversions_admit_a_function_with_a_built_in_only_body",
+        "dependency_facts2987::differential_dependency_facts_never_answer_unaffected_when_a_surface_rebinds"
       ]
     },
     {

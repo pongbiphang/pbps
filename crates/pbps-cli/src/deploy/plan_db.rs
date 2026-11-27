@@ -880,12 +880,40 @@ pub(super) async fn plan_db_selected(
         // pass and check below, as an ordinary plan does, and is sealed in
         // the order they leave (#1516).
         let mut resolution = None;
-        match crate::resolution::case(
+        // Connected dependency facts (DEC-2987.1): read once, only when a
+        // resolver is selected and the plan has kept surfaces that can be
+        // narrowed. A failed read is never a plan error: it yields no facts
+        // (plan-level answers) and one printed note.
+        let dependency_facts = if resolver_selection.is_some()
+            && let Some(needed) = pbps_diff::resolver::needed_facts(
+                base_side,
+                desired_side,
+                &cs,
+                dialect.as_ref(),
+            ) {
+            let (facts, note) = crate::resolution::unwrap_dependency_facts(
+                dialect.dependency_facts(&mut conn, &needed).await,
+            );
+            if let Some(note) = note {
+                if !json {
+                    eprintln!("note: {}", note.message);
+                }
+                findings.push(note);
+                if json {
+                    carried.clone_from(&findings);
+                }
+            }
+            facts
+        } else {
+            None
+        };
+        match crate::resolution::case_with_facts(
             resolver_selection.as_ref(),
             base_side,
             desired_side,
             &cs,
             dialect.as_ref(),
+            dependency_facts.as_ref(),
         ) {
             crate::resolution::Case::Fallback => {}
             crate::resolution::Case::NotNeeded { assessment } => {

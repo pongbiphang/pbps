@@ -7188,3 +7188,30 @@ Rejected:
 - **Narrowing by column.** It is sound for a view's ordinary reads and wrong for the forms above, and telling them apart is parsing SQL.
 - **Dropping the text test and trusting the edges alone.** The two forms it catches were measured to rebind with no edge.
 - **Sending unparsed bodies to the resolver.** The resolver re-creates a surface and compares what it bound; an unbound body gives it nothing to compare, so the run would cost a scratch and prove nothing.
+
+<a id="dec-2987-2"></a>
+
+**DEC-2987.2. PostgreSQL supplies the facts from one read of its catalog, asked only when a resolver is selected and the plan has a surface they could prove; a failed read costs the narrowing and nothing else.**
+
+DEC-2987.1 decides from facts no engine supplied. This entry is the first engine.
+
+**The differ says what to read.** `needed_facts` runs the classification the assessment runs and returns the kept surfaces that are neither rebuilt nor already answered, and the names that arrive. A plan that moves no name, or is of a class the facts do not describe, returns nothing and no query is sent. The read is of the surfaces asked for, so its cost follows the plan and not the database, except the ancestor ties, which are read whole (a few milliseconds beside twenty thousand relations, measured).
+
+**One snapshot, an empty search path, every catalog name qualified.** The reads share one read-only repeatable-read transaction that is always rolled back, so the edges, the ancestor ties and the name checks describe one moment.
+
+**An edge is read from every object the surface owns.** A view's rewrite rule and its own row (for its output columns), a default's or generated column's expression, a check, an index, a trigger, a routine. A default's edge on its own column, a view's rule on its own view, a routine's on its own language and any surface's on its own schema are how the engine ties an object to its parts, and are left out.
+
+**An edge the facts cannot name makes the whole surface unreadable.** A reference into a temporary schema, into a `pg_` schema other than the engine's own catalog, to a system column, to an operator class, collation, access method or cast that is not the engine's own, to a text-search object, or to anything the read did not expect. The engine's own catalog is left out only because every arriving name is checked against it. A surface the catalog does not hold, or holds twice, is unreadable too, and so is a materialized view until it is measured.
+
+**A routine is parsed when the engine kept its body as a tree.** Otherwise its edges are its header's (argument and result types, parameter defaults), which is what DEC-2987.1 checks for an unparsed body.
+
+**A relation or type brings its array type.** PostgreSQL names it `_` and the name, clipped to the name limit, and takes another name when that one is held. The first choice arrives with the object: it is asked about like any arriving name, and the plan is narrowed only when the catalog shows it free. A rename takes the array type with it (measured), so the renamed name's array type arrives too. A sequence and an index have no array type (measured) and bring none.
+
+**A failed read is not a failed plan.** The statement is sent on the plan's own connection before its planning transaction. If it fails (a role that cannot read a catalog, a timeout), `plan` prints one note, keeps the plan-level answer of DEC-1515.1 and goes on. Other engines supply no facts and are unchanged.
+
+**The merge gate is a differential test on the engine.** For each case it builds a database, reads the facts, assesses, applies the change, then re-creates every kept surface and compares what it bound (its deparsed text under an empty search path, its column types and its recorded dependencies by identity) with what it bound before. No surface answered unaffected by dependency may differ. It runs on the lowest and highest supported PostgreSQL.
+
+Rejected:
+- **Reading every surface's edges once per plan.** Simpler, and the cost would follow the database's size on every plan, including the ones no fact could narrow.
+- **Refusing the plan when the read fails.** The facts only ever remove questions; a plan without them is the plan every user had before.
+- **Deriving the array type's name in the differ.** The clipping rule and the name are the engine's, so the dialect answers.
