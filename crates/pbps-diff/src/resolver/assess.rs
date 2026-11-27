@@ -303,32 +303,30 @@ impl<'a> Narrowing<'a> {
         filter_binds: bool,
         lexis: &Lexis<'_>,
     ) -> Option<UnaffectedReason> {
-        let reason = match self.facts.surfaces.get(base_surface)? {
+        // An unparsed surface's edges are its header's, bound at creation
+        // whatever the body's language, and are checked as a parsed one's.
+        let (edges, reason) = match self.facts.surfaces.get(base_surface)? {
             SurfaceDependencies::Unreadable => return None,
-            SurfaceDependencies::Unparsed => UnaffectedReason::Unparsed,
-            SurfaceDependencies::Parsed(edges) => {
-                let hit = edges.iter().any(|e| match e {
-                    DependencyEdge::Relation(r) => self.expanded_relations.contains(r),
-                    DependencyEdge::Column(c) => self.expanded_relations.contains(&c.table),
-                    DependencyEdge::Routine(r) => self.effects.touched_routines.contains(r),
-                    DependencyEdge::Type(t) => {
-                        self.effects.touched_types.contains(t)
-                            || self.expanded_relations.contains(t)
-                    }
-                }) || self
-                    .effects
-                    .arriving_names
-                    .iter()
-                    .any(|n| edges.iter().any(|e| e.matches_arriving_name(n)));
-                if hit {
-                    return None;
-                }
-                UnaffectedReason::ByDependency
-            }
+            SurfaceDependencies::Unparsed(edges) => (edges, UnaffectedReason::Unparsed),
+            SurfaceDependencies::Parsed(edges) => (edges, UnaffectedReason::ByDependency),
         };
-        // Asked of an unparsed surface too: a routine's header (its parameter
-        // and return types, its parameter defaults) is bound at creation
-        // whatever the body's language, and it is part of the text.
+        let touched = edges.iter().any(|e| match e {
+            DependencyEdge::Relation(r) => self.expanded_relations.contains(r),
+            DependencyEdge::Column(c) => self.expanded_relations.contains(&c.table),
+            DependencyEdge::Routine(r) => self.effects.touched_routines.contains(r),
+            DependencyEdge::Type(t) => {
+                self.effects.touched_types.contains(t) || self.expanded_relations.contains(t)
+            }
+        });
+        let found_first = self
+            .effects
+            .arriving_names
+            .iter()
+            .any(|n| edges.iter().any(|e| e.matches_arriving_name(n)));
+        if touched || found_first {
+            return None;
+        }
+        // Asked of an unparsed surface too: its header is part of the text.
         if !self.effects.arriving_relations_and_types.is_empty() {
             let texts = surface_texts(kept_surface, schema, filter_binds)?;
             if self.effects.arriving_relations_and_types.iter().any(|a| {
@@ -709,6 +707,18 @@ impl PlanEffects {
                         || desired.schema.tables.get(to).is_some_and(is_excluded_table);
                 self.touched_relations.insert(from.clone());
                 self.arrive_rel_or_type(to.clone());
+                // A move to another schema carries the table's indexes, keys
+                // and owned sequences with it: each leaves one schema's
+                // namespace and arrives in the other's.
+                if engine.indexes_are_relations && from.schema != to.schema {
+                    match base.schema.tables.get(from) {
+                        Some(table) => {
+                            self.record_table_relations(from, table, hooks, false);
+                            self.record_table_relations(to, table, hooks, true);
+                        }
+                        None => self.exclude_narrowing = true,
+                    }
+                }
             }
             // A column change touches its table, not the column: a statement
             // can bind a table's columns and record an edge on the table only
@@ -2358,7 +2368,7 @@ mod dependency_facts_tests {
             ),
             (
                 module_surface("app.f_unparsed()"),
-                SurfaceDependencies::Unparsed,
+                SurfaceDependencies::Unparsed(BTreeSet::new()),
             ),
             (module_surface("app.v_empty"), parsed([])),
         ]);
@@ -2430,11 +2440,11 @@ mod dependency_facts_tests {
         let mut facts = clear_facts(BTreeMap::from([
             (
                 module_surface("app.f_plain()"),
-                SurfaceDependencies::Unparsed,
+                SurfaceDependencies::Unparsed(BTreeSet::new()),
             ),
             (
                 module_surface("app.f_returns()"),
-                SurfaceDependencies::Unparsed,
+                SurfaceDependencies::Unparsed(BTreeSet::new()),
             ),
         ]));
         facts
@@ -2980,5 +2990,166 @@ mod dependency_facts_tests {
             .insert("n".into(), owning(None));
         let found = assessed(&unnamed, drop_column(), false);
         assert_eq!(found.count(Answer::Unaffected), 0);
+    }
+
+    /// An unparsed routine's header is bound at creation: its edges are
+    /// checked as a parsed surface's. An arriving overload of a function a
+    /// parameter default calls, and a change to a table a parameter is typed
+    /// by, each leave it a question; an unrelated plan does not.
+    #[test]
+    fn an_unparsed_routine_is_held_by_the_edges_of_its_header() {
+        let mut schema = two_table_schema();
+        schema.modules.insert(
+            "app.f_header()".parse().unwrap(),
+            routine("RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END; $$"),
+        );
+        let facts = DependencyFacts {
+            surfaces: BTreeMap::from([(
+                module_surface("app.f_header()"),
+                SurfaceDependencies::Unparsed(BTreeSet::from([
+                    DependencyEdge::Routine("app.g".parse().unwrap()),
+                    DependencyEdge::Type("app.t".parse().unwrap()),
+                ])),
+            )]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::from([
+                ("g".into(), CatalogName::Clear),
+                ("h".into(), CatalogName::Clear),
+            ]),
+        };
+        let arriving = |sig: &str| {
+            vec![Change::Module(ModuleChange::CreateModule {
+                id: sig.parse().unwrap(),
+                module: Box::new(routine("RETURNS int LANGUAGE sql RETURN 1")),
+            })]
+        };
+        let plans = [
+            (
+                "an overload of the default's function",
+                arriving("early.g(int)"),
+                false,
+            ),
+            (
+                "a column of the parameter's table",
+                vec![add_column("app.t", "extra")],
+                false,
+            ),
+            ("another function", arriving("early.h(int)"), true),
+            (
+                "a column of another table",
+                vec![add_column("app.u", "extra")],
+                true,
+            ),
+        ];
+        for (label, changes, proven) in plans {
+            let found = run(&schema, &schema, changes, Some(&facts));
+            assert_eq!(
+                found.unaffected_reason(&module_surface("app.f_header()")),
+                proven.then_some(UnaffectedReason::Unparsed),
+                "{label}"
+            );
+        }
+    }
+
+    /// A table moved to another schema carries its indexes and owned
+    /// sequences: each leaves the old schema's namespace and arrives in the
+    /// new one's. A surface bound to a relation of that name elsewhere, and
+    /// one bound to the carried relation, stay questions; a rename within a
+    /// schema carries nothing.
+    #[test]
+    fn a_table_moved_to_another_schema_carries_its_relations_with_it() {
+        let mut schema = two_table_schema();
+        let t: TableName = "app.t".parse().unwrap();
+        let mut owning = Column::new("int".parse().unwrap());
+        owning.value_source = ValueSource::Sequence(pbps_model::OwnedSequence {
+            name: Some("s".into()),
+            ..pbps_model::OwnedSequence::serial()
+        });
+        schema
+            .tables
+            .get_mut(&t)
+            .unwrap()
+            .columns
+            .insert("n".into(), owning);
+        for (id, text) in [
+            ("app.v_later", "SELECT 1 AS later"),
+            ("app.v_carried", "SELECT 2 AS carried"),
+            ("app.v_other", "SELECT 3 AS other"),
+        ] {
+            schema.modules.insert(id.parse().unwrap(), view(text));
+        }
+        let base_ids = resolve_ids(&schema, &IdsFile::default());
+        let side = crate::Side {
+            schema: &schema,
+            ids: &base_ids,
+        };
+        let facts = DependencyFacts {
+            surfaces: BTreeMap::from([
+                (
+                    module_surface("app.v_later"),
+                    parsed([DependencyEdge::Relation("late.s".parse().unwrap())]),
+                ),
+                (
+                    module_surface("app.v_carried"),
+                    parsed([DependencyEdge::Relation("app.s".parse().unwrap())]),
+                ),
+                (
+                    module_surface("app.v_other"),
+                    parsed([DependencyEdge::Column(
+                        "app.u".parse::<TableName>().unwrap().column("id"),
+                    )]),
+                ),
+            ]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::from([
+                ("t".into(), CatalogName::Clear),
+                ("t2".into(), CatalogName::Clear),
+                ("s".into(), CatalogName::Clear),
+            ]),
+        };
+        let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
+        let eng = Engine {
+            indexes_are_relations: true,
+            normalize: &normalize,
+            filter_binds: true,
+        };
+        let renamed = |to: &str| {
+            assessed_with_facts(
+                side,
+                side,
+                &ChangeSet {
+                    changes: vec![PlannedChange::new(Change::Table(
+                        TableChange::RenameTable {
+                            uid: Uid::generate(UidKind::Table),
+                            from: t.clone(),
+                            to: to.parse().unwrap(),
+                            defaults: Vec::new(),
+                        },
+                    ))],
+                },
+                &eng,
+                &Hooks {
+                    lexis: &pbps_model::module::SHARED,
+                    chooses_a_name: &|_, _| false,
+                },
+                Some(&facts),
+            )
+        };
+        let moved = renamed("early.t");
+        for surface in ["app.v_later", "app.v_carried"] {
+            assert_eq!(moved.questions[&module_surface(surface)], Answer::Resolve);
+        }
+        assert_eq!(
+            moved.unaffected_reason(&module_surface("app.v_other")),
+            Some(UnaffectedReason::ByDependency)
+        );
+        let within = renamed("app.t2");
+        for surface in ["app.v_later", "app.v_carried", "app.v_other"] {
+            assert_eq!(
+                within.unaffected_reason(&module_surface(surface)),
+                Some(UnaffectedReason::ByDependency),
+                "{surface}"
+            );
+        }
     }
 }

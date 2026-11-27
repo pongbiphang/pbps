@@ -7178,7 +7178,7 @@ A kept surface is `Unaffected` when all of these hold, and `Resolve` otherwise:
 
 **Granularity is the relation.** A `MERGE` target records an edge on the table and none on the columns it assigns, and a row-type reference reads every column, so a column change touches its table.
 
-**A body the engine did not bind at creation is unaffected, and reported apart.** A string-bodied or procedural routine has no creation-time binding to move, which is the question the assessment asks. What it finds when it runs is the resolver's documented observation limit, and the assessment's answer carries the reason (`Unparsed`) so a report can count it separately from a proof. The class, catalog-name and text tests still apply to it: a routine's header (its parameter and return types and its parameter defaults) is bound at creation whatever the body's language, and it is part of the text.
+**A body the engine did not bind at creation is unaffected, and reported apart.** A string-bodied or procedural routine has no creation-time binding to move, which is the question the assessment asks. What it finds when it runs is the resolver's documented observation limit, and the assessment's answer carries the reason (`Unparsed`) so a report can count it separately from a proof. Its header (its parameter and return types and its parameter defaults) is bound at creation whatever the body's language, so the facts carry the header's edges and every test applies to them as to a parsed surface's; only the body is left out.
 
 **Absent, empty and unreadable are three answers.** A surface the facts do not cover and one whose read failed stay `Resolve`; a parsed surface with no edges is a fact. An arriving name the catalog was not asked about is not a clear one.
 

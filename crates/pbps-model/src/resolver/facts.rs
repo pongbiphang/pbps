@@ -18,16 +18,18 @@ pub enum ReadFact<T> {
 
 /// Creation-time dependency record for one kept surface.
 ///
-/// Only [`Self::Parsed`] carries an edge set, so an unparsed or unreadable
-/// surface cannot hold edges. Absence from [`DependencyFacts::surfaces`] means
+/// An unreadable surface cannot hold edges. Absence from [`DependencyFacts::surfaces`] means
 /// "not covered" and is never equivalent to `Parsed(empty)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceDependencies {
     /// The catalog read failed or could not establish completeness.
     Unreadable,
-    /// The body was not parsed or bound at creation time; call-time drift is
-    /// outside creation-time binding and is reported as a known gap.
-    Unparsed,
+    /// The body was not bound at creation, so it has no creation-time
+    /// binding to move; what it finds when it runs is reported as a known
+    /// gap. What the engine did bind is here: the edges of the header (the
+    /// parameter and return types, the parameter defaults), complete as
+    /// [`Self::Parsed`]'s are.
+    Unparsed(BTreeSet<DependencyEdge>),
     /// Parsed and bound at creation time with this complete forward edge set
     /// (gathered across all dependent objects). Empty is a truthful fact.
     Parsed(BTreeSet<DependencyEdge>),
@@ -112,7 +114,10 @@ mod tests {
             covered_empty.clone(),
             SurfaceDependencies::Parsed(BTreeSet::new()),
         );
-        surfaces.insert(unparsed.clone(), SurfaceDependencies::Unparsed);
+        surfaces.insert(
+            unparsed.clone(),
+            SurfaceDependencies::Unparsed(BTreeSet::new()),
+        );
         surfaces.insert(unreadable.clone(), SurfaceDependencies::Unreadable);
 
         let facts = DependencyFacts {
@@ -128,7 +133,7 @@ mod tests {
         );
         assert_eq!(
             facts.surfaces.get(&unparsed),
-            Some(&SurfaceDependencies::Unparsed)
+            Some(&SurfaceDependencies::Unparsed(BTreeSet::new()))
         );
         assert_eq!(
             facts.surfaces.get(&unreadable),
