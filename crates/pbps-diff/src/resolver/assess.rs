@@ -614,8 +614,14 @@ impl PlanEffects {
 
     fn arrive_with_companions(&mut self, name: ObjectName, hooks: &Hooks<'_>) {
         let companions = (hooks.companion_types)(&name);
+        // A first choice two arrivals of one plan both want (two long names
+        // clipped alike, or a type declared under another's companion name)
+        // goes to one of them and the other takes a name nothing here knows.
+        // The catalog cannot say so: neither exists yet.
+        self.exclude_narrowing |= self.arriving_companion_types.contains(&name);
         self.arrive_rel_or_type(name);
         for comp in companions {
+            self.exclude_narrowing |= self.arriving_relations_and_types.contains(&comp);
             self.arrive_rel_or_type(comp.clone());
             self.arriving_companion_types.insert(comp);
         }
@@ -3336,6 +3342,79 @@ mod dependency_facts_tests {
         assert_eq!(needed.surfaces, BTreeSet::from([module_surface("app.v_u")]));
         assert!(needed.arriving_names.is_empty());
         assert!(needed.arriving_companion_types.is_empty());
+    }
+
+    /// Two tables of one plan whose names clip to the same companion name:
+    /// the second takes a fallback the facts cannot name, so nothing is
+    /// narrowed, even with the first choice reported free.
+    #[test]
+    fn two_arrivals_wanting_one_companion_name_are_not_narrowed() {
+        let schema = two_table_schema();
+        let base_ids = resolve_ids(&schema, &IdsFile::default());
+        let side = crate::Side {
+            schema: &schema,
+            ids: &base_ids,
+        };
+        let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
+        let eng = Engine {
+            indexes_are_relations: true,
+            normalize: &normalize,
+            filter_binds: true,
+        };
+        // Every name's companion is its first character, so `ta` and `tb`
+        // want the same one and `x` wants another.
+        let companion_types = |name: &ObjectName| {
+            vec![ObjectName::new(
+                &name.schema,
+                format!("_{}", &name.name[..1]),
+            )]
+        };
+        let hooks = Hooks {
+            lexis: &pbps_model::module::SHARED,
+            chooses_a_name: &|_, _| false,
+            companion_types: &companion_types,
+        };
+        let create = |names: &[&str]| ChangeSet {
+            changes: names
+                .iter()
+                .map(|name| {
+                    PlannedChange::new(Change::Table(TableChange::CreateTable {
+                        uid: Uid::generate(UidKind::Table),
+                        name: name.parse().unwrap(),
+                        table: Box::new(table_with_columns(&["id"])),
+                        beside_default: None,
+                        moves_at_most: None,
+                    }))
+                })
+                .collect(),
+        };
+        let facts = DependencyFacts {
+            surfaces: BTreeMap::from([(
+                module_surface("app.v_u"),
+                parsed([DependencyEdge::Column(
+                    "app.u".parse::<TableName>().unwrap().column("id"),
+                )]),
+            )]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: ["ta", "tb", "x", "_t", "_x"]
+                .into_iter()
+                .map(|n| (n.to_owned(), CatalogName::Clear))
+                .collect(),
+            companion_types: BTreeMap::from([
+                ("early._t".parse().unwrap(), NameAvailability::Free),
+                ("early._x".parse().unwrap(), NameAvailability::Free),
+            ]),
+        };
+        let answer = |names: &[&str]| {
+            assessed_with_facts(side, side, &create(names), &eng, &hooks, Some(&facts)).questions
+                [&module_surface("app.v_u")]
+        };
+        assert_eq!(answer(&["early.ta", "early.x"]), Answer::Unaffected);
+        assert_eq!(answer(&["early.ta", "early.tb"]), Answer::Resolve);
+        // A relation declared under another arrival's companion name, in
+        // either order.
+        assert_eq!(answer(&["early.x", "early._x"]), Answer::Resolve);
+        assert_eq!(answer(&["early._x", "early.x"]), Answer::Resolve);
     }
 
     #[test]
