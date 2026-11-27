@@ -111,6 +111,28 @@ fn ask_the_system(
             why: "the operating system does not let this process write the file".to_owned(),
         });
     }
+    // SQLite also writes the files it already keeps beside the database: a
+    // commit in WAL mode goes to the `-wal` file. Each is asked when it
+    // exists; one that does not is created in the directory, asked above.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let kept = std::path::PathBuf::from(name);
+        match may(&kept, false) {
+            Ok(Some(false)) => gaps.push(PermissionGap {
+                permission: "WRITE",
+                securable: format!("journal file `{}`", shown(&kept)),
+                why: "SQLite writes this file when it commits, and the operating system \
+                      does not let this process write it"
+                    .to_owned(),
+            }),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                asked(&kept, false)?;
+            }
+        }
+    }
     if beside == Some(false) {
         gaps.push(PermissionGap {
             permission: "WRITE",

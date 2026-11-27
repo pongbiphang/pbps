@@ -306,3 +306,63 @@ fn a_platform_that_cannot_be_asked_is_said_and_never_read_as_writable() {
     );
     assert!(matches!(failed, Err(DbError::Refused(_))), "{failed:?}");
 }
+
+#[test]
+fn a_journal_file_kept_beside_the_database_is_asked_when_it_exists() {
+    let path = Path::new("dir").join("app.db");
+    let absent = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    let ends = |p: &Path, suffix: &str| p.to_string_lossy().ends_with(suffix);
+    let journal = |p: &Path| ["-wal", "-shm", "-journal"].iter().any(|s| ends(p, s));
+
+    // A write-ahead log this process may not write is a gap that names it.
+    let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
+    ask_the_system(
+        &path,
+        |p, _| match p {
+            p if ends(p, "-wal") => Ok(Some(false)),
+            p if ends(p, "-shm") || ends(p, "-journal") => absent(),
+            _ => Ok(Some(true)),
+        },
+        &mut gaps,
+        &mut unasked,
+    )
+    .expect("answered");
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert!(gaps[0].securable.contains("app.db-wal"), "{gaps:?}");
+
+    // Negative: no journal file kept is no gap and no error, and a writable
+    // one is no gap.
+    for kept in [None, Some(true)] {
+        let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
+        ask_the_system(
+            &path,
+            |p, _| match (journal(p), kept) {
+                (false, _) => Ok(Some(true)),
+                (true, None) => absent(),
+                (true, answer) => Ok(answer),
+            },
+            &mut gaps,
+            &mut unasked,
+        )
+        .expect("answered");
+        assert!(
+            gaps.is_empty() && unasked.is_empty(),
+            "{gaps:?} {unasked:?}"
+        );
+    }
+
+    // A journal file whose question failed is an error, never an answer.
+    let failed = ask_the_system(
+        &path,
+        |p, _| {
+            if ends(p, "-shm") {
+                Err(std::io::Error::other("no answer"))
+            } else {
+                Ok(Some(true))
+            }
+        },
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    assert!(matches!(failed, Err(DbError::Refused(_))), "{failed:?}");
+}
