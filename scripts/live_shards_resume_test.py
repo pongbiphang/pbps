@@ -1165,6 +1165,30 @@ class ResolverFixtureProofs(Harness):
         self.assertEqual(json.loads(path.read_text())["inputs"],
                          json.loads((before / "manifest.json").read_text())["inputs"])
 
+    def test_a_port_only_the_unused_express_fixture_would_take_is_allowed(self):
+        # The proof starts no Express server, so the Express default port
+        # must not refuse a primary moved onto it (draft review round 3).
+        result, path = self.proof(requires=self.exported(26331, 26332),
+                                  env={"PBPS_TEST_PORT": "26331"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(path.read_text())["status"], "ok")
+        self.assertEqual(self.remaining(), [])
+
+    def test_a_proofs_test_group_is_drained_before_its_leader_is_reaped(self):
+        # Reaping first frees the group id, and the cleanup's signal could
+        # then reach a reused one (draft review round 3).
+        seen = []
+        with self.shards.FixtureRun(()) as fixtures:
+            def settle(process):
+                seen.append(process.returncode)
+                fixtures.settle(process)
+            ran = self.shards.run_tests(
+                [sys.executable, "-c", "print('running 0 tests')"], [],
+                start=fixtures.start, settle=settle)
+            self.assertEqual(seen, [None])
+            self.assertEqual(fixtures.processes, [])
+        self.assertEqual(ran[1], 0)
+
     def test_a_whole_check_proof_refuses_the_resolver_fixtures(self):
         for check_args in (["--cargo-check"], ["--python", "scripts/check-live-fixture.py"]):
             with self.subTest(check_args=check_args):

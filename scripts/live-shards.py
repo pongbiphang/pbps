@@ -90,11 +90,13 @@ def selector(value):
     return index, count
 
 
-def fixture_env(suite, index, source):
+def fixture_env(suite, index, source, kinds=None):
+    """Assign names and ports to the suite's fixtures, or to `kinds` of them only."""
     env = dict(source)
     prefix = env.get("PBPS_LIVE_PREFIX") or "pbps-live"
     low, high = ephemeral_ports()
-    for name, port, kind, default in FIXTURES[suite]:
+    fixtures = [f for f in FIXTURES[suite] if kinds is None or f[2] in kinds]
+    for name, port, kind, default in fixtures:
         base = env.get(name)
         env[name] = f"{base}-s{index}" if base else f"{prefix}s{index}-{kind}"
         if name == "PBPS_TEST_MSSQL_SCRATCH_NAME" and not base:
@@ -104,8 +106,8 @@ def fixture_env(suite, index, source):
         require(0 < int(env[port]) < 65536, "fixture port outside 1..65535")
         require(not low <= int(env[port]) <= high,
                 f"fixture {env[name]}: {port}={env[port]} overlaps host ephemeral range {low}..{high}")
-    require(len({env[n] for n, _, _, _ in FIXTURES[suite]}) == 3, "fixture names collide")
-    require(len({env[p] for _, p, _, _ in FIXTURES[suite]}) == 3, "fixture ports collide")
+    require(len({env[n] for n, _, _, _ in fixtures}) == len(fixtures), "fixture names collide")
+    require(len({env[p] for _, p, _, _ in fixtures}) == len(fixtures), "fixture ports collide")
     return env
 
 
@@ -160,6 +162,11 @@ class FixtureRun:
 
     def run(self, command, **kwargs):
         process = self.start(command, **kwargs)
+        self.settle(process)
+        return process.wait()
+
+    def settle(self, process):
+        """Drain a started group before its leader is reaped."""
         try:
             # Leave the leader waitable until draining starts: its PID still
             # anchors ownership of the group even when only descendants run.
@@ -169,7 +176,6 @@ class FixtureRun:
                 pass  # stop() already drained and reaped this owned group.
         finally:
             self.drain([process])
-        return process.wait()
 
     def stop(self):
         with self.lock:
@@ -620,7 +626,7 @@ def load_resume(previous, tree, inputs, suites, flakes, unregistered=None):
     return proven, failures, waived, manifest
 
 
-def run_tests(command, assigned, *, on_failure=None, env=None, start=subprocess.Popen):
+def run_tests(command, assigned, *, on_failure=None, env=None, start=subprocess.Popen, settle=None):
     reported, summaries, duplicates, headers = {}, [], [], []
     active = False
     started = last = time.monotonic()
@@ -650,6 +656,10 @@ def run_tests(command, assigned, *, on_failure=None, env=None, start=subprocess.
             # Observed failures must reach the existing receipt protocol before
             # the line is forwarded: the proxy can die before its final receipt.
             print(line, end="", flush=True)
+        # An owned group is drained while its leader still holds the group id;
+        # reaping first would let a later signal reach a reused one.
+        if settle is not None:
+            settle(process)
         code = process.wait()
     passed = sum(r["status"] == "ok" for r in reported.values())
     failed = len(reported) - passed
@@ -1295,11 +1305,14 @@ def run_with_resolver_fixtures(command, assigned, source):
     # The runner sets NAME to its own primary before sourcing the script; an
     # inherited one would start, or reuse, a container outside the owned names.
     env.pop("NAME", None)
-    env = fixture_env("mssql", 0, env)
+    # Only the two servers the script starts: an Express port the proof never
+    # uses must not refuse a caller's ports.
+    env = fixture_env("mssql", 0, env, kinds=("mssql", "mssql-scratch"))
     # `set -e` first: a script that cannot be sourced must not reach the test.
     shell = ["bash", "-c", 'set -e; source scripts/resolver-mssql-fixtures.sh; exec "$@"', "resolver-proof"]
     with FixtureRun((env["PBPS_TEST_MSSQL_NAME"], env["PBPS_TEST_MSSQL_SCRATCH_NAME"])) as fixtures:
-        return run_tests([*shell, *command], assigned, env=env, start=fixtures.start)
+        return run_tests([*shell, *command], assigned, env=env, start=fixtures.start,
+                         settle=fixtures.settle)
 
 
 def record_proof(argv):
