@@ -213,30 +213,33 @@ fn readable_steps_supply_both_effect_views() {
 }
 
 #[test]
-fn rewrite_order_is_unchanged_when_an_unread_step_has_no_trigger() {
-    let mut plan = create_then_add_column();
-    plan.logical = vec![drop_check_on_undeclared_table("unknown")];
-    let (_, analysed) = shadow(&plan);
-    assert!(analysed.effects().is_err());
-    let changes = pbps_model::ChangeSet {
-        changes: plan.logical,
+fn rewrite_ordering_refuses_an_unread_step_without_a_trigger() {
+    let plan = create_then_add_column();
+    let order = |changes| {
+        super::before_rewrites(
+            super::propose(pbps_model::ChangeSet { changes }),
+            crate::Side {
+                schema: &plan.before,
+                ids: &plan.before_ids,
+            },
+            crate::Side {
+                schema: &plan.after,
+                ids: &plan.after_ids,
+            },
+            &pbps_dialect::MinimalDialect,
+            &ModuleDeps::new(),
+            None,
+        )
     };
-    let ordered = super::before_rewrites(
-        super::propose(changes.clone()),
-        crate::Side {
-            schema: &plan.before,
-            ids: &plan.before_ids,
-        },
-        crate::Side {
-            schema: &plan.after,
-            ids: &plan.after_ids,
-        },
-        &pbps_dialect::MinimalDialect,
-        &ModuleDeps::new(),
-        None,
-    )
-    .expect("no trigger requires settlement");
-    assert_eq!(ordered.changes().changes, changes.changes);
+    let unchanged = order(plan.logical.clone()).expect("a fully read plan has no trigger");
+    assert_eq!(unchanged.changes().changes, plan.logical);
+
+    let error = order(vec![drop_check_on_undeclared_table("unknown")])
+        .expect_err("an unread step refuses rewrite ordering");
+    assert_eq!(
+        error,
+        "no managed object is recorded under `app.unknown` (before change 0)"
+    );
 }
 
 /// Parent and child tables, the child's key into the parent, both dropped.

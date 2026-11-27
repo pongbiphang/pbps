@@ -1140,6 +1140,10 @@ mod tests {
                 pbps_model::Uid::generate(pbps_model::uid::UidKind::Table),
                 pbps_model::TableName::new("app", "t"),
             );
+            ids.columns.insert(
+                pbps_model::Uid::generate(pbps_model::uid::UidKind::Column),
+                pbps_model::TableName::new("app", "t").column("id"),
+            );
             ids
         };
         let (lowered, _) = lower_from_empty(&pg, &held, &ids, &Default::default()).unwrap();
