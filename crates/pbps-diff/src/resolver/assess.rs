@@ -1,26 +1,26 @@
 //! Lightweight assessment (ADR-0016 §1, DEC-1515.1): which creation-time
 //! binding questions a connected plan raises, answered from the typed plan
-//! alone where that is sound. No SQL is read and no catalog is asked.
+//! alone where that is sound, and per kept surface from the dependencies the
+//! engine recorded where the caller read them (DEC-2987.1). No SQL is parsed
+//! and no catalog is asked here: the facts arrive as data.
 
 use super::prepare::{forward, invalidates, surfaces};
-use pbps_model::ColumnChange;
-use pbps_model::ConstraintChange;
-use pbps_model::GrantChange;
-use pbps_model::IndexChange;
-use pbps_model::ModuleChange;
-use pbps_model::PartitionChange;
-use pbps_model::TableChange;
-use pbps_model::TypeValueChange;
+use pbps_model::module::Lexis;
 use pbps_model::part_effects::PartEffect;
-use pbps_model::resolver::Surface;
-use pbps_model::{Change, ChangeSet, GrantTarget, IdsIndex};
-use std::collections::BTreeMap;
+use pbps_model::resolver::{
+    Ancestor, CatalogName, DependencyEdge, DependencyFacts, ReadFact, Surface, SurfaceDependencies,
+};
+use pbps_model::{
+    Change, ChangeSet, ColumnChange, ConstraintChange, ExtensionChange, GrantChange, GrantTarget,
+    IdsIndex, IndexChange, ModuleChange, ModuleId, ObjectName, OwnedSequence, PartitionChange,
+    PrimaryKey, Schema, Table, TableChange, TableName, TypeChange, TypeValueChange, ValueSource,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One question's answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Answer {
-    /// Nothing in the plan can move what this surface binds: the plan changes
-    /// no name a lookup could reach.
+    /// Nothing in the plan can move what this surface binds.
     Unaffected,
     /// The plan already recreates this surface from its declaration, so its
     /// creation binds afresh whatever the answer would have been.
@@ -29,11 +29,27 @@ pub enum Answer {
     Resolve,
 }
 
+/// Why a kept surface was answered [`Answer::Unaffected`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnaffectedReason {
+    /// The plan changes nothing a name lookup could reach (DEC-1515.1).
+    NoNameMoved,
+    /// The plan moves names, and the dependencies the engine recorded when it
+    /// created this surface show that none of them is one it bound or could
+    /// bind instead (DEC-2987.1).
+    ByDependency,
+    /// The engine did not bind this surface's body when it created it, so
+    /// there is no creation-time binding to move. What the body finds when it
+    /// runs is not this question, and is reported apart (DEC-2987.1).
+    Unparsed,
+}
+
 /// Every surface the target holds that the plan keeps, by its declared
 /// spelling, with its answer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Assessment {
     pub questions: BTreeMap<Surface, Answer>,
+    unaffected_reasons: BTreeMap<Surface, UnaffectedReason>,
 }
 
 impl Assessment {
@@ -47,6 +63,19 @@ impl Assessment {
         self.questions.values().filter(|a| **a == answer).count()
     }
 
+    #[must_use]
+    pub fn unaffected_reason(&self, surface: &Surface) -> Option<UnaffectedReason> {
+        self.unaffected_reasons.get(surface).copied()
+    }
+
+    #[must_use]
+    pub fn count_unaffected(&self, reason: UnaffectedReason) -> usize {
+        self.unaffected_reasons
+            .values()
+            .filter(|r| **r == reason)
+            .count()
+    }
+
     /// The surfaces only an engine can answer, in order.
     pub fn unresolved(&self) -> impl Iterator<Item = &Surface> {
         self.questions
@@ -56,17 +85,17 @@ impl Assessment {
     }
 }
 
-/// Answer each question `ordinary` raises: the plan the differ produced for
-/// `base -> desired`, before any connected pass adds to it.
+/// Answer each question `ordinary` raises for `base -> desired` (DEC-1515.1),
+/// from the typed plan alone.
 ///
 /// Deliberately coarse. A surface is unaffected only when the plan changes
 /// nothing a name lookup could reach anywhere; any such change sends every
 /// surface the plan does not already rebuild to the engine. Narrowing that by
-/// path, dependency or name would need the reasoning ADR-0016 leaves to the
-/// engine — a qualified call, an overload, a column-notation reference or a
-/// relation-namespace arrival each defeats a guess — and a wrong narrowing is
-/// a silent wrong answer, where a wide one costs only a resolver run that the
-/// project asked for by selecting one.
+/// path or by name alone would need the reasoning ADR-0016 leaves to the
+/// engine: a qualified call, an overload, a column-notation reference or a
+/// relation-namespace arrival each defeats a guess, and a wrong narrowing is
+/// a silent wrong answer. [`assess_with_facts`] narrows it only from what the
+/// engine itself recorded.
 #[must_use]
 pub fn assess(
     base: crate::Side<'_>,
@@ -74,7 +103,54 @@ pub fn assess(
     ordinary: &ChangeSet,
     dialect: &(impl pbps_dialect::Dialect + ?Sized),
 ) -> Assessment {
-    assessed_with(
+    assess_with_facts(base, desired, ordinary, dialect, None)
+}
+
+/// [`assess`], narrowed per kept surface by the dependencies the engine
+/// recorded (DEC-2987.1). With no facts every answer is [`assess`]'s.
+///
+/// A kept surface of a plan that moves names is unaffected only when all of
+/// these hold; anything else, and anything unreadable, stays a question:
+///
+/// - the plan is of no class the facts do not describe (partitions, a type
+///   rebuild, a package, a computed column, a schema's visibility, a name the
+///   engine chooses);
+/// - none of its recorded edges points at an object the plan touches, a
+///   column of one, or a descendant of one;
+/// - no arriving name is the name of anything it has an edge on, nor one the
+///   engine's own catalog holds, since an arrival earlier on the path would
+///   be found first;
+/// - its text mentions no arriving relation or type, which covers the forms
+///   that bind and leave no edge.
+#[must_use]
+pub fn assess_with_facts(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    ordinary: &ChangeSet,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
+    facts: Option<&DependencyFacts>,
+) -> Assessment {
+    let lexicon = dialect.lexicon();
+    let code_only = |definition: &str| dialect.code_only(definition);
+    let lexis = Lexis {
+        code_only: &code_only,
+        quoted_identifiers: lexicon.quoted_identifiers,
+        continues_ident: lexicon.identifier_continues,
+        reserved: lexicon.reserved,
+        bare_rank: &pbps_model::module::every_schema,
+    };
+    let hooks = Hooks {
+        lexis: &lexis,
+        implicit_relations: &|name, table| {
+            dialect
+                .implicit_relation_names(name, table)
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        },
+        owned_sequence: &|table, col, seq| dialect.owned_sequence_name(table, col, seq),
+    };
+    assessed_with_facts(
         base,
         desired,
         ordinary,
@@ -83,6 +159,8 @@ pub fn assess(
             normalize: &|definition| dialect.normalize_definition(definition),
             filter_binds: dialect.filter_binds_expression(),
         },
+        &hooks,
+        facts,
     )
 }
 
@@ -97,12 +175,46 @@ struct Engine<'a> {
     filter_binds: bool,
 }
 
+/// What the narrowing asks the dialect: none of it is read without facts.
+struct Hooks<'a> {
+    /// The scanner the rebuild candidates are found with; the text test must
+    /// read a body as that does.
+    lexis: &'a Lexis<'a>,
+    /// The relations the engine creates with a table under names it chooses.
+    implicit_relations: &'a dyn Fn(&TableName, &Table) -> Vec<String>,
+    /// The name of the sequence a column owns, where it can be known.
+    owned_sequence: &'a dyn Fn(&TableName, &str, &OwnedSequence) -> Option<String>,
+}
+
 /// [`assess`], with the engine facts it reads.
+#[cfg(test)]
 fn assessed_with(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
     ordinary: &ChangeSet,
     engine: &Engine<'_>,
+) -> Assessment {
+    assessed_with_facts(
+        base,
+        desired,
+        ordinary,
+        engine,
+        &Hooks {
+            lexis: &pbps_model::module::SHARED,
+            implicit_relations: &|_, _| Vec::new(),
+            owned_sequence: &|_, _, _| None,
+        },
+        None,
+    )
+}
+
+fn assessed_with_facts(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    ordinary: &ChangeSet,
+    engine: &Engine<'_>,
+    hooks: &Hooks<'_>,
+    facts: Option<&DependencyFacts>,
 ) -> Assessment {
     let after = surfaces(desired.schema, engine.filter_binds);
     let parts: Vec<_> = ordinary
@@ -110,11 +222,10 @@ fn assessed_with(
         .iter()
         .map(|p| super::part_effects(&p.change))
         .collect();
-    let moved = ordinary
-        .changes
-        .iter()
-        .any(|p| moves_bindings(&p.change, base, desired, engine));
+    let effects = PlanEffects::of(ordinary, base, desired, engine, hooks);
+    let narrowing = facts.and_then(|f| Narrowing::prepare(f, &effects));
     let mut questions = BTreeMap::new();
+    let mut unaffected_reasons = BTreeMap::new();
     // Asked once per base surface: indexed once (#1870).
     let base_names = base.ids.index();
     let desired_names = desired.ids.index();
@@ -123,19 +234,189 @@ fn assessed_with(
         if !after.contains(&kept) {
             continue;
         }
-        let answer = if replaced(&surface, &kept, &base_names, &desired_names)
+        let (answer, reason) = if replaced(&surface, &kept, &base_names, &desired_names)
             || ordinary.changes.iter().zip(&parts).any(|(p, facts)| {
                 recreates(&p.change, facts, &surface, &kept, base, desired, engine)
             }) {
-            Answer::Rebuild
-        } else if moved {
-            Answer::Resolve
+            (Answer::Rebuild, None)
+        } else if !effects.moves_bindings {
+            (Answer::Unaffected, Some(UnaffectedReason::NoNameMoved))
+        } else if effects.exclude_narrowing {
+            (Answer::Resolve, None)
+        } else if let Some(why) = narrowing.as_ref().and_then(|n| {
+            n.prove(
+                &surface,
+                &kept,
+                desired.schema,
+                engine.filter_binds,
+                hooks.lexis,
+            )
+        }) {
+            (Answer::Unaffected, Some(why))
         } else {
-            Answer::Unaffected
+            (Answer::Resolve, None)
         };
+        if let Some(why) = reason {
+            unaffected_reasons.insert(kept.clone(), why);
+        }
         questions.insert(kept, answer);
     }
-    Assessment { questions }
+    Assessment {
+        questions,
+        unaffected_reasons,
+    }
+}
+
+/// The facts of one plan, once they are known to be usable for it at all.
+struct Narrowing<'a> {
+    facts: &'a DependencyFacts,
+    effects: &'a PlanEffects,
+    expanded_relations: BTreeSet<ObjectName>,
+}
+
+impl<'a> Narrowing<'a> {
+    /// `None` when no surface of this plan can be proven: the ancestor ties
+    /// were not read, or an arriving name is held by the engine's own catalog
+    /// (every surface may call it and no edge says which), or was not asked.
+    fn prepare(facts: &'a DependencyFacts, effects: &'a PlanEffects) -> Option<Self> {
+        let ReadFact::Known(ancestors) = &facts.relation_ancestors else {
+            return None;
+        };
+        if !effects
+            .arriving_names
+            .iter()
+            .all(|n| matches!(facts.catalog_names.get(n), Some(CatalogName::Clear)))
+        {
+            return None;
+        }
+        let expanded_relations = expand_touched_relations(
+            &effects.touched_relations,
+            &effects.touched_types,
+            ancestors,
+        );
+        Some(Self {
+            facts,
+            effects,
+            expanded_relations,
+        })
+    }
+
+    /// Why this kept surface is unaffected, or `None` when it stays a
+    /// question. An absent surface is not covered, which is not "no edges".
+    fn prove(
+        &self,
+        base_surface: &Surface,
+        kept_surface: &Surface,
+        schema: &Schema,
+        filter_binds: bool,
+        lexis: &Lexis<'_>,
+    ) -> Option<UnaffectedReason> {
+        let reason = match self.facts.surfaces.get(base_surface)? {
+            SurfaceDependencies::Unreadable => return None,
+            SurfaceDependencies::Unparsed => UnaffectedReason::Unparsed,
+            SurfaceDependencies::Parsed(edges) => {
+                let hit = edges.iter().any(|e| match e {
+                    DependencyEdge::Relation(r) => self.expanded_relations.contains(r),
+                    DependencyEdge::Column(c) => self.expanded_relations.contains(&c.table),
+                    DependencyEdge::Routine(r) => self.effects.touched_routines.contains(r),
+                    DependencyEdge::Type(t) => {
+                        self.effects.touched_types.contains(t)
+                            || self.expanded_relations.contains(t)
+                    }
+                }) || self
+                    .effects
+                    .arriving_names
+                    .iter()
+                    .any(|n| edges.iter().any(|e| e.matches_arriving_name(n)));
+                if hit {
+                    return None;
+                }
+                UnaffectedReason::ByDependency
+            }
+        };
+        if !self.effects.arriving_relations_and_types.is_empty() {
+            let texts = surface_texts(kept_surface, schema, filter_binds)?;
+            if self.effects.arriving_relations_and_types.iter().any(|a| {
+                texts
+                    .iter()
+                    .any(|t| pbps_model::module::references_with(t, a, lexis))
+            }) {
+                return None;
+            }
+        }
+        Some(reason)
+    }
+}
+
+/// Transitive closure of touched relations through ancestor ties (cycle-safe).
+fn expand_touched_relations(
+    touched_relations: &BTreeSet<ObjectName>,
+    touched_types: &BTreeSet<ObjectName>,
+    ancestors: &BTreeMap<ObjectName, BTreeSet<Ancestor>>,
+) -> BTreeSet<ObjectName> {
+    let mut expanded = touched_relations.clone();
+    loop {
+        let before = expanded.len();
+        for (descendant, parents) in ancestors {
+            if !expanded.contains(descendant)
+                && parents.iter().any(|a| match a {
+                    Ancestor::Relation(r) => expanded.contains(r),
+                    Ancestor::Type(t) => touched_types.contains(t) || expanded.contains(t),
+                })
+            {
+                expanded.insert(descendant.clone());
+            }
+        }
+        if expanded.len() == before {
+            return expanded;
+        }
+    }
+}
+
+/// Expression texts of a kept surface in `schema`, or `None` if absent.
+fn surface_texts<'a>(
+    surface: &Surface,
+    schema: &'a Schema,
+    filter_binds: bool,
+) -> Option<Vec<&'a str>> {
+    match surface {
+        Surface::Module(id) => schema.modules.get(id).map(|m| vec![m.definition.as_str()]),
+        Surface::Default(col) => {
+            let table = schema.tables.get(&col.table)?;
+            if let Some(column) = table.columns.get(&col.name) {
+                match &column.value_source {
+                    ValueSource::Default(e) => return Some(vec![e.as_str()]),
+                    ValueSource::Generated(g) => return Some(vec![g.expression.as_str()]),
+                    ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => {}
+                }
+            }
+            table
+                .partition_of
+                .as_ref()
+                .and_then(|p| p.columns.get(&col.name)?.default.as_deref())
+                .or_else(|| table.computed.get(&col.name).map(|c| c.expression.as_str()))
+                .map(|e| vec![e])
+        }
+        Surface::Check { table, name } => schema
+            .tables
+            .get(table)?
+            .checks
+            .get(name)
+            .map(|c| vec![c.expression.as_str()]),
+        Surface::Index { table, name } => {
+            let index = schema.tables.get(table)?.indexes.get(name)?;
+            let mut texts: Vec<&str> = index
+                .columns
+                .iter()
+                .filter_map(|c| c.key.expression())
+                .collect();
+            if filter_binds && let Some(filter) = index.filter.as_deref() {
+                texts.push(filter);
+            }
+            (!texts.is_empty()).then_some(texts)
+        }
+        Surface::Namespace(_) | Surface::Table(_) | Surface::Column(_) | Surface::Type(_) => None,
+    }
 }
 
 /// Whether the surface found under the same spelling belongs to another table
@@ -199,113 +480,391 @@ fn declared_differently(
     }
 }
 
-/// Whether a change can alter what some name lookup finds: it brings a name
-/// into a namespace, takes one out, changes a type an overload is chosen by,
-/// or changes who may look in a schema. Listed in full, so a new kind of
-/// change is classified here rather than defaulting either way.
-fn moves_bindings(
-    change: &Change,
-    base: crate::Side<'_>,
-    desired: crate::Side<'_>,
-    engine: &Engine<'_>,
-) -> bool {
-    match change {
-Change::Partition(PartitionChange::RebuildPartitionedTable(_)) => true,
-Change::Index(IndexChange::BuildPartitionedIndex(_)) | Change::Partition(PartitionChange::CopyTableRows(_)) | Change::Partition(PartitionChange::AnalyzeTableTree(_)) => false,
-        // Relations, their row types and their columns.
-        Change::Table(TableChange::CreateTable { .. })
-        | Change::Table(TableChange::DropTable { .. })
-        | Change::Table(TableChange::RenameTable { .. })
-        | Change::Column(ColumnChange::AddColumn { .. })
-        | Change::Column(ColumnChange::DropColumn { .. })
-        | Change::Column(ColumnChange::RenameColumn { .. })
-        | Change::Column(ColumnChange::AlterColumnType { .. })
-        | Change::Column(ColumnChange::AddComputedColumn { .. })
-        | Change::Column(ColumnChange::DropComputedColumn { .. })
-        // Renames the clones of its parent's indexes and keys to the
-        // declaration's names, and its table leaves the parent's inheritance;
-        // or, attached, builds whichever of them the table lacks under names
-        // the engine chooses, and its table joins it (#1545). Partitions are
-        // PostgreSQL's alone, where an index's name is a relation's.
-        | Change::Partition(PartitionChange::DetachPartition { .. })
-        | Change::Partition(PartitionChange::AttachPartition { .. })
-        // Creates, renames or drops a sequence, a relation in its schema's
-        // namespace that an unqualified relation lookup on the path finds
-        // (#1889). PostgreSQL's alone.
-        | Change::Column(ColumnChange::AlterColumnNumbering { .. })
-        // A routine's identity, a view's columns, a type's existence. A
-        // rebuild brings a type's temporary name in, moves columns to it and
-        // takes the old one out (DEC-1635.7).
-        | Change::TypeValue(TypeValueChange::EnumRebuild { .. })
-        | Change::Module(ModuleChange::CreateModule { .. })
-        | Change::Module(ModuleChange::DropModule { .. }) => true,
-        // Each creates or drops an index. Where an index's name is a
-        // relation's (PostgreSQL), an unqualified relation lookup on the path
-        // finds it first, and one that bound it, such as a `regclass`
-        // constant, finds another relation once it is gone. Where an index
-        // is named per table (SQL Server), no lookup reaches it.
-        Change::Constraint(ConstraintChange::SetPrimaryKey { .. })
-        | Change::Constraint(ConstraintChange::AddUnique { .. })
-        | Change::Constraint(ConstraintChange::DropUnique { .. })
-        | Change::Constraint(ConstraintChange::SetExclusion { .. })
-        | Change::Index(IndexChange::AddIndex { .. })
-        | Change::Index(IndexChange::DropIndex { .. }) => engine.indexes_are_relations,
-        Change::Module(ModuleChange::AlterModule { id, .. }) => declared_differently(id, base, desired, engine),
-        // A schema the creating role may not use is skipped by the lookup.
-        Change::Permission(GrantChange::Grant { target, .. }) | Change::Permission(GrantChange::Revoke { target, .. }) => {
-            matches!(target, GrantTarget::Schema(_))
+/// Everything the assessment needs from a plan's changes, derived in one
+/// exhaustive pass so binding movement, excluded classes, touched objects, and
+/// arriving names can never disagree.
+#[derive(Default)]
+struct PlanEffects {
+    moves_bindings: bool,
+    exclude_narrowing: bool,
+    touched_relations: BTreeSet<ObjectName>,
+    touched_routines: BTreeSet<ObjectName>,
+    touched_types: BTreeSet<ObjectName>,
+    arriving_names: BTreeSet<String>,
+    arriving_relations_and_types: BTreeSet<ObjectName>,
+}
+
+fn is_excluded_table(table: &Table) -> bool {
+    table.partition_by.is_some() || table.partition_of.is_some() || !table.computed.is_empty()
+}
+
+impl PlanEffects {
+    fn of(
+        ordinary: &ChangeSet,
+        base: crate::Side<'_>,
+        desired: crate::Side<'_>,
+        engine: &Engine<'_>,
+        hooks: &Hooks<'_>,
+    ) -> Self {
+        let mut effects = Self::default();
+        for planned in &ordinary.changes {
+            effects.record(&planned.change, base, desired, engine, hooks);
         }
-        // An expression's own definition is its own question; changing it
-        // brings no name anywhere. A check's or foreign key's name is a
-        // constraint's, which no lookup in an expression reaches.
-        Change::Column(ColumnChange::AlterColumnDefault { .. })
-        | Change::Partition(PartitionChange::SetPartitionDefault { .. })
-        | Change::Column(ColumnChange::AlterColumnExpression { .. })
-        | Change::Constraint(ConstraintChange::AddCheck { .. })
-        | Change::Constraint(ConstraintChange::DropCheck { .. })
-        | Change::Constraint(ConstraintChange::AddForeignKey { .. })
-        | Change::Constraint(ConstraintChange::DropForeignKey { .. })
-        | Change::Column(ColumnChange::AlterColumnNullability { .. })
-        | Change::Column(ColumnChange::SetColumnDeprecated { .. })
-        | Change::TableProperty(_)
-        | Change::Policy(_)
-        | Change::Index(IndexChange::SetIndexStorageParameters { .. })
-        | Change::Partition(PartitionChange::SetPartitionNotNull { .. })
-        | Change::Row(_)
-        | Change::TypeValue(TypeValueChange::AddEnumValue { .. })
-        | Change::TypeValue(TypeValueChange::AlterDomain { .. })
-        | Change::TypeValue(TypeValueChange::RenameEnumValue { .. })
-        // Roles, types, search objects and extensions (catalog family patterns). A role or type moves
-        // no existing lookup. A package create **can**: it may add an operator
-        // or function that matches an argument type better than what the path
-        // found before (measured on 16 and 18: intarray's `@>` on `int[]`; a
-        // stored view, default, check and `BEGIN ATOMIC` body keep their binding,
-        // while later statements and string-bodied or plpgsql routines bind the
-        // package's operator at call time; citext adds nothing that rebinds).
-        // DEC-1515.1's rule would make that `true`, and it stays `false` on
-        // purpose: `true` sends every kept surface to a resolver that cannot
-        // describe a package the target lacks, and `resolution::resolve`
-        // refuses that by name. So the assessment's "unaffected" count does not
-        // cover a create; answering it soundly needs the resolver to hold the
-        // package (DEC-2447.6, a later slice). Do not "fix" this to `true`.
-        //
-        // A package **drop** is the same answer for the same reason, and one
-        // measured more: `true` sent every kept surface to a resolver whose
-        // scratch holds the package through its externals file, and the
-        // closing evidence then omitted a prerequisite the plan removes
-        // ("resolver evidence omits a required prerequisite", an internal
-        // error, on 16 and 18). What a drop does to a kept surface is bounded
-        // by the engine instead: a stored view, default, check or SQL-bodied
-        // routine that uses a member is a dependent that makes `RESTRICT` refuse
-        // (and the plan refuses it first, by name); only a body bound at call
-        // time, such as plpgsql's, finds nothing once the member is gone, which
-        // is the resolver's documented observation limit (DEC-2447.8).
-        //
-        // An **update** is the same answer for the same reason: its scratch holds
-        // the version the target holds, so a plan that also needs the resolver is
-        // refused by name first (DEC-2447.10).
-        | Change::Role(_) | Change::Type(_) | Change::Search(_) | Change::Extension(_)
-        | Change::Permission(GrantChange::PublicExecution { .. }) => false,
+        effects
+    }
+
+    fn arrive_rel_or_type(&mut self, name: ObjectName) {
+        self.arriving_names.insert(name.name.clone());
+        self.arriving_relations_and_types.insert(name);
+    }
+
+    fn touch_module(&mut self, id: &ModuleId) {
+        match id {
+            ModuleId::Named(obj) => {
+                self.touched_relations.insert(obj.clone());
+            }
+            ModuleId::Routine(r) => {
+                self.touched_routines.insert(r.name.clone());
+            }
+            ModuleId::Trigger { .. } => {}
+        }
+    }
+
+    fn record_table_relations(
+        &mut self,
+        table_name: &TableName,
+        table: &Table,
+        hooks: &Hooks<'_>,
+        arriving: bool,
+    ) {
+        let names = table
+            .indexes
+            .keys()
+            .chain(table.unique.keys())
+            .chain(table.exclude.keys())
+            .chain(table.primary_key.as_ref().and_then(|pk| pk.name.as_ref()))
+            .map(|n| n.raw().to_owned())
+            .chain((hooks.implicit_relations)(table_name, table));
+        for name in names {
+            let rel = ObjectName::new(&table_name.schema, name);
+            if arriving {
+                self.arrive_rel_or_type(rel);
+            } else {
+                self.touched_relations.insert(rel);
+            }
+        }
+    }
+
+    fn record_pk(&mut self, schema: &str, pk: Option<&PrimaryKey>, arriving: bool) {
+        match pk.map(|p| &p.name) {
+            Some(Some(n)) if arriving => self.arrive_rel_or_type(ObjectName::new(schema, n.raw())),
+            Some(Some(n)) => {
+                self.touched_relations
+                    .insert(ObjectName::new(schema, n.raw()));
+            }
+            Some(None) => self.exclude_narrowing = true,
+            None => {}
+        }
+    }
+
+    fn record_column_sequence(
+        &mut self,
+        table: &TableName,
+        name: &pbps_model::ColumnName,
+        column: &pbps_model::Column,
+        hooks: &Hooks<'_>,
+    ) {
+        let names = match &column.value_source {
+            ValueSource::Sequence(seq) => (hooks.owned_sequence)(table, name.raw(), seq)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ValueSource::Identity(_) => {
+                let mut one = Table::default();
+                one.columns.insert(name.clone(), column.clone());
+                (hooks.implicit_relations)(table, &one)
+            }
+            ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => return,
+        };
+        self.exclude_narrowing |= names.is_empty();
+        for s in names {
+            self.arrive_rel_or_type(ObjectName::new(&table.schema, s));
+        }
+    }
+
+    /// Classify one change into binding movement, excluded-class fallback,
+    /// touched base objects, and arriving names. Listed in full so a new kind
+    /// of change must be classified here rather than defaulting either way.
+    fn record(
+        &mut self,
+        change: &Change,
+        base: crate::Side<'_>,
+        desired: crate::Side<'_>,
+        engine: &Engine<'_>,
+        hooks: &Hooks<'_>,
+    ) {
+        match change {
+            // Classes that move names and that the facts do not describe, so
+            // every kept surface stays a question whatever was read.
+            //
+            // A detach renames the clones of its parent's indexes and keys to
+            // the declaration's names, and its table leaves the parent's
+            // inheritance; an attach builds whichever of them the table lacks
+            // under names the engine chooses, and its table joins it (#1545).
+            // Partitions are PostgreSQL's alone, where an index's name is a
+            // relation's.
+            Change::Partition(
+                PartitionChange::RebuildPartitionedTable(_)
+                | PartitionChange::DetachPartition { .. }
+                | PartitionChange::AttachPartition { .. },
+            )
+            // A computed column is SQL Server's, which supplies no facts. A
+            // numbering change creates, renames or drops a sequence, a
+            // relation in its schema's namespace that an unqualified relation
+            // lookup on the path finds (#1889), under a name this plan may
+            // not hold.
+            | Change::Column(
+                ColumnChange::AddComputedColumn { .. }
+                | ColumnChange::DropComputedColumn { .. }
+                | ColumnChange::AlterColumnNumbering { .. },
+            )
+            // A rebuild brings a type's temporary name in, moves columns to
+            // it and takes the old one out (DEC-1635.7).
+            | Change::TypeValue(TypeValueChange::EnumRebuild { .. }) => {
+                self.moves_bindings = true;
+                self.exclude_narrowing = true;
+            }
+            // Classes the facts do not describe and that move nothing by
+            // themselves: beside a change that does, every kept surface stays
+            // a question.
+            //
+            // A package create **can** move a binding: it may add an operator
+            // or function that matches an argument type better than what the
+            // path found before (measured on 16 and 18: intarray's `@>` on
+            // `int[]`; a stored view, default, check and `BEGIN ATOMIC` body
+            // keep their binding, while later statements and string-bodied or
+            // plpgsql routines bind the package's operator at call time;
+            // citext adds nothing that rebinds). DEC-1515.1's rule would make
+            // that move bindings, and it does not on purpose: that sends
+            // every kept surface to a resolver that cannot describe a package
+            // the target lacks, and `resolution::resolve` refuses that by
+            // name. So the assessment's "unaffected" count does not cover a
+            // create; answering it soundly needs the resolver to hold the
+            // package (DEC-2447.6, a later slice). Do not "fix" this to move
+            // bindings.
+            //
+            // An **update** is the same answer for the same reason: its
+            // scratch holds the version the target holds, so a plan that also
+            // needs the resolver is refused by name first (DEC-2447.10).
+            Change::Index(IndexChange::BuildPartitionedIndex(_))
+            | Change::Partition(
+                PartitionChange::CopyTableRows(_)
+                | PartitionChange::AnalyzeTableTree(_)
+                | PartitionChange::SetPartitionDefault { .. }
+                | PartitionChange::SetPartitionNotNull { .. },
+            )
+            | Change::Extension(
+                ExtensionChange::CreateExtension { .. }
+                | ExtensionChange::UpdateExtension { .. }
+                | ExtensionChange::SetExtensionSchema { .. },
+            ) => self.exclude_narrowing = true,
+            // Relations, their row types, and backing relation-namespace objects.
+            Change::Table(TableChange::CreateTable {
+                name,
+                table,
+                beside_default,
+                ..
+            }) => {
+                self.moves_bindings = true;
+                self.exclude_narrowing |= beside_default.is_some() || is_excluded_table(table);
+                self.arrive_rel_or_type(name.clone());
+                if engine.indexes_are_relations {
+                    self.record_table_relations(name, table, hooks, true);
+                }
+            }
+            Change::Table(TableChange::DropTable {
+                name, detach_from, ..
+            }) => {
+                self.moves_bindings = true;
+                let base_table = base.schema.tables.get(name);
+                self.exclude_narrowing |=
+                    detach_from.is_some() || base_table.is_some_and(is_excluded_table);
+                self.touched_relations.insert(name.clone());
+                if engine.indexes_are_relations
+                    && let Some(t) = base_table
+                {
+                    self.record_table_relations(name, t, hooks, false);
+                }
+            }
+            Change::Table(TableChange::RenameTable { from, to, .. }) => {
+                self.moves_bindings = true;
+                self.exclude_narrowing |=
+                    base.schema.tables.get(from).is_some_and(is_excluded_table)
+                        || desired.schema.tables.get(to).is_some_and(is_excluded_table);
+                self.touched_relations.insert(from.clone());
+                self.arrive_rel_or_type(to.clone());
+            }
+            // A column change touches its table, not the column: a statement
+            // can bind a table's columns and record an edge on the table only
+            // (a `MERGE` target), and a row-type reference reads every column.
+            Change::Column(ColumnChange::AddColumn {
+                table,
+                name,
+                column,
+                ..
+            }) => {
+                self.moves_bindings = true;
+                self.touched_relations.insert(table.clone());
+                if engine.indexes_are_relations {
+                    self.record_column_sequence(table, name, column, hooks);
+                }
+            }
+            Change::Column(
+                ColumnChange::DropColumn { column, .. }
+                | ColumnChange::AlterColumnType { column, .. },
+            ) => {
+                self.moves_bindings = true;
+                self.touched_relations.insert(column.table.clone());
+            }
+            Change::Column(ColumnChange::RenameColumn { table, .. }) => {
+                self.moves_bindings = true;
+                self.touched_relations.insert(table.clone());
+            }
+            Change::Module(ModuleChange::CreateModule { id, .. }) => {
+                self.moves_bindings = true;
+                match id {
+                    ModuleId::Named(obj) => self.arrive_rel_or_type(obj.clone()),
+                    ModuleId::Routine(r) => {
+                        self.arriving_names.insert(r.name.name.clone());
+                    }
+                    ModuleId::Trigger { .. } => {}
+                }
+            }
+            Change::Module(ModuleChange::DropModule { id, .. }) => {
+                self.moves_bindings = true;
+                self.touch_module(id);
+            }
+            Change::Module(ModuleChange::AlterModule { id, .. }) => {
+                if declared_differently(id, base, desired, engine) {
+                    self.moves_bindings = true;
+                    self.touch_module(id);
+                }
+            }
+            // Each creates or drops an index. Where an index's name is a
+            // relation's (PostgreSQL), an unqualified relation lookup on the
+            // path finds it first, and one that bound it, such as a `regclass`
+            // constant, finds another relation once it is gone. Where an index
+            // is named per table (SQL Server), no lookup reaches it. An
+            // unnamed key's index has a name the engine chooses.
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
+                table, from, to, ..
+            }) => {
+                if engine.indexes_are_relations {
+                    self.moves_bindings = true;
+                    self.record_pk(&table.schema, from.as_ref(), false);
+                    self.record_pk(&table.schema, to.as_ref(), true);
+                }
+            }
+            Change::Constraint(ConstraintChange::AddUnique { table, name, .. })
+            | Change::Index(IndexChange::AddIndex { table, name, .. }) => {
+                if engine.indexes_are_relations {
+                    self.moves_bindings = true;
+                    self.arrive_rel_or_type(ObjectName::new(&table.schema, name.raw()));
+                }
+            }
+            Change::Constraint(ConstraintChange::DropUnique { table, name })
+            | Change::Index(IndexChange::DropIndex { table, name }) => {
+                if engine.indexes_are_relations {
+                    self.moves_bindings = true;
+                    self.touched_relations
+                        .insert(ObjectName::new(&table.schema, name.raw()));
+                }
+            }
+            Change::Constraint(ConstraintChange::SetExclusion {
+                table,
+                name,
+                from,
+                to,
+            }) => {
+                if engine.indexes_are_relations {
+                    self.moves_bindings = true;
+                    let rel = ObjectName::new(&table.schema, name.raw());
+                    if from.is_some() {
+                        self.touched_relations.insert(rel.clone());
+                    }
+                    if to.is_some() {
+                        self.arrive_rel_or_type(rel);
+                    }
+                }
+            }
+            // A schema the creating role may not use is skipped by the
+            // lookup, for every object in it: no edge says which surfaces.
+            Change::Permission(
+                GrantChange::Grant { target, .. } | GrantChange::Revoke { target, .. },
+            ) => match target {
+                GrantTarget::Schema(_) => {
+                    self.moves_bindings = true;
+                    self.exclude_narrowing = true;
+                }
+                GrantTarget::Object(_) | GrantTarget::Routine(_) | GrantTarget::Sequence(_) => {}
+            },
+            // A type moves no existing lookup by DEC-1515.1's rule, and that
+            // answer is kept. Beside a change that does move names, its name
+            // is one more that arrives or is touched.
+            Change::Type(TypeChange::CreateType { name, .. }) => {
+                self.arrive_rel_or_type(ObjectName::new(name.schema(), name.name()));
+            }
+            Change::Type(TypeChange::DropType { name, .. }) => {
+                self.touched_types
+                    .insert(ObjectName::new(name.schema(), name.name()));
+            }
+            Change::Type(TypeChange::RenameType { from, to, .. }) => {
+                self.touched_types
+                    .insert(ObjectName::new(from.schema(), from.name()));
+                self.arrive_rel_or_type(ObjectName::new(to.schema(), to.name()));
+            }
+            // An expression's own definition is its own question; changing it
+            // brings no name anywhere. A check's or foreign key's name is a
+            // constraint's, which no lookup in an expression reaches. A role
+            // and a search object move no existing lookup.
+            //
+            // A package **drop** moves nothing here, for the reason a create
+            // does not and one measured more: moving bindings sent every kept
+            // surface to a resolver whose scratch holds the package through
+            // its externals file, and the closing evidence then omitted a
+            // prerequisite the plan removes ("resolver evidence omits a
+            // required prerequisite", an internal error, on 16 and 18). What a
+            // drop does to a kept surface is bounded by the engine instead: a
+            // stored view, default, check or SQL-bodied routine that uses a
+            // member is a dependent that makes `RESTRICT` refuse (and the plan
+            // refuses it first, by name); only a body bound at call time, such
+            // as plpgsql's, finds nothing once the member is gone, which is
+            // the resolver's documented observation limit (DEC-2447.8).
+            Change::Constraint(
+                ConstraintChange::AddCheck { .. }
+                | ConstraintChange::DropCheck { .. }
+                | ConstraintChange::AddForeignKey { .. }
+                | ConstraintChange::DropForeignKey { .. },
+            )
+            | Change::Index(IndexChange::SetIndexStorageParameters { .. })
+            | Change::Column(
+                ColumnChange::AlterColumnDefault { .. }
+                | ColumnChange::AlterColumnExpression { .. }
+                | ColumnChange::AlterColumnNullability { .. }
+                | ColumnChange::SetColumnDeprecated { .. },
+            )
+            | Change::Permission(GrantChange::PublicExecution { .. })
+            | Change::Extension(ExtensionChange::DropExtension { .. })
+            | Change::TableProperty(_)
+            | Change::Policy(_)
+            | Change::Row(_)
+            | Change::TypeValue(
+                TypeValueChange::AddEnumValue { .. }
+                | TypeValueChange::AlterDomain { .. }
+                | TypeValueChange::RenameEnumValue { .. },
+            )
+            | Change::Role(_)
+            | Change::Search(_) => {}
+        }
     }
 }
 
@@ -980,6 +1539,1236 @@ mod tests {
                 vec![grant(GrantTarget::Object("app.t".parse().unwrap()))]
             )
             .requires_resolution()
+        );
+    }
+}
+
+#[cfg(test)]
+mod dependency_facts_tests {
+    use super::*;
+    use pbps_dialect::MinimalDialect;
+    use pbps_model::{
+        CheckConstraint, Column, ComputedColumn, DetachedKind, DetachedName, EnumRebuildStep,
+        Extension, Hints, IdsFile, Index, IndexColumn, IndexKey, ManagedType, Module, ModuleKind,
+        PartitionBound, PartitionBy, PartitionOf, Permission, PlannedChange, Rebuild,
+        RebuildIdentities, RebuildPartitionedTable, Schema, Table, Uid, UidKind,
+    };
+
+    fn resolve_ids(schema: &Schema, old: &IdsFile) -> IdsFile {
+        crate::resolve(
+            schema,
+            old,
+            &[],
+            &crate::Context {
+                operator: "2987".into(),
+                today: "2026-11-27".into(),
+            },
+        )
+        .unwrap()
+        .ids
+    }
+
+    fn view(definition: &str) -> Module {
+        Module {
+            kind: ModuleKind::View,
+            description: None,
+            definition: definition.into(),
+            options: Default::default(),
+        }
+    }
+
+    fn routine(definition: &str) -> Module {
+        Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: definition.into(),
+            options: Default::default(),
+        }
+    }
+
+    fn table_with_columns(cols: &[&str]) -> Table {
+        let mut table = Table::default();
+        for col in cols {
+            table
+                .columns
+                .insert((*col).into(), Column::new("int".parse().unwrap()));
+        }
+        table
+    }
+
+    fn two_table_schema() -> Schema {
+        let mut schema = Schema::default();
+        schema
+            .tables
+            .insert("app.t".parse().unwrap(), table_with_columns(&["id", "k"]));
+        schema
+            .tables
+            .insert("app.u".parse().unwrap(), table_with_columns(&["id", "k"]));
+        schema
+            .modules
+            .insert("app.v_t".parse().unwrap(), view("SELECT id FROM app.t"));
+        schema
+            .modules
+            .insert("app.v_u".parse().unwrap(), view("SELECT id FROM app.u"));
+        schema
+    }
+
+    fn run(
+        base: &Schema,
+        desired: &Schema,
+        changes: Vec<Change>,
+        facts: Option<&DependencyFacts>,
+    ) -> Assessment {
+        let base_ids = resolve_ids(base, &IdsFile::default());
+        let desired_ids = resolve_ids(desired, &base_ids);
+        let ordinary = ChangeSet {
+            changes: changes.into_iter().map(PlannedChange::new).collect(),
+        };
+        assess_with_facts(
+            crate::Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            crate::Side {
+                schema: desired,
+                ids: &desired_ids,
+            },
+            &ordinary,
+            &MinimalDialect,
+            facts,
+        )
+    }
+
+    fn add_column(table: &str, col: &str) -> Change {
+        Change::Column(ColumnChange::AddColumn {
+            uid: Uid::generate(UidKind::Column),
+            table: table.parse().unwrap(),
+            name: col.into(),
+            column: Box::new(Column::new("int".parse().unwrap())),
+        })
+    }
+
+    fn parsed(edges: impl IntoIterator<Item = DependencyEdge>) -> SurfaceDependencies {
+        SurfaceDependencies::Parsed(edges.into_iter().collect())
+    }
+
+    fn module_surface(id: &str) -> Surface {
+        Surface::Module(id.parse().unwrap())
+    }
+
+    fn clear_facts(surfaces: BTreeMap<Surface, SurfaceDependencies>) -> DependencyFacts {
+        DependencyFacts {
+            surfaces,
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::new(),
+        }
+    }
+
+    /// Negative sweep: with no facts, `assess_with_facts(..., None)` agrees
+    /// identically with `assess(...)` across non-moving, moving, rebuild, and
+    /// excluded-class plans, and every `Unaffected` carries `NoNameMoved`.
+    #[test]
+    fn without_facts_every_answer_is_unchanged_and_unaffected_is_no_name_moved() {
+        let mut base = two_table_schema();
+        let mut n = Column::new("int".parse().unwrap());
+        n.value_source = ValueSource::Default("0".into());
+        base.tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .columns
+            .insert("n".into(), n);
+        base.tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .checks
+            .insert(
+                "ck_n".into(),
+                CheckConstraint {
+                    expression: "n >= 0".into(),
+                },
+            );
+
+        let base_ids = resolve_ids(&base, &IdsFile::default());
+        let side = crate::Side {
+            schema: &base,
+            ids: &base_ids,
+        };
+
+        let cases: Vec<(&str, Vec<Change>)> = vec![
+            (
+                "object grant (no move)",
+                vec![Change::Permission(GrantChange::Grant {
+                    role: "reader".into(),
+                    target: GrantTarget::Object("app.t".parse().unwrap()),
+                    permissions: BTreeSet::from([Permission::Select]),
+                })],
+            ),
+            ("add column", vec![add_column("app.t", "extra")]),
+            (
+                "drop column",
+                vec![Change::Column(ColumnChange::DropColumn {
+                    uid: Uid::generate(UidKind::Column),
+                    column: "app.t.k".parse().unwrap(),
+                })],
+            ),
+            (
+                "create table",
+                vec![Change::Table(TableChange::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: "app.new_t".parse().unwrap(),
+                    table: Box::new(table_with_columns(&["id"])),
+                    beside_default: None,
+                    moves_at_most: None,
+                })],
+            ),
+            (
+                "create routine",
+                vec![Change::Module(ModuleChange::CreateModule {
+                    id: "app.f()".parse().unwrap(),
+                    module: Box::new(routine("RETURNS int LANGUAGE sql RETURN 1")),
+                })],
+            ),
+            (
+                "schema grant",
+                vec![Change::Permission(GrantChange::Grant {
+                    role: "owner".into(),
+                    target: GrantTarget::Schema("ext".into()),
+                    permissions: BTreeSet::from([Permission::Usage]),
+                })],
+            ),
+            (
+                "create extension alone",
+                vec![Change::Extension(ExtensionChange::CreateExtension {
+                    uid: Uid::generate(UidKind::Extension),
+                    name: "citext".into(),
+                    definition: Extension {
+                        schema: "ext".into(),
+                        version: "1.6".into(),
+                    },
+                    requires: BTreeSet::new(),
+                })],
+            ),
+            (
+                "add computed column",
+                vec![Change::Column(ColumnChange::AddComputedColumn {
+                    table: "app.t".parse().unwrap(),
+                    name: "c".into(),
+                    computed: ComputedColumn {
+                        expression: "id + 1".into(),
+                        persisted: false,
+                        not_null: false,
+                    },
+                })],
+            ),
+        ];
+
+        for (label, changes) in cases {
+            let ordinary = ChangeSet {
+                changes: changes.into_iter().map(PlannedChange::new).collect(),
+            };
+            let legacy = assess(side, side, &ordinary, &MinimalDialect);
+            let none_facts = assess_with_facts(side, side, &ordinary, &MinimalDialect, None);
+            assert_eq!(legacy, none_facts, "{label}");
+            for (surface, answer) in &none_facts.questions {
+                match answer {
+                    Answer::Unaffected => assert_eq!(
+                        none_facts.unaffected_reason(surface),
+                        Some(UnaffectedReason::NoNameMoved),
+                        "{label}: {surface:?}"
+                    ),
+                    Answer::Rebuild | Answer::Resolve => {
+                        assert_eq!(none_facts.unaffected_reason(surface), None, "{label}");
+                    }
+                }
+            }
+        }
+
+        // Also check diff-driven declared rebuild beside a moving change.
+        let mut desired = base.clone();
+        desired
+            .modules
+            .insert("app.v_t".parse().unwrap(), view("SELECT id, k FROM app.t"));
+        desired
+            .tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .columns
+            .insert("label".into(), Column::new("text".parse().unwrap()));
+        let desired_ids = resolve_ids(&desired, &base_ids);
+        let desired_side = crate::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        };
+        let ordinary = crate::diff(side, desired_side, &MinimalDialect, &Hints::default()).unwrap();
+        assert_eq!(
+            assess(side, desired_side, &ordinary, &MinimalDialect),
+            assess_with_facts(side, desired_side, &ordinary, &MinimalDialect, None)
+        );
+    }
+
+    /// Negative-first: a surface with an edge on the changed table, on a column
+    /// of it, on its row type, or on a descendant of it stays `Resolve`; a view
+    /// with no edge on any of those is `Unaffected` with `ByDependency`.
+    #[test]
+    fn relation_column_row_type_and_descendant_edges_stay_resolve_while_unrelated_is_unaffected() {
+        let mut schema = Schema::default();
+        for name in ["app.parent", "app.child", "app.grandchild", "app.other"] {
+            schema
+                .tables
+                .insert(name.parse().unwrap(), table_with_columns(&["id", "note"]));
+        }
+        schema.modules.insert(
+            "app.v_direct".parse().unwrap(),
+            view("SELECT * FROM app.parent"),
+        );
+        schema.modules.insert(
+            "app.v_col".parse().unwrap(),
+            view("SELECT id FROM app.parent"),
+        );
+        schema.modules.insert(
+            "app.v_rowtype".parse().unwrap(),
+            view("SELECT NULL::app.parent"),
+        );
+        schema.modules.insert(
+            "app.v_child".parse().unwrap(),
+            view("SELECT * FROM app.child"),
+        );
+        schema.modules.insert(
+            "app.v_grandchild".parse().unwrap(),
+            view("SELECT * FROM app.grandchild"),
+        );
+        schema.modules.insert(
+            "app.v_other".parse().unwrap(),
+            view("SELECT id FROM app.other"),
+        );
+
+        let parent: TableName = "app.parent".parse().unwrap();
+        let child: TableName = "app.child".parse().unwrap();
+        let grandchild: TableName = "app.grandchild".parse().unwrap();
+        let other: TableName = "app.other".parse().unwrap();
+
+        let surfaces = BTreeMap::from([
+            (
+                module_surface("app.v_direct"),
+                parsed([DependencyEdge::Relation(parent.clone())]),
+            ),
+            (
+                module_surface("app.v_col"),
+                parsed([DependencyEdge::Column(parent.column("id"))]),
+            ),
+            (
+                module_surface("app.v_rowtype"),
+                parsed([DependencyEdge::Type(parent.clone())]),
+            ),
+            (
+                module_surface("app.v_child"),
+                parsed([DependencyEdge::Relation(child.clone())]),
+            ),
+            (
+                module_surface("app.v_grandchild"),
+                parsed([DependencyEdge::Column(grandchild.column("id"))]),
+            ),
+            (
+                module_surface("app.v_other"),
+                parsed([DependencyEdge::Column(other.column("id"))]),
+            ),
+        ]);
+        let ancestors = BTreeMap::from([
+            (child.clone(), BTreeSet::from([Ancestor::Relation(parent)])),
+            (grandchild, BTreeSet::from([Ancestor::Relation(child)])),
+        ]);
+        let facts = DependencyFacts {
+            surfaces,
+            relation_ancestors: ReadFact::Known(ancestors),
+            catalog_names: BTreeMap::new(),
+        };
+
+        let found = run(
+            &schema,
+            &schema,
+            vec![add_column("app.parent", "extra")],
+            Some(&facts),
+        );
+        for resolve in [
+            "app.v_direct",
+            "app.v_col",
+            "app.v_rowtype",
+            "app.v_child",
+            "app.v_grandchild",
+        ] {
+            let s = module_surface(resolve);
+            assert_eq!(found.questions[&s], Answer::Resolve, "{resolve}");
+            assert_eq!(found.unaffected_reason(&s), None, "{resolve}");
+        }
+        let unrelated = module_surface("app.v_other");
+        assert_eq!(found.questions[&unrelated], Answer::Unaffected);
+        assert_eq!(
+            found.unaffected_reason(&unrelated),
+            Some(UnaffectedReason::ByDependency)
+        );
+
+        // Direction check: changing the child does NOT touch a reader of the parent alone.
+        let child_change = run(
+            &schema,
+            &schema,
+            vec![add_column("app.child", "child_only")],
+            Some(&facts),
+        );
+        assert_eq!(
+            child_change.questions[&module_surface("app.v_child")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            child_change.questions[&module_surface("app.v_grandchild")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            child_change.questions[&module_surface("app.v_direct")],
+            Answer::Unaffected
+        );
+        assert_eq!(
+            child_change.unaffected_reason(&module_surface("app.v_direct")),
+            Some(UnaffectedReason::ByDependency)
+        );
+    }
+
+    /// A typed table (`OF comp`): changing a composite type touches readers
+    /// of tables typed `OF` it, while leaving unrelated readers `Unaffected`.
+    #[test]
+    fn changing_a_composite_type_touches_readers_of_tables_typed_of_it() {
+        let mut schema = Schema::default();
+        schema
+            .tables
+            .insert("app.ot".parse().unwrap(), table_with_columns(&["a"]));
+        schema
+            .tables
+            .insert("app.other".parse().unwrap(), table_with_columns(&["a"]));
+        schema
+            .modules
+            .insert("app.v_typed".parse().unwrap(), view("SELECT * FROM app.ot"));
+        schema.modules.insert(
+            "app.v_other".parse().unwrap(),
+            view("SELECT a FROM app.other"),
+        );
+
+        let ot: TableName = "app.ot".parse().unwrap();
+        let other: TableName = "app.other".parse().unwrap();
+        let comp: ObjectName = "app.comp".parse().unwrap();
+        let facts = DependencyFacts {
+            surfaces: BTreeMap::from([
+                (
+                    module_surface("app.v_typed"),
+                    parsed([DependencyEdge::Relation(ot.clone())]),
+                ),
+                (
+                    module_surface("app.v_other"),
+                    parsed([DependencyEdge::Column(other.column("a"))]),
+                ),
+            ]),
+            relation_ancestors: ReadFact::Known(BTreeMap::from([(
+                ot,
+                BTreeSet::from([Ancestor::Type(comp)]),
+            )])),
+            catalog_names: BTreeMap::from([("comp_v2".into(), CatalogName::Clear)]),
+        };
+
+        // Paired with a moving change on an unrelated third table so the plan
+        // enters the per-surface rule.
+        let found = run(
+            &schema,
+            &schema,
+            vec![
+                add_column("app.unrelated", "x"),
+                Change::Type(TypeChange::RenameType {
+                    uid: Uid::generate(UidKind::Type),
+                    from: "app.comp".parse().unwrap(),
+                    to: "app.comp_v2".parse().unwrap(),
+                    definition: Box::new(ManagedType::Enum {
+                        values: vec!["a".into()],
+                    }),
+                }),
+            ],
+            Some(&facts),
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_typed")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_other")],
+            Answer::Unaffected
+        );
+        assert_eq!(
+            found.unaffected_reason(&module_surface("app.v_other")),
+            Some(UnaffectedReason::ByDependency)
+        );
+    }
+
+    /// An arriving routine whose name equals a column edge's name,
+    /// a type edge's name, a routine edge's name, a relation edge's name, or a
+    /// catalog-held (or unreadable/unchecked) name stays `Resolve`; a routine
+    /// with a clear catalog name and no matching edge is `Unaffected`.
+    #[test]
+    fn arriving_routine_matching_column_type_routine_or_catalog_name_stays_resolve() {
+        let mut schema = Schema::default();
+        schema.tables.insert(
+            "app.t".parse().unwrap(),
+            table_with_columns(&["id", "note"]),
+        );
+        schema.modules.insert(
+            "app.v_col".parse().unwrap(),
+            view("SELECT note(t) FROM app.t"),
+        );
+        schema.modules.insert(
+            "app.v_type".parse().unwrap(),
+            view("SELECT d(id) FROM app.t"),
+        );
+        schema.modules.insert(
+            "app.v_fn".parse().unwrap(),
+            view("SELECT calc(id) FROM app.t"),
+        );
+        schema
+            .modules
+            .insert("app.v_plain".parse().unwrap(), view("SELECT id FROM app.t"));
+
+        let t: TableName = "app.t".parse().unwrap();
+        let base_surfaces = BTreeMap::from([
+            (
+                module_surface("app.v_col"),
+                parsed([DependencyEdge::Column(t.column("note"))]),
+            ),
+            (
+                module_surface("app.v_type"),
+                parsed([
+                    DependencyEdge::Column(t.column("id")),
+                    DependencyEdge::Type("app.d".parse().unwrap()),
+                ]),
+            ),
+            (
+                module_surface("app.v_fn"),
+                parsed([
+                    DependencyEdge::Column(t.column("id")),
+                    DependencyEdge::Routine("app.calc".parse().unwrap()),
+                ]),
+            ),
+            (
+                module_surface("app.v_plain"),
+                parsed([DependencyEdge::Column(t.column("id"))]),
+            ),
+        ]);
+
+        let create_fn = |sig: &str| {
+            Change::Module(ModuleChange::CreateModule {
+                id: sig.parse().unwrap(),
+                module: Box::new(routine("RETURNS int LANGUAGE sql RETURN 1")),
+            })
+        };
+
+        // 1. Arriving routine `note(app.t)` hits `v_col` via its column edge `note`,
+        //    leaving the other views unaffected.
+        let facts = DependencyFacts {
+            surfaces: base_surfaces.clone(),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::from([("note".into(), CatalogName::Clear)]),
+        };
+        let found = run(
+            &schema,
+            &schema,
+            vec![create_fn("app.note(app.t)")],
+            Some(&facts),
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_col")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_type")],
+            Answer::Unaffected
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_plain")],
+            Answer::Unaffected
+        );
+
+        // 2. Arriving routine `d(int)` hits `v_type` via its type edge `d`.
+        let facts = DependencyFacts {
+            surfaces: base_surfaces.clone(),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::from([("d".into(), CatalogName::Clear)]),
+        };
+        let found = run(
+            &schema,
+            &schema,
+            vec![create_fn("app.d(int)")],
+            Some(&facts),
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_type")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_plain")],
+            Answer::Unaffected
+        );
+
+        // 3. Arriving overload `calc(text)` hits `v_fn` via its routine edge `calc`.
+        let facts = DependencyFacts {
+            surfaces: base_surfaces.clone(),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::from([("calc".into(), CatalogName::Clear)]),
+        };
+        let found = run(
+            &schema,
+            &schema,
+            vec![create_fn("app.calc(text)")],
+            Some(&facts),
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_fn")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_plain")],
+            Answer::Unaffected
+        );
+
+        // 4. Arriving routine with a catalog-held name (e.g. `uuid` or `lower`),
+        //    an unreadable catalog check, or an unchecked (absent) name sends
+        //    every kept surface to `Resolve`.
+        for (name, status) in [
+            ("uuid", Some(CatalogName::Held)),
+            ("lower", Some(CatalogName::Unreadable)),
+            ("unchecked", None),
+        ] {
+            let mut catalog_names = BTreeMap::new();
+            if let Some(s) = status {
+                catalog_names.insert(name.to_owned(), s);
+            }
+            let facts = DependencyFacts {
+                surfaces: base_surfaces.clone(),
+                relation_ancestors: ReadFact::Known(BTreeMap::new()),
+                catalog_names,
+            };
+            let found = run(
+                &schema,
+                &schema,
+                vec![create_fn(&format!("app.{name}(text)"))],
+                Some(&facts),
+            );
+            assert_eq!(
+                found.count(Answer::Resolve),
+                base_surfaces.len(),
+                "{name} / {status:?}: {found:?}"
+            );
+        }
+
+        // 5. Positive control: an arriving routine with a clear catalog name
+        //    matching no edge leaves every covered parsed surface `Unaffected`.
+        let facts = DependencyFacts {
+            surfaces: base_surfaces,
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::from([("unrelated_helper".into(), CatalogName::Clear)]),
+        };
+        let found = run(
+            &schema,
+            &schema,
+            vec![create_fn("app.unrelated_helper(int)")],
+            Some(&facts),
+        );
+        assert!(!found.requires_resolution(), "{found:?}");
+        assert_eq!(found.count_unaffected(UnaffectedReason::ByDependency), 4);
+    }
+
+    /// A surface with NO edge on an arriving relation or type name
+    /// still stays `Resolve` when its SQL text mentions that name (reusing the
+    /// existing identifier scanner); surfaces whose text does not mention it
+    /// (or only mentions it in a comment, literal, or another schema) are
+    /// `Unaffected`.
+    #[test]
+    fn surface_text_mentioning_arriving_relation_or_type_without_edge_stays_resolve() {
+        let mut schema = Schema::default();
+        let mut table = table_with_columns(&["id"]);
+        let mut col_def = Column::new("int".parse().unwrap());
+        col_def.value_source =
+            ValueSource::Default("CASE WHEN ARRAY[]::n[] IS NULL THEN 0 ELSE 1 END".into());
+        table.columns.insert("d_col".into(), col_def);
+        table.checks.insert(
+            "ck_arr".into(),
+            CheckConstraint {
+                expression: "ARRAY[]::n[] IS NULL".into(),
+            },
+        );
+        table.indexes.insert(
+            "ix_expr".into(),
+            Index {
+                columns: vec![IndexColumn {
+                    key: IndexKey::Expression("(ARRAY[]::n[] IS NULL)".into()),
+                    descending: false,
+                    opclass: None,
+                    collation: None,
+                    opclass_parameters: BTreeMap::new(),
+                }],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: None,
+            },
+        );
+        schema.tables.insert("app.host".parse().unwrap(), table);
+
+        // Views with zero recorded edges: an empty typed array, json_value
+        // RETURNING dom, comment/literal-only mention, and other-schema qualified.
+        schema.modules.insert(
+            "app.v_f1".parse().unwrap(),
+            view("SELECT 1 AS r WHERE ARRAY[]::n[] IS NULL"),
+        );
+        schema.modules.insert(
+            "app.v_f2".parse().unwrap(),
+            view("SELECT json_value(j, '$.a' RETURNING dom) FROM app.host"),
+        );
+        schema.modules.insert(
+            "app.v_comment".parse().unwrap(),
+            view("SELECT 1 AS r -- n dom\nWHERE 'n' <> 'dom'"),
+        );
+        schema.modules.insert(
+            "app.v_other_schema".parse().unwrap(),
+            view("SELECT 1 AS r WHERE ARRAY[]::late.n[] IS NULL"),
+        );
+
+        let host: TableName = "app.host".parse().unwrap();
+        let default_s = Surface::Default(host.column("d_col"));
+        let check_s = Surface::Check {
+            table: host.clone(),
+            name: "ck_arr".into(),
+        };
+        let index_s = Surface::Index {
+            table: host,
+            name: "ix_expr".into(),
+        };
+
+        let surfaces = BTreeMap::from([
+            (default_s.clone(), parsed([])),
+            (check_s.clone(), parsed([])),
+            (index_s.clone(), parsed([])),
+            (module_surface("app.v_f1"), parsed([])),
+            (module_surface("app.v_f2"), parsed([])),
+            (module_surface("app.v_comment"), parsed([])),
+            (module_surface("app.v_other_schema"), parsed([])),
+        ]);
+        let facts = DependencyFacts {
+            surfaces,
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::from([
+                ("n".into(), CatalogName::Clear),
+                ("dom".into(), CatalogName::Clear),
+            ]),
+        };
+
+        // Relation `early.n` arrives and type `early.dom` arrives.
+        let found = run(
+            &schema,
+            &schema,
+            vec![
+                Change::Table(TableChange::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: "early.n".parse().unwrap(),
+                    table: Box::new(table_with_columns(&["y"])),
+                    beside_default: None,
+                    moves_at_most: None,
+                }),
+                Change::Type(TypeChange::CreateType {
+                    uid: Uid::generate(UidKind::Type),
+                    name: "early.dom".parse().unwrap(),
+                    definition: Box::new(ManagedType::Enum {
+                        values: vec!["x".into()],
+                    }),
+                }),
+            ],
+            Some(&facts),
+        );
+
+        for s in [
+            default_s,
+            check_s,
+            index_s,
+            module_surface("app.v_f1"),
+            module_surface("app.v_f2"),
+        ] {
+            assert_eq!(found.questions[&s], Answer::Resolve, "{s:?}");
+        }
+        assert_eq!(
+            found.questions[&module_surface("app.v_comment")],
+            Answer::Unaffected
+        );
+        assert_eq!(
+            found.unaffected_reason(&module_surface("app.v_comment")),
+            Some(UnaffectedReason::ByDependency)
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_other_schema")],
+            Answer::Unaffected
+        );
+    }
+
+    /// Absent (uncovered) and unreadable stay `Resolve`; unparsed is
+    /// `Unaffected` with `UnaffectedReason::Unparsed`; parsed with
+    /// an empty edge set is `Unaffected` when nothing arrives that it mentions
+    /// (and `Resolve` when something it mentions arrives). Unreadable ancestor
+    /// ties force `Resolve` even for parsed-empty surfaces.
+    #[test]
+    fn uncovered_unreadable_unparsed_and_parsed_empty_states_behave_distinctly() {
+        let mut schema = Schema::default();
+        schema
+            .tables
+            .insert("app.t".parse().unwrap(), table_with_columns(&["id"]));
+        schema
+            .modules
+            .insert("app.v_uncovered".parse().unwrap(), view("SELECT 1"));
+        schema
+            .modules
+            .insert("app.v_unreadable".parse().unwrap(), view("SELECT 1"));
+        schema.modules.insert(
+            "app.f_unparsed()".parse().unwrap(),
+            routine("RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END; $$"),
+        );
+        schema.modules.insert(
+            "app.v_empty".parse().unwrap(),
+            view("SELECT 1 AS constant_only"),
+        );
+
+        let surfaces = BTreeMap::from([
+            (
+                module_surface("app.v_unreadable"),
+                SurfaceDependencies::Unreadable,
+            ),
+            (
+                module_surface("app.f_unparsed()"),
+                SurfaceDependencies::Unparsed,
+            ),
+            (module_surface("app.v_empty"), parsed([])),
+        ]);
+        let facts = clear_facts(surfaces.clone());
+
+        let found = run(
+            &schema,
+            &schema,
+            vec![add_column("app.t", "extra")],
+            Some(&facts),
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_uncovered")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_unreadable")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.f_unparsed()")],
+            Answer::Unaffected
+        );
+        assert_eq!(
+            found.unaffected_reason(&module_surface("app.f_unparsed()")),
+            Some(UnaffectedReason::Unparsed)
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_empty")],
+            Answer::Unaffected
+        );
+        assert_eq!(
+            found.unaffected_reason(&module_surface("app.v_empty")),
+            Some(UnaffectedReason::ByDependency)
+        );
+        assert_eq!(found.count_unaffected(UnaffectedReason::NoNameMoved), 0);
+        assert_eq!(found.count_unaffected(UnaffectedReason::ByDependency), 1);
+        assert_eq!(found.count_unaffected(UnaffectedReason::Unparsed), 1);
+
+        // Negative: unreadable ancestor ties force every kept surface to `Resolve`.
+        let unreadable_ancestors = DependencyFacts {
+            surfaces,
+            relation_ancestors: ReadFact::Unreadable,
+            catalog_names: BTreeMap::new(),
+        };
+        let found = run(
+            &schema,
+            &schema,
+            vec![add_column("app.t", "extra")],
+            Some(&unreadable_ancestors),
+        );
+        assert_eq!(found.count(Answer::Resolve), 4, "{found:?}");
+    }
+
+    /// Excluded plan classes stay today's answer for every kept surface even
+    /// with perfect empty facts covering every surface.
+    #[test]
+    fn every_excluded_plan_class_keeps_todays_answer_even_with_perfect_facts() {
+        let schema = two_table_schema();
+        let perfect = clear_facts(BTreeMap::from([
+            (module_surface("app.v_t"), parsed([])),
+            (module_surface("app.v_u"), parsed([])),
+        ]));
+
+        // Sanity control: a plain column add on an unrelated table narrows both
+        // covered surfaces to `Unaffected` with these exact facts.
+        let control = run(
+            &schema,
+            &schema,
+            vec![add_column("app.other", "x")],
+            Some(&perfect),
+        );
+        assert!(!control.requires_resolution(), "{control:?}");
+        assert_eq!(control.count_unaffected(UnaffectedReason::ByDependency), 2);
+
+        let excluded_cases: Vec<(&str, Vec<Change>)> = vec![
+            (
+                "partition detach",
+                vec![Change::Partition(PartitionChange::DetachPartition {
+                    uid: Uid::generate(UidKind::Table),
+                    table: "app.p_1".parse().unwrap(),
+                    parent: "app.p".parse().unwrap(),
+                    names: vec![DetachedName {
+                        kind: DetachedKind::Index,
+                        parent: "ix_p".into(),
+                        name: Some("ix_p_1".into()),
+                    }],
+                    shape: Box::new(table_with_columns(&["id"])),
+                })],
+            ),
+            (
+                "partition attach",
+                vec![Change::Partition(PartitionChange::AttachPartition {
+                    uid: Uid::generate(UidKind::Table),
+                    table: "app.p_1".parse().unwrap(),
+                    parent: "app.p".parse().unwrap(),
+                    bound: PartitionBound::Default,
+                    key: vec!["id".into()],
+                    shape: Box::new(table_with_columns(&["id"])),
+                    rehearsal: None,
+                })],
+            ),
+            (
+                "partitioned table rebuild",
+                vec![Change::Partition(PartitionChange::RebuildPartitionedTable(
+                    Box::new(RebuildPartitionedTable {
+                        table: "app.p".parse().unwrap(),
+                        intent: Rebuild {
+                            source: RebuildIdentities {
+                                tables: BTreeMap::new(),
+                                columns: BTreeMap::new(),
+                            },
+                            replacement: RebuildIdentities {
+                                tables: BTreeMap::new(),
+                                columns: BTreeMap::new(),
+                            },
+                            replacement_root: Uid::generate(UidKind::Table),
+                            continues: BTreeMap::new(),
+                            target_checksum: "x".into(),
+                            max_rows: 1,
+                            allowed_at: "2026-11-27T00:00:00Z".into(),
+                            reason: "repartition".parse().unwrap(),
+                            operator: "2987".into(),
+                            types: BTreeMap::new(),
+                            conversions: BTreeMap::new(),
+                            exclusions: BTreeMap::new(),
+                        },
+                        earlier: Vec::new(),
+                        before: BTreeMap::new(),
+                        after: BTreeMap::new(),
+                    }),
+                ))],
+            ),
+            (
+                "create partitioned table",
+                vec![Change::Table(TableChange::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: "app.part_parent".parse().unwrap(),
+                    table: Box::new(Table {
+                        partition_by: Some(PartitionBy {
+                            strategy: Default::default(),
+                            columns: vec!["id".into()],
+                            external: false,
+                        }),
+                        ..table_with_columns(&["id"])
+                    }),
+                    beside_default: None,
+                    moves_at_most: None,
+                })],
+            ),
+            (
+                "create partition child",
+                vec![Change::Table(TableChange::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: "app.part_child".parse().unwrap(),
+                    table: Box::new(Table {
+                        partition_of: Some(PartitionOf {
+                            parent: "app.part_parent".parse().unwrap(),
+                            bound: PartitionBound::Default,
+                            columns: BTreeMap::new(),
+                        }),
+                        ..Table::default()
+                    }),
+                    beside_default: None,
+                    moves_at_most: None,
+                })],
+            ),
+            (
+                "enum rebuild",
+                vec![Change::TypeValue(TypeValueChange::EnumRebuild {
+                    uid: Uid::generate(UidKind::Type),
+                    name: "app.mood".parse().unwrap(),
+                    tmp: "app.mood__pbps_new".parse().unwrap(),
+                    step: EnumRebuildStep::Create {
+                        definition: Box::new(ManagedType::Enum {
+                            values: vec!["ok".into()],
+                        }),
+                        removed: Vec::new(),
+                        ordinal: 0,
+                        over: None,
+                        why: None,
+                    },
+                })],
+            ),
+            (
+                "extension arriving beside moving change",
+                vec![
+                    Change::Extension(ExtensionChange::CreateExtension {
+                        uid: Uid::generate(UidKind::Extension),
+                        name: "citext".into(),
+                        definition: Extension {
+                            schema: "ext".into(),
+                            version: "1.6".into(),
+                        },
+                        requires: BTreeSet::new(),
+                    }),
+                    add_column("app.other", "x"),
+                ],
+            ),
+            (
+                "extension arriving alone (stays today's Unaffected per DEC-2447.6)",
+                vec![Change::Extension(ExtensionChange::CreateExtension {
+                    uid: Uid::generate(UidKind::Extension),
+                    name: "citext".into(),
+                    definition: Extension {
+                        schema: "ext".into(),
+                        version: "1.6".into(),
+                    },
+                    requires: BTreeSet::new(),
+                })],
+            ),
+            (
+                "sql server add computed column",
+                vec![Change::Column(ColumnChange::AddComputedColumn {
+                    table: "app.other".parse().unwrap(),
+                    name: "c".into(),
+                    computed: ComputedColumn {
+                        expression: "id + 1".into(),
+                        persisted: false,
+                        not_null: false,
+                    },
+                })],
+            ),
+            (
+                "sql server drop computed column",
+                vec![Change::Column(ColumnChange::DropComputedColumn {
+                    table: "app.other".parse().unwrap(),
+                    name: "c".into(),
+                    computed: ComputedColumn {
+                        expression: "id + 1".into(),
+                        persisted: false,
+                        not_null: false,
+                    },
+                })],
+            ),
+            (
+                "schema grant",
+                vec![Change::Permission(GrantChange::Grant {
+                    role: "owner".into(),
+                    target: GrantTarget::Schema("ext".into()),
+                    permissions: BTreeSet::from([Permission::Usage]),
+                })],
+            ),
+        ];
+
+        for (label, changes) in excluded_cases {
+            let without_facts = run(&schema, &schema, changes.clone(), None);
+            let with_facts = run(&schema, &schema, changes, Some(&perfect));
+            assert_eq!(with_facts, without_facts, "{label}");
+        }
+    }
+
+    /// The `MERGE`-shaped case: a surface holding an edge on the relation
+    /// alone (no column edge for the target column `k`) stays `Resolve` when
+    /// column `k` is dropped or retyped, while a surface with no edge on `u`
+    /// is `Unaffected`.
+    #[test]
+    fn merge_shaped_relation_only_edge_stays_resolve_on_column_drop_and_retype() {
+        let mut schema = two_table_schema();
+        schema.modules.insert(
+            "app.c_merge()".parse().unwrap(),
+            routine(
+                "RETURNS void LANGUAGE sql BEGIN ATOMIC \
+                 MERGE INTO app.u USING app.t ON app.u.id = app.t.id \
+                 WHEN MATCHED THEN UPDATE SET k = app.t.k; END",
+            ),
+        );
+
+        let t: TableName = "app.t".parse().unwrap();
+        let u: TableName = "app.u".parse().unwrap();
+        let facts = clear_facts(BTreeMap::from([
+            // MERGE records only relation-level edge on `app.u` (nothing on `u.k`).
+            (
+                module_surface("app.c_merge()"),
+                parsed([
+                    DependencyEdge::Relation(u.clone()),
+                    DependencyEdge::Column(t.column("id")),
+                    DependencyEdge::Column(t.column("k")),
+                ]),
+            ),
+            (
+                module_surface("app.v_t"),
+                parsed([DependencyEdge::Column(t.column("id"))]),
+            ),
+            (
+                module_surface("app.v_u"),
+                parsed([DependencyEdge::Column(u.column("id"))]),
+            ),
+        ]));
+
+        let drop_k = Change::Column(ColumnChange::DropColumn {
+            uid: Uid::generate(UidKind::Column),
+            column: u.column("k"),
+        });
+        let retype_k = Change::Column(ColumnChange::AlterColumnType {
+            uid: Uid::generate(UidKind::Column),
+            column: u.column("k"),
+            from: "int".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: None,
+            through_external_partitions: false,
+            using: None,
+        });
+
+        for change in [drop_k, retype_k] {
+            let found = run(&schema, &schema, vec![change.clone()], Some(&facts));
+            assert_eq!(
+                found.questions[&module_surface("app.c_merge()")],
+                Answer::Resolve,
+                "{change:?}"
+            );
+            assert_eq!(
+                found.questions[&module_surface("app.v_u")],
+                Answer::Resolve,
+                "{change:?}"
+            );
+            assert_eq!(
+                found.questions[&module_surface("app.v_t")],
+                Answer::Unaffected,
+                "{change:?}"
+            );
+            assert_eq!(
+                found.unaffected_reason(&module_surface("app.v_t")),
+                Some(UnaffectedReason::ByDependency),
+                "{change:?}"
+            );
+        }
+    }
+
+    /// Relation-namespace indexes (`indexes_are_relations == true`): an added
+    /// index arrives as a relation name (catching text mentions and matching
+    /// edges), and a dropped index touches that index relation without
+    /// touching unrelated surfaces.
+    #[test]
+    fn relation_namespace_index_changes_narrow_by_index_relation_and_text_scan() {
+        let mut schema = two_table_schema();
+        schema.modules.insert(
+            "app.v_mentions_ix".parse().unwrap(),
+            view("SELECT 1 WHERE ARRAY[]::ix_new[] IS NULL"),
+        );
+        let base_ids = resolve_ids(&schema, &IdsFile::default());
+        let side = crate::Side {
+            schema: &schema,
+            ids: &base_ids,
+        };
+        let t: TableName = "app.t".parse().unwrap();
+        let ix_old: ObjectName = "app.ix_old".parse().unwrap();
+        let facts = DependencyFacts {
+            surfaces: BTreeMap::from([
+                (
+                    module_surface("app.v_t"),
+                    parsed([DependencyEdge::Relation(ix_old)]),
+                ),
+                (
+                    module_surface("app.v_u"),
+                    parsed([DependencyEdge::Column(t.column("id"))]),
+                ),
+                (module_surface("app.v_mentions_ix"), parsed([])),
+            ]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::from([("ix_new".into(), CatalogName::Clear)]),
+        };
+        let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
+        let eng = Engine {
+            indexes_are_relations: true,
+            normalize: &normalize,
+            filter_binds: true,
+        };
+        let code_only = |d: &str| pbps_dialect::Dialect::code_only(&MinimalDialect, d);
+        let lexicon = pbps_dialect::Dialect::lexicon(&MinimalDialect);
+        let lexis = Lexis {
+            code_only: &code_only,
+            quoted_identifiers: lexicon.quoted_identifiers,
+            continues_ident: lexicon.identifier_continues,
+            reserved: lexicon.reserved,
+            bare_rank: &pbps_model::module::every_schema,
+        };
+        let hooks = Hooks {
+            lexis: &lexis,
+            implicit_relations: &|_, _| Vec::new(),
+            owned_sequence: &|_, _, _| None,
+        };
+
+        let drop_ix = ChangeSet {
+            changes: vec![PlannedChange::new(Change::Index(IndexChange::DropIndex {
+                table: t.clone(),
+                name: "ix_old".into(),
+            }))],
+        };
+        let found = assessed_with_facts(side, side, &drop_ix, &eng, &hooks, Some(&facts));
+        assert_eq!(found.questions[&module_surface("app.v_t")], Answer::Resolve);
+        assert_eq!(
+            found.questions[&module_surface("app.v_u")],
+            Answer::Unaffected
+        );
+
+        let add_ix = ChangeSet {
+            changes: vec![PlannedChange::new(Change::Index(IndexChange::AddIndex {
+                table: t,
+                name: "ix_new".into(),
+                index: Box::new(Index {
+                    columns: Vec::new(),
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                }),
+                clustered: false,
+            }))],
+        };
+        let found = assessed_with_facts(side, side, &add_ix, &eng, &hooks, Some(&facts));
+        assert_eq!(
+            found.questions[&module_surface("app.v_mentions_ix")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.v_u")],
+            Answer::Unaffected
         );
     }
 }

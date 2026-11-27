@@ -19,7 +19,7 @@ pub(crate) fn part_effects(
     change.part_effects()
 }
 
-pub use assess::{Answer, Assessment, assess};
+pub use assess::{Answer, Assessment, UnaffectedReason, assess, assess_with_facts};
 
 use crate::order::resolver_finish::settle;
 use crate::order::{Baseline, Checks, Schedule, graph};
