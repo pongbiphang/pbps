@@ -18,6 +18,7 @@ use anyhow::Context as _;
 
 use pbps_db::Conn;
 use pbps_dialect::{Dialect, Statement};
+use pbps_diff::order::finish;
 use pbps_model::ColumnChange;
 use pbps_model::ConstraintChange;
 use pbps_model::GrantChange;
@@ -282,7 +283,7 @@ pub fn lower_between<D: crate::emission::Engine>(
     })?;
     // SQL Server has no passes of its own today.
     let build = crate::dependents::schedule::schedule(
-        build,
+        finish::standalone(build),
         &crate::dependents::schedule::Declarations {
             schema,
             sources: crate::dependents::Sources { before, after: ids },
@@ -292,7 +293,17 @@ pub fn lower_between<D: crate::emission::Engine>(
         dialect,
     )?
     .changes;
-    let ordered = build.ordered(pbps_model::PlanMode::Transactional, dialect);
+    let ordered = finish::offline(
+        build,
+        finish::Inputs {
+            before,
+            after,
+            modules: &hints.annotations.modules(after.schema),
+            captured: &Default::default(),
+        },
+        dialect,
+    )?
+    .ordered(pbps_model::PlanMode::Transactional, dialect);
     let lowered = crate::statements(&ordered, selected)?;
     Ok((lowered, pbps_dialect::PlanPayload::operations(&ordered)))
 }

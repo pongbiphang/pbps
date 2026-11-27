@@ -174,7 +174,56 @@ impl fmt::Display for Skipped {
     }
 }
 
-/// The plan in its final order, and what it took to get there.
+/// The shared schedule's result and what it took to get there.
+///
+/// ```compile_fail
+/// use pbps_diff::order::{Differ, deployment::schedule::Scheduled};
+/// use pbps_dialect::MinimalDialect;
+/// fn skip(scheduled: Scheduled<Differ, MinimalDialect>) {
+///     let _ = scheduled.changes.ordered(pbps_model::PlanMode::Transactional, &MinimalDialect);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::{Differ, PlanView, deployment::schedule::Scheduled};
+/// use pbps_dialect::{MinimalDialect, lower::{Lowering, lower_all}};
+/// fn lower<E: Lowering<Input = dyn PlanView<MinimalDialect>>>(
+///     scheduled: &Scheduled<Differ, MinimalDialect>, emitter: &E,
+/// ) {
+///     let _ = lower_all(&scheduled.changes as &dyn PlanView<MinimalDialect>, emitter);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::{Differ, deployment::schedule::Scheduled, seal};
+/// use pbps_dialect::MinimalDialect;
+/// fn seal_early(scheduled: Scheduled<Differ, MinimalDialect>, wire: pbps_model::SavedPlan) {
+///     let _ = seal::<MinimalDialect>(scheduled.changes, wire);
+/// }
+/// ```
+///
+/// ```
+/// use pbps_diff::{Side, diff, order::{finish, deployment::{
+///     Sources, schedule::{Declarations, Facts, schedule},
+/// }}};
+/// use pbps_dialect::MinimalDialect;
+/// use pbps_model::{Hints, IdsFile, PlanMode, Schema};
+/// let schema = Schema::default();
+/// let ids = IdsFile::default();
+/// let side = Side { schema: &schema, ids: &ids };
+/// let hints = Hints::default();
+/// let plan = diff(side, side, &MinimalDialect, &hints).unwrap();
+/// let scheduled = schedule(finish::standalone(plan), &Declarations {
+///     schema: &schema, sources: Sources { before: side, after: &ids },
+///     annotations: &hints.annotations,
+/// }, &Facts::default(), &MinimalDialect).unwrap();
+/// let inputs = finish::Inputs {
+///     before: side, after: side, modules: &Default::default(), captured: &Default::default(),
+/// };
+/// let finished = finish::offline(scheduled.changes, inputs, &MinimalDialect).unwrap();
+/// let ordered = finished.ordered(PlanMode::Transactional, &MinimalDialect);
+/// assert!(ordered.changes().changes.is_empty());
+/// ```
 pub struct Scheduled<
     S: crate::order::RouteState<D> = crate::order::Draft,
     D: Dialect + ?Sized = dyn Dialect,

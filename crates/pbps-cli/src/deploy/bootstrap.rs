@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::engine::{ApplySession as _, PlanSession as _};
+use pbps_diff::order::finish;
 
 /// `pbps bootstrap` — build the whole schema from the declarations.
 ///
@@ -465,7 +466,7 @@ pub(super) async fn bootstrap_async(
         // no column is released, and `weave` has nothing to add. The passes that
         // read nothing run, so the `--sql` script gets them too (#1955).
         let cs = crate::dependents::schedule::schedule(
-            cs,
+            finish::standalone(cs),
             &crate::dependents::schedule::Declarations {
                 schema: &loaded.schema,
                 sources: crate::dependents::Sources {
@@ -481,6 +482,23 @@ pub(super) async fn bootstrap_async(
             dialect.as_ref(),
         )?
         .changes;
+        let finished = finish::offline(
+            cs,
+            finish::Inputs {
+                before: pbps_diff::Side {
+                    schema: &prerequisites,
+                    ids: &prerequisite_ids,
+                },
+                after: pbps_diff::Side {
+                    schema: &loaded.schema,
+                    ids: &ids,
+                },
+                modules: &loaded.hints.annotations.modules(&loaded.schema),
+                captured: &Default::default(),
+            },
+            dialect.as_ref(),
+        )?;
+        let cs = finished.changes();
         // And the check `plan --db` runs on that final order (DEC-1576.1): an
         // expression naming, in a literal, a relation created only after it is
         // refused with the two-plan remedy, before any script or DDL, rather
@@ -493,12 +511,12 @@ pub(super) async fn bootstrap_async(
         let mut refused = Vec::new();
         if dialect.names_relations_in_literals() {
             let offline = crate::dependents::names_a_later_relation(
-                &cs,
+                cs,
                 dialect.as_ref(),
                 None,
                 &Schema::default(),
             );
-            let prefixes = crate::dependents::key_name_prefixes(&cs);
+            let prefixes = crate::dependents::key_name_prefixes(cs);
             match target {
                 Some(target)
                     if !prefixes.is_empty() || offline.iter().any(|n| !n.searched.is_empty()) =>
@@ -507,7 +525,7 @@ pub(super) async fn bootstrap_async(
                         let mut conn = db::connect(target).await?;
                         let holders = dialect.key_name_holders(&mut conn, &prefixes).await?;
                         for name in crate::dependents::names_a_later_relation(
-                            &cs,
+                            cs,
                             dialect.as_ref(),
                             Some(&holders),
                             &Schema::default(),
@@ -538,14 +556,12 @@ pub(super) async fn bootstrap_async(
         //
         // Emitted now and rendered at the write: the pins carry the zone the
         // build ran in, which a target tells only once connected (DEC-1916.1).
+        let ordered = finished.ordered(pbps_model::PlanMode::Transactional, dialect.as_ref());
+        let cs = ordered.changes();
         let script = sql_out
             .map(|_| {
-                crate::statements(
-                    &cs.clone()
-                        .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref()),
-                    &dialect,
-                )?
-                .bootstrap_script(&loaded.schema, &project.config.trusted_roles)
+                crate::statements(&ordered, &dialect)?
+                    .bootstrap_script(&loaded.schema, &project.config.trusted_roles)
             })
             .transpose()?;
         let write_script = |zone: &SessionZone| -> anyhow::Result<()> {
@@ -569,16 +585,12 @@ pub(super) async fn bootstrap_async(
             return write_script(&SessionZone::offline_utc()).map(|()| services::Bootstrap::Script);
         };
 
-        let statements = crate::statements(
-            &cs.clone()
-                .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref()),
-            &dialect,
-        )?;
+        let statements = crate::statements(&ordered, &dialect)?;
 
         Box::pin(async {
             let mut conn = db::connect(target).await?;
             let bootstrap_pins =
-                bootstrap_type_pins(&dialect, &mut conn, &loaded.schema, &cs, project).await?;
+                bootstrap_type_pins(&dialect, &mut conn, &loaded.schema, cs, project).await?;
             // A collation the server lacks is refused here, by name, rather than
             // by the `CREATE TABLE` that names it after the ones before it ran
             // (#1175).
@@ -594,8 +606,8 @@ pub(super) async fn bootstrap_async(
                 .refuse_history_references_alike(&mut conn, &loaded.schema)
                 .await?;
             // A history retention or a cascading key the server lacks (#1502).
-            dialect.refuse_unsupported_temporal(&mut conn, &cs).await?;
-            dialect.permission_support(&mut conn, &cs, &ids).await?;
+            dialect.refuse_unsupported_temporal(&mut conn, cs).await?;
+            dialect.permission_support(&mut conn, cs, &ids).await?;
             crate::engine::lock(&mut conn, operator).await?;
             let mut transaction_attempted = false;
             let result = async {
@@ -636,7 +648,7 @@ pub(super) async fn bootstrap_async(
                 // success and records a snapshot that does not hold the grant
                 // (#261).
                 dialect.owned_targets(
-                    &cs,
+                    cs,
                     &ids,
                     &existing.scoped.owners,
                     &existing.scoped.session_role,
@@ -646,8 +658,7 @@ pub(super) async fn bootstrap_async(
                 // PostgreSQL grants use existing cluster roles; their existence
                 // is outside this database's ownership (DECISIONS 211).
                 let (wanted, vacated) = role_name_expectations(
-                    &cs.clone()
-                        .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref()),
+                    &ordered,
                     dialect.as_ref(),
                     pbps_model::PlanMode::Transactional,
                     0,
@@ -656,7 +667,7 @@ pub(super) async fn bootstrap_async(
                 // A history name already taken: SQL Server takes an existing
                 // table whose columns match as the history, with its rows,
                 // instead of refusing (measured on 17.0, #1176).
-                refuse_taken_history_names(&dialect, &mut conn, &cs, &target.label).await?;
+                refuse_taken_history_names(&dialect, &mut conn, cs, &target.label).await?;
 
                 refuse_extension_prerequisite_drift(
                     &existing.scoped.schema,
@@ -677,7 +688,7 @@ pub(super) async fn bootstrap_async(
                     .recheck_prerequisites(
                         &mut conn,
                         &bootstrap_pins,
-                        &cs,
+                        cs,
                         &project.config.trusted_roles,
                         pbps_db::TransactionOwner::OwnTransaction,
                     )
@@ -688,7 +699,7 @@ pub(super) async fn bootstrap_async(
                     &dialect,
                     &statements,
                     &bootstrap_pins,
-                    &cs,
+                    cs,
                     &project.config.trusted_roles,
                 )
                 .await?;
@@ -697,7 +708,7 @@ pub(super) async fn bootstrap_async(
                 dialect
                     .refuse_unsafe_definers(
                         &mut conn,
-                        &crate::engine::written_routines(&cs),
+                        &crate::engine::written_routines(cs),
                         crate::engine::Absent::Refused,
                     )
                     .await?;
@@ -743,7 +754,7 @@ pub(super) async fn bootstrap_async(
                 // the unexpressible list (DECISIONS 371, 517). The same
                 // postcondition the apply paths ask, at the read this command
                 // records.
-                refuse_unmet_public_execution(&cs, &built, &target.label)?;
+                refuse_unmet_public_execution(cs, &built, &target.label)?;
                 // Only the uids of what this build made. The ids file may name
                 // tables, types and roles these declarations do not hold; recording
                 // those as held would make the next plan skip them (#1600, #1606).
@@ -759,7 +770,7 @@ pub(super) async fn bootstrap_async(
                     .recheck_prerequisites(
                         &mut conn,
                         &bootstrap_pins,
-                        &cs,
+                        cs,
                         &project.config.trusted_roles,
                         pbps_db::TransactionOwner::CallersTransaction,
                     )

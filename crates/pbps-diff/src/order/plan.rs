@@ -57,6 +57,28 @@ impl<D: pbps_dialect::Dialect + ?Sized> RouteState<D> for Differ {
     type Output = Canonical<D>;
     type Input = Continuing<D>;
 }
+/// A declaration build whose shared schedule is its last ordering pass.
+#[derive(Debug, Clone)]
+pub struct Standalone;
+impl<D: ?Sized> route_state::Sealed<D> for Standalone {}
+impl<D: pbps_dialect::Dialect + ?Sized> RouteState<D> for Standalone {
+    type Output = StandaloneScheduled<D>;
+    type Input = Draft;
+}
+
+/// The shared schedule's result on the standalone route, before finishing.
+pub struct StandaloneScheduled<D: ?Sized>(std::marker::PhantomData<fn(&D) -> &D>);
+impl<D: ?Sized> Clone for StandaloneScheduled<D> {
+    fn clone(&self) -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+impl<D: ?Sized> std::fmt::Debug for StandaloneScheduled<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StandaloneScheduled")
+    }
+}
+
 impl<D: ?Sized> route_state::Sealed<D> for Canonical<D> {}
 impl<D: pbps_dialect::Dialect + ?Sized> RouteState<D> for Canonical<D> {
     type Output = Canonical<D>;
@@ -113,14 +135,14 @@ impl<D: ?Sized> std::fmt::Debug for Canonical<D> {
 /// the differ's preceding sort and rename stages.
 /// ```compile_fail
 /// use pbps_diff::{Side, order::{deployment::{Sources, schedule::{Declarations, Facts, schedule}}, propose}};
-/// fn copied_input(dialect: &pbps_dialect::MinimalDialect) {
+/// fn copied_input(dialect: &pbps_dialect::MinimalDialect, inputs: pbps_diff::order::finish::Inputs<'_>) {
 /// let schema = pbps_model::Schema::default();
 /// let ids = pbps_model::IdsFile::default();
 /// let result = schedule(propose(pbps_model::ChangeSet::default()), &Declarations {
 ///     schema: &schema, sources: Sources { before: Side { schema: &schema, ids: &ids }, after: &ids },
 ///     annotations: &Default::default(),
 /// }, &Facts::default(), dialect).unwrap();
-/// let _ = result.changes.ordered(pbps_model::PlanMode::Transactional, dialect);
+/// let _ = pbps_diff::order::finish::offline(result.changes, inputs, dialect);
 /// }
 /// ```
 pub type CanonicalPlan<D> = PlanningPlan<Canonical<D>>;
@@ -149,12 +171,6 @@ pub(super) fn canonical<D: pbps_dialect::Dialect + ?Sized>(
     done.captured = plan.captured;
     Ok(done)
 }
-impl<D: pbps_dialect::Dialect + ?Sized> CanonicalPlan<D> {
-    pub fn ordered(self, mode: PlanMode, dialect: &D) -> OrderedPlan<D> {
-        OrderedPlan::from_canonical(self, mode, dialect)
-    }
-}
-
 /// An immutable intermediate result. Ordering another stage may replace it,
 /// but neither it nor a cloned payload can be passed to an engine.
 ///
@@ -323,11 +339,13 @@ impl<S> PartialEq<PlanningPlan<S>> for ChangeSet {
 /// canonical route before execution; an empty settlement cannot certify them.
 /// A copied rebuild part remains a draft even after settlement:
 /// ```compile_fail
-/// fn partial(copy: pbps_model::CopyTableRows) {
+/// fn partial(copy: pbps_model::CopyTableRows, inputs: pbps_diff::order::finish::Inputs<'_>) {
 ///     let draft = pbps_diff::order::propose(pbps_model::ChangeSet {
 ///         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Partition(pbps_model::PartitionChange::CopyTableRows(Box::new(copy))))],
 ///     });
-///     draft.ordered(pbps_model::PlanMode::Transactional, &pbps_dialect::MinimalDialect);
+///     use pbps_diff::order::finish;
+///     let _ = finish::connected(draft, inputs, &pbps_dialect::MinimalDialect,
+///         finish::Catalog { slots: None, verified: false });
 /// }
 /// ```
 /// A model-owned root cannot impersonate a certified input:
@@ -457,30 +475,21 @@ impl<D: ?Sized> OrderedPlan<D> {
     where
         D: pbps_dialect::Dialect,
     {
-        plan.boundaries
-            .ensure(&plan)
-            .expect("pending boundaries cannot enter a certified emitter");
-        Self {
-            identities: plan.identities.unwrap_or_else(|| {
-                pbps_model::operation::Operations::expanded(
-                    plan.logical,
-                    plan.origins
-                        .iter()
-                        .cloned()
-                        .zip(plan.payload.changes.iter().cloned()),
-                    pbps_model::operation::ModuleEdits::InPlace,
-                )
-            }),
-            changes: plan.payload,
-            origins: plan.origins,
-            proof: plan.proof,
-            mode,
-            dialect: dialect.name(),
-            brand: std::marker::PhantomData,
-        }
+        Self::from_planning(plan, mode, dialect)
     }
 
-    fn from_canonical(plan: CanonicalPlan<D>, mode: PlanMode, dialect: &D) -> Self
+    pub(super) fn from_finished(
+        plan: super::finish::FinishedPlan<D>,
+        mode: PlanMode,
+        dialect: &D,
+    ) -> Self
+    where
+        D: pbps_dialect::Dialect,
+    {
+        Self::from_planning(plan.into_canonical(), mode, dialect)
+    }
+
+    fn from_planning<S>(plan: PlanningPlan<S>, mode: PlanMode, dialect: &D) -> Self
     where
         D: pbps_dialect::Dialect,
     {

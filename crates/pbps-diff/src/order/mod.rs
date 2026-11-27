@@ -33,10 +33,10 @@ The emitter fixture constructor is absent from an ordinary external build:
 
 ```compile_fail
 let _ = pbps_diff::order::singleton(
-    pbps_model::PlannedChange::new(pbps_model::Change::CreateRole {
+    pbps_model::PlannedChange::new(pbps_model::Change::Role(pbps_model::RoleChange::CreateRole {
         uid: "r_aaaaaa".parse().unwrap(),
         name: "reader".into(),
-    }),
+    })),
     pbps_model::PlanMode::Transactional,
     &pbps_dialect::MinimalDialect,
 );
@@ -52,6 +52,7 @@ mod companions;
 pub mod deployment;
 pub mod edges;
 pub mod expand;
+pub mod finish;
 pub mod generated;
 pub(crate) mod last_column;
 pub mod membership;

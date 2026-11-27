@@ -227,8 +227,7 @@ pub fn canonical(
         step.change,
         pbps_model::Change::Partition(pbps_model::PartitionChange::AttachPartition { .. })
     )));
-    let ordered = done
-        .changes
+    let ordered = pbps_diff::order::finish::finish_fixture(done.changes)
         .ordered(pbps_model::PlanMode::Transactional, &pg);
     assert!(!ordered.changes().changes.is_empty());
     Ok(ordered.changes().clone())

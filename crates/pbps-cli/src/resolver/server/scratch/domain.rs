@@ -8,6 +8,7 @@ use crate::resolver::contract::{PreparedView, ResolverEngine};
 use pbps_db::resolver::environment::Verdict;
 use pbps_db::{Conn, Driver};
 use pbps_dialect::Dialect;
+use pbps_diff::order::finish;
 use pbps_model::{Hints, IdsFile, ModuleKind, PlanMode, Schema};
 
 /// The code vet is a PostgreSQL operation by design.
@@ -120,8 +121,8 @@ pub(super) async fn run(
         pbps_diff::bootstrap(base, desired_types, &dialect, &hints).map_err(|errors| {
             unavailable(format!("the declared types cannot be ordered: {errors:?}"))
         })?;
-    let ordered = pbps_diff::order::deployment::schedule::schedule(
-        bootstrap.clone(),
+    let scheduled = pbps_diff::order::deployment::schedule::schedule(
+        finish::standalone(bootstrap.clone()),
         &pbps_diff::order::deployment::schedule::Declarations {
             schema: &types,
             sources: pbps_diff::order::deployment::Sources {
@@ -133,8 +134,18 @@ pub(super) async fn run(
         &Default::default(),
         &dialect,
     )
+    .map_err(|error| unavailable(error.to_string()))?;
+    let ordered = finish::offline(
+        scheduled.changes,
+        finish::Inputs {
+            before: base,
+            after: desired_types,
+            modules: &hints.annotations.modules(&types),
+            captured: &Default::default(),
+        },
+        &dialect,
+    )
     .map_err(|error| unavailable(error.to_string()))?
-    .changes
     .ordered(PlanMode::Transactional, &dialect);
     let lowered = pbps_dialect::lower::lower_all(
         &ordered as &dyn pbps_diff::order::PlanView<pbps_pg::Postgres>,

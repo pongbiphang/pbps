@@ -5129,7 +5129,7 @@ mod operations {
         let ordered = plan(base, desired, &Hints::default(), &observations, dialect).unwrap();
         assert_eq!(first.ordered.changes, ordered.changes);
         assert_eq!(first.ordered.proof, ordered.proof);
-        let certified = ordered.changes.clone().ordered(
+        let certified = crate::order::finish::finish_fixture(ordered.changes.clone()).ordered(
             pbps_model::PlanMode::Transactional,
             &pbps_dialect::MinimalDialect,
         );
@@ -5147,11 +5147,11 @@ mod operations {
         let continued = later
             .settle(ordered.changes.clone())
             .unwrap()
-            .into_planning()
-            .ordered(
-                pbps_model::PlanMode::Transactional,
-                &pbps_dialect::MinimalDialect,
-            );
+            .into_planning();
+        let continued = crate::order::finish::finish_fixture(continued).ordered(
+            pbps_model::PlanMode::Transactional,
+            &pbps_dialect::MinimalDialect,
+        );
         let continued_operations = pbps_dialect::PlanPayload::operations(&continued);
         assert_eq!(
             continued_operations.as_slice()[3].id(),

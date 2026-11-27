@@ -131,16 +131,11 @@ pub(crate) fn plan(
         ids: base.1,
     };
     let hints = Hints::default();
-    let planned = pbps_diff::diff(
-        before,
-        pbps_diff::Side {
-            schema: declared.0,
-            ids: declared.1,
-        },
-        dialect,
-        &hints,
-    )
-    .map_err(|errors| {
+    let after = pbps_diff::Side {
+        schema: declared.0,
+        ids: declared.1,
+    };
+    let planned = pbps_diff::diff(before, after, dialect, &hints).map_err(|errors| {
         errors
             .iter()
             .map(ToString::to_string)
@@ -148,7 +143,7 @@ pub(crate) fn plan(
             .join("\n")
     })?;
     let scheduled = schedule(
-        planned,
+        pbps_diff::order::finish::standalone(planned),
         &Declarations {
             schema: declared.0,
             sources: Sources {
@@ -161,7 +156,18 @@ pub(crate) fn plan(
         dialect,
     )
     .map_err(|error| error.to_string())?;
-    let ordered = scheduled.changes.ordered(PlanMode::Transactional, dialect);
+    let ordered = pbps_diff::order::finish::offline(
+        scheduled.changes,
+        pbps_diff::order::finish::Inputs {
+            before,
+            after,
+            modules: &hints.annotations.modules(after.schema),
+            captured: &Default::default(),
+        },
+        dialect,
+    )
+    .map_err(|error| error.to_string())?
+    .ordered(PlanMode::Transactional, dialect);
     let lowered =
         lower_all(&ordered as &dyn PlanView<Sqlite>, dialect).map_err(|error| error.to_string())?;
     Ok(lowered.statements().to_vec())

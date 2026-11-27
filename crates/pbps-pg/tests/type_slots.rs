@@ -404,7 +404,8 @@ async fn replacement_type_slots_apply_new_dependents_and_refuse_retained_binding
                 )
                 .unwrap()
                 .changes;
-                let ordered = ordered.ordered(pbps_model::PlanMode::Transactional, &dialect);
+                let ordered = pbps_diff::order::finish::finish_fixture(ordered)
+                    .ordered(pbps_model::PlanMode::Transactional, &dialect);
                 let lowered = pbps_dialect::lower::lower_all(
                     &ordered as &dyn pbps_diff::order::PlanView<pbps_pg::Postgres>,
                     &dialect,

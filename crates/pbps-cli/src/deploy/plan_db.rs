@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::engine::PlanSession as _;
+use pbps_diff::order::finish;
 
 /// Advisory only: a reused name supplies no identity intent (SPEC 14.3).
 pub(crate) fn type_replacement_warnings(
@@ -1012,15 +1013,11 @@ pub(super) async fn plan_db_selected(
                 .external_role_renames(&mut conn, &recorded_snapshot.ids, &resolved.ids)
                 .await?
                 .check;
-            // The plan carries what the resolver's run bound at creation, so
-            // every pass that orders it again reads the same bindings. Only the
-            // observer below judges the finished `ChangeSet`, which does not
-            // (DEC-2143.8).
-            #[cfg(debug_assertions)]
+            // The final stage reads the same bindings as the earlier passes (DEC-2143.8).
+            let empty_capture = Default::default();
             let captured = resolution
                 .as_ref()
-                .map(|(_, unsealed, _)| unsealed.captured().clone())
-                .unwrap_or_default();
+                .map_or(&empty_capture, |(_, unsealed, _)| unsealed.captured());
             // First, so that what it adds is held to every check after it: a
             // view this plan now drops and recreates takes `before_a_rebuild`
             // like one the declarations edit (#314, ADR-0009 §4).
@@ -1068,33 +1065,17 @@ pub(super) async fn plan_db_selected(
             let ordered = dialect
                 .order_by_catalog(&mut plan_state, &mut conn, &mut cs, frame)
                 .await?;
-            // Every pass that orders the plan has run: the verifier checks the
-            // order that is saved and applied, in tests and debug builds
-            // (#1954, DEC-1954.6), and the engine says when it already has.
-            // Debug assertions alone, not `cfg(test)`: `pbps-diff` is compiled
-            // without its own `cfg(test)` here, so a release test build has no
-            // observer to call.
-            #[cfg(debug_assertions)]
-            if !ordered.verified { pbps_diff::order::shadow::observe_scheduled(
-                pbps_diff::Side {
-                    schema: &recorded_snapshot.schema,
-                    ids: &recorded_ids,
-                },
-                pbps_diff::Side {
-                    schema: &loaded.schema,
-                    ids: &resolved.ids,
+            let cs = finish::connected(
+                cs,
+                finish::Inputs {
+                    before: frame.recorded,
+                    after: frame.written,
+                    modules: &hints.annotations.modules(frame.written.schema),
+                    captured,
                 },
                 dialect.as_ref(),
-                &hints.annotations.modules(&loaded.schema),
-                &cs,
-                pbps_diff::order::shadow::Stage::Final,
-                Some(&ordered.facts.unwrap_or_default()),
-                &captured,
-            )?; }
-            // The observer's own gate: a release test build has `cfg(test)`
-            // but no observer, so the facts are spent here too (#2089).
-            #[cfg(not(debug_assertions))]
-            let _ = (ordered.verified, ordered.facts);
+                finish::Catalog { slots: ordered.facts.as_ref(), verified: ordered.verified },
+            )?;
             let checks = dialect
                 .check_final_order(&plan_state, &mut conn, cs.changes(), frame)
                 .await?;
@@ -1219,12 +1200,15 @@ pub(super) async fn plan_db_selected(
         // one place a change window has a moment and a target to be measured
         // against. An `error` refuses the plan here, before anything is
         // written; `apply` never sees a policy.
-        let policy = crate::attach_policy_findings(
-            &mut cs, project, dialect.as_ref(), true,
+        let (policy, step_findings) = crate::policy_findings(
+            cs.changes(), project, dialect.as_ref(), true,
             pbps_diff::Side { schema: &base, ids: &recorded_ids },
             pbps_diff::Side { schema: &declared, ids: &resolved.ids },
             retirement_revision.as_ref(),
         );
+        if let Some(step_findings) = step_findings {
+            cs = finish::record_findings(cs, &step_findings);
+        }
         if !json {
             for f in &policy {
                 eprintln!("{}: {} — {}", f.severity_word(), f.id, f.message);
@@ -1379,7 +1363,7 @@ pub(super) async fn plan_db_selected(
                 if let Some(finding) = finding {
                     // Keep the warning with the approved typed change as
                     // well as in the command's findings envelope.
-                    pbps_diff::order::writebacks::findings(&mut cs, &[(0, finding.clone())]);
+                    cs = finish::record_findings(cs, &[(0, finding.clone())]);
                     let finding = crate::policy_finding(&finding);
                     if finding.severity == crate::output::Severity::Error {
                         return Ok(Connected::Refused { finding, findings });
@@ -1414,8 +1398,8 @@ pub(super) async fn plan_db_selected(
                         return Ok(Connected::Refused { finding, findings });
                     }
                 };
-                let sealed = rechecked
-                    .seal(cs.clone(), base_side, desired_side)
+                let (finished, evidence) = rechecked
+                    .seal_finished(cs, base_side, desired_side)
                     .map_err(|e| {
                         anyhow::anyhow!(
                             "the resolver's evidence could not be sealed over the final plan: {e}; \
@@ -1425,13 +1409,9 @@ pub(super) async fn plan_db_selected(
                 resolver_assessment
                     .as_mut()
                     .expect("a successful resolver run has an assessment")
-                    .record_authorization(sealed.evidence.qualification().authorization);
-                cs = sealed.changes;
-                Some(Resolution {
-                    name,
-                    asked,
-                    evidence: sealed.evidence,
-                })
+                    .record_authorization(evidence.qualification().authorization);
+                cs = finished;
+                Some(Resolution { name, asked, evidence })
             }
         };
         let crate::engine::DeclaredTypes {
@@ -1470,11 +1450,11 @@ pub(super) async fn plan_db_selected(
                 }
             );
         }
+        let ordered = cs.ordered(plan_mode(staged), dialect.as_ref());
         let mut manifests = crate::rehearsal::connected::Manifests::new();
         let rehearsal = match course {
             Course::Off => Some(pbps_model::Rehearsal::Off),
             Course::Rehearse => {
-                let ordered = cs.clone().ordered(plan_mode(staged), dialect.as_ref());
                 let lowered = crate::statements(&ordered, &dialect)?;
                 let mut base_hints = hints.clone();
                 base_hints.annotations = hints.annotations.baseline();
@@ -1532,10 +1512,10 @@ pub(super) async fn plan_db_selected(
             pins: extension_pins,
             drops: extension_drops,
         } = dialect
-            .extension_seals(&mut conn, &cs, manifests, &declared, &resolved.ids)
+            .extension_seals(&mut conn, ordered.changes(), manifests, &declared, &resolved.ids)
             .await?;
         Ok(Connected::Ordinary(Box::new((
-            cs,
+            ordered,
             // The zone this session started in: what every offset-less
             // value above was read in, and what the apply pins (DEC-1916.1).
             (
@@ -1574,7 +1554,7 @@ pub(super) async fn plan_db_selected(
         ))))
     }).await?;
         let (
-            cs,
+            ordered,
             (baseline_checksum, baseline_collation, baseline_zone),
             baseline_description,
             connected_checks,
@@ -1606,22 +1586,20 @@ pub(super) async fn plan_db_selected(
             }
         };
 
-        if staged && pbps_diff::order::row_security::requires_transaction(&cs) {
+        let cs = ordered.changes();
+        if staged && pbps_diff::order::row_security::requires_transaction(cs) {
             bail!(
                 "row-security changes require a transactional plan; --staged is unsupported (DEC-1173.3)"
             );
         }
-        let statements = crate::statements(
-            &cs.clone().ordered(plan_mode(staged), dialect.as_ref()),
-            &dialect,
-        )?;
+        let statements = crate::statements(&ordered, &dialect)?;
         if staged {
             // A staged plan is one logical change isolated in a deployment of its
             // own (ADR-0003). The limit is the whole point: what cannot be rolled
             // back must not be able to take four unrelated changes down with it,
             // and a resume that had to reason about which of five changes were
             // half-done would be guessing.
-            let logical = crate::logical_changes(&cs);
+            let logical = crate::logical_changes(cs);
             if logical > 1 {
                 bail!(
                     "--staged applies one logical change, and this plan has {logical}.\n\
@@ -1663,7 +1641,7 @@ pub(super) async fn plan_db_selected(
             type_routines: reviewed.0.clone(),
             type_routine_approval: (!reviewed.0.is_empty())
                 .then(|| crate::pins::TYPE_ROUTINE_APPROVAL.to_owned()),
-            origins: crate::report::origins(&cs),
+            origins: crate::report::origins(cs),
             cost: Some(cost),
             resolver_selection,
             resolver_assessment,
@@ -1711,7 +1689,7 @@ pub(super) async fn plan_db_selected(
                 println!("Rehearsal: {}", crate::explain::rehearsal_line(detail));
                 print!("{}", crate::explain::rehearsal_render(detail));
             }
-            print!("{}", crate::report::plan(&cs, &names));
+            print!("{}", crate::report::plan(cs, &names));
             if let Some(note) = findings.iter().find(|f| f.id == "plan.undeclared-comments") {
                 println!("{}", note.message);
             }
@@ -1733,7 +1711,7 @@ pub(super) async fn plan_db_selected(
                 database_collation: baseline_collation,
                 time_zone: baseline_zone,
             },
-            cs.changes().clone(),
+            cs.clone(),
             resolved.ids,
         );
         plan.object_deps = loaded
@@ -1807,7 +1785,7 @@ pub(super) async fn plan_db_selected(
             )?
         ))
     }).transpose()?;
-        let plan = pbps_diff::order::seal(cs.ordered(plan.mode, dialect.as_ref()), plan)?;
+        let plan = pbps_diff::order::seal(ordered, plan)?;
         Ok(services::PlanResult::Planned(Box::new(services::Planned {
             artifact: Box::new(plan),
             script,

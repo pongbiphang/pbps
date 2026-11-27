@@ -2447,3 +2447,22 @@ A SQLite-only fallback would leave one exception to remember. The rewrite pass m
 If one of these refusals stops a valid plan, the fix is to make that step readable by stating the fact it lacks. The lenient reading does not come back.
 
 The name-slot readers still apply their own rules through the paired view. Settlement in release builds remains open.
+
+<a id="dec-2993-10"></a>
+
+**DEC-2993.10. A fresh plan needs the final stage before it can become ordered (#2993).** The shared scheduler and resolver return engine-branded intermediates. The final stage alone makes a private `FinishedPlan<D>` after the route's last ordering pass. Only that value converts to `OrderedPlan<D>`. Until settlement lands, it proves only that the final stage ran.
+
+The types pin the call where a convention would leave each lowerer and publisher to remember it. A standalone marker is selected on a differ result and returned by the same shared scheduler. The connected continuation has a separate type and reaches the final stage only with its route facts and catalog result. A connected result cannot take the standalone entry point.
+
+The connected observer runs on the same inputs under its existing debug gate. The rebuild's own verifier still runs before that join and the stage trusts its success flag. The shared `Differ` observation stays where it is. The standalone stage carries the existing sequence. Refusals, plan bytes, mode, checksums and formats stay the same. Saved plans enter through checked admission and keep their reviewed order.
+
+Two closed operations carry late connected metadata. Findings attach to the same indexed steps and refresh the existing proof. Resolver remap keeps each step's position and carries the resolver's edges and operation identities to that sequence. Both stay at their existing points in the refusal order.
+
+Rejected:
+
+- A generic payload mapper could change positions while keeping the final mark.
+- A second final-stage call after the metadata would repeat the connected observation.
+- Settlement in this pull request would combine a new ordering rule with changes to every route end before the measurement.
+- Refusing first could reject a valid plan that the settlement is meant to repair.
+
+The route-end measurement, final settlement and the rule for unread name-slot rows at a route end remain open.

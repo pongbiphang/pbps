@@ -102,15 +102,18 @@ pub(super) struct Identity {
 
 /// Seals `changes`, the plan in its final order, with `proof` over that
 /// order.
-pub(super) fn seal<D: super::PlanningDialect, S>(
+fn seal_evidence<D: super::PlanningDialect>(
     key: &EnvironmentFingerprintKey,
     sealed: Sealing<D>,
-    changes: pbps_diff::order::PlanningPlan<S>,
+    changes: &pbps_model::ChangeSet,
     proof: pbps_model::resolver::OrderingProof,
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
-    object_grants: Vec<pbps_model::resolver::AuthorizationGrant>,
-) -> Result<ResolvedPlan<S>, Error> {
+    catalog: Option<&pbps_db::catalog::Pulled>,
+) -> Result<ResolverEvidence, Error> {
+    let object_grants =
+        <D::Resolver as ResolverEngine>::seal_grants(key, changes, desired.ids, catalog)
+            .map_err(Error::Scope)?;
     let Sealing {
         planned,
         opening_catalog,
@@ -124,7 +127,7 @@ pub(super) fn seal<D: super::PlanningDialect, S>(
         producer,
         opening,
     } = sealed;
-    let grants = scope::planned_schema_grants(&changes).map_err(Error::Scope)?;
+    let grants = scope::planned_schema_grants(changes).map_err(Error::Scope)?;
     if grants != planned {
         return Err(Error::Scope(
             "the final ordered grants disagree with the qualified scope".into(),
@@ -146,7 +149,7 @@ pub(super) fn seal<D: super::PlanningDialect, S>(
     let persisted = scope::persisted_after::<D::Resolver>(
         &authorization,
         key,
-        &changes,
+        changes,
         object_grants,
         authorization_condition.as_ref(),
     )
@@ -159,7 +162,7 @@ pub(super) fn seal<D: super::PlanningDialect, S>(
     // scratch capture is sealed exactly once under the selected key.
     let opening_records = super::resolution::records(&opening);
     let transitions =
-        transitions::derive_for::<D>(&changes, base, desired, &opening_records, &compiled_records)?;
+        transitions::derive_for::<D>(changes, base, desired, &opening_records, &compiled_records)?;
     let compiled = producer
         .compiled
         .seal_for_plan()
@@ -204,8 +207,8 @@ pub(super) fn seal<D: super::PlanningDialect, S>(
             write_path_extras: write_path_extras.clone(),
         },
     };
-    let evidence = ResolverEvidence::new(
-        &changes,
+    ResolverEvidence::new(
+        changes,
         qualification,
         persisted,
         opening,
@@ -214,8 +217,7 @@ pub(super) fn seal<D: super::PlanningDialect, S>(
         transitions,
         proof,
     )
-    .map_err(|error| Error::Binding(format!("closing evidence projection: {error}")))?;
-    Ok(ResolvedPlan { changes, evidence })
+    .map_err(|error| Error::Binding(format!("closing evidence projection: {error}")))
 }
 
 /// A run's answer before its evidence is sealed (#1516). The run is over and
@@ -415,23 +417,39 @@ impl<D: super::PlanningDialect> Rechecked<D> {
         let changes =
             pbps_diff::order::resolver_remap::finish(&run.ordered.changes, changes, describe)
                 .map_err(Error::Binding)?;
-        let proof = changes.proof().clone();
-        let object_grants = <D::Resolver as ResolverEngine>::seal_grants(
-            &run.key,
-            &changes,
-            desired.ids,
-            grants.as_deref(),
-        )
-        .map_err(Error::Scope)?;
-        seal::<D, _>(
+        let evidence = seal_evidence::<D>(
             &run.key,
             run.sealing,
-            changes,
-            proof,
+            changes.changes(),
+            changes.proof().clone(),
             base,
             desired,
-            object_grants,
-        )
+            grants.as_deref(),
+        )?;
+        Ok(ResolvedPlan { changes, evidence })
+    }
+
+    /// Remap the resolver's evidence over the finished connected sequence.
+    pub fn seal_finished(
+        self,
+        changes: pbps_diff::order::finish::FinishedPlan<D>,
+        base: pbps_diff::Side<'_>,
+        desired: pbps_diff::Side<'_>,
+    ) -> Result<(pbps_diff::order::finish::FinishedPlan<D>, ResolverEvidence), Error> {
+        let Rechecked(run, grants) = self;
+        let changes =
+            pbps_diff::order::finish::remap_resolver(&run.ordered.changes, changes, describe)
+                .map_err(Error::Binding)?;
+        let evidence = seal_evidence::<D>(
+            &run.key,
+            run.sealing,
+            changes.changes(),
+            changes.proof().clone(),
+            base,
+            desired,
+            grants.as_deref(),
+        )?;
+        Ok((changes, evidence))
     }
 
     /// The plan in the resolver's own order.

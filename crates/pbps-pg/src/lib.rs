@@ -1085,16 +1085,16 @@ fn default_problems(
 ///     let _ = pbps_dialect::lower::lower_all::<pbps_pg::Postgres>(plan, &pbps_pg::Postgres::new());
 /// }
 /// ```
-/// Canonical completion also keeps its planner: the final constructor cannot
-/// relabel a completed PostgreSQL route as SQL Server, or the reverse.
+/// The final stage keeps its planner's brand through the conversion to
+/// an ordered plan.
 ///
 /// ```compile_fail
-/// fn pg_canonical_cannot_reach_mssql(plan: pbps_diff::order::CanonicalPlan<pbps_pg::Postgres>) {
+/// fn pg_finished_cannot_reach_mssql(plan: pbps_diff::order::finish::FinishedPlan<pbps_pg::Postgres>) {
 ///     let _ = plan.ordered(pbps_model::PlanMode::Transactional, &pbps_mssql::Mssql);
 /// }
 /// ```
 /// ```compile_fail
-/// fn mssql_canonical_cannot_reach_pg(plan: pbps_diff::order::CanonicalPlan<pbps_mssql::Mssql>) {
+/// fn mssql_finished_cannot_reach_pg(plan: pbps_diff::order::finish::FinishedPlan<pbps_mssql::Mssql>) {
 ///     let _ = plan.ordered(pbps_model::PlanMode::Transactional, &pbps_pg::Postgres::new());
 /// }
 /// ```
@@ -1106,9 +1106,7 @@ fn default_problems(
 /// fn rescheduling_pg_to_mssql(plan: pbps_diff::order::CanonicalPlan<pbps_pg::Postgres>,
 ///     declared: &Declarations<'_>, facts: &Facts<'_>) {
 ///     let dialect = pbps_mssql::Mssql;
-///     let scheduled = schedule(plan, declared, facts, &dialect).unwrap();
-///     let ordered = scheduled.changes.ordered(pbps_model::PlanMode::Transactional, &dialect);
-///     let _ = pbps_dialect::lower::lower_all::<pbps_mssql::Mssql>(&ordered, &dialect);
+///     let _ = schedule(plan, declared, facts, &dialect);
 /// }
 /// ```
 ///
@@ -1119,8 +1117,7 @@ fn default_problems(
 ///     let scope = pbps_diff::order::writebacks::ScopeInput::new(vec![]).unwrap();
 ///     let pending = scope.append_to(plan, &pbps_pg::Postgres::new());
 ///     let dialect = pbps_mssql::Mssql;
-///     let scheduled = schedule(pending, declared, facts, &dialect).unwrap();
-///     let _ = scheduled.changes.ordered(pbps_model::PlanMode::Transactional, &dialect);
+///     let _ = schedule(pending, declared, facts, &dialect);
 /// }
 /// ```
 ///
@@ -1158,9 +1155,7 @@ fn default_problems(
 /// fn rescheduling_mssql_to_pg(plan: pbps_diff::order::CanonicalPlan<pbps_mssql::Mssql>,
 ///     declared: &Declarations<'_>, facts: &Facts<'_>) {
 ///     let dialect = pbps_pg::Postgres::new();
-///     let scheduled = schedule(plan, declared, facts, &dialect).unwrap();
-///     let ordered = scheduled.changes.ordered(pbps_model::PlanMode::Transactional, &dialect);
-///     let _ = pbps_dialect::lower::lower_all::<pbps_pg::Postgres>(&ordered, &dialect);
+///     let _ = schedule(plan, declared, facts, &dialect);
 /// }
 /// ```
 ///
@@ -1171,8 +1166,7 @@ fn default_problems(
 ///     let scope = pbps_diff::order::writebacks::ScopeInput::new(vec![]).unwrap();
 ///     let pending = scope.append_to(plan, &pbps_mssql::Mssql);
 ///     let dialect = pbps_pg::Postgres::new();
-///     let scheduled = schedule(pending, declared, facts, &dialect).unwrap();
-///     let _ = scheduled.changes.ordered(pbps_model::PlanMode::Transactional, &dialect);
+///     let _ = schedule(pending, declared, facts, &dialect);
 /// }
 /// ```
 ///
@@ -3257,8 +3251,10 @@ mod tests {
                 assert_eq!(actual.proof(), first.proof());
                 assert_eq!(fingerprint(&actual), fingerprint(&first));
                 for mode in [PlanMode::Transactional, PlanMode::Staged] {
-                    let expected = first.clone().ordered(mode, dialect);
-                    let ordered = actual.clone().ordered(mode, dialect);
+                    let expected = pbps_diff::order::finish::finish_fixture(first.clone())
+                        .ordered(mode, dialect);
+                    let ordered = pbps_diff::order::finish::finish_fixture(actual.clone())
+                        .ordered(mode, dialect);
                     assert_eq!(
                         ordered.operations().as_slice(),
                         expected.operations().as_slice()
