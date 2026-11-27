@@ -287,6 +287,10 @@ pub fn validate(plan: &SavedPlan) -> Result<(), String> {
                     .primary_key
                     .as_ref()
                     .is_some_and(|key| key.name.as_ref() == Some(name))
+                // A check or foreign key shares the constraint namespace, so the
+                // planner never keeps an own under one's name (`taken`).
+                || shape.checks.contains_key(name)
+                || shape.foreign_keys.contains_key(name)
         };
         let taken: BTreeSet<_> = rehearsal.kept.values().collect();
         let holds = plan.dialect == "postgres"
@@ -692,6 +696,19 @@ mod tests {
                         filter: None,
                         storage_parameters: Default::default(),
                         timing: crate::ExclusionTiming::Immediate,
+                    },
+                );
+            }),
+        ));
+        // A check the declaration gives the kept unique constraint's name
+        // (draft review round 2).
+        cases.push((
+            "a check the declaration names as the kept constraint".to_owned(),
+            constrained(|_, shape| {
+                shape.checks.insert(
+                    "c_u".into(),
+                    crate::CheckConstraint {
+                        expression: "n > 0".into(),
                     },
                 );
             }),
