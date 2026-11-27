@@ -53,16 +53,105 @@ pub struct SlotEffects {
     pub intermediate: Vec<SlotKey>,
 }
 
-/// Every step's slots, and the steps whose names could not be read.
-#[derive(Debug, Clone, Default)]
-pub struct Slots {
-    /// Actual catalog names promoted to their typed action owner for graph AND replay.
-    pub catalog_owned: BTreeMap<SlotKey, ObjectKey>,
-    pub effects: Vec<SlotEffects>,
-    pub unowned: Vec<(OperationId, OwnerError)>,
-    /// Steps whose statements could not be lowered, so their intermediate
-    /// names are not checked.
-    pub unlowered: Vec<OperationId>,
+/// The steps whose names or intermediate names could not be read.
+#[derive(Debug)]
+pub struct SlotUnread<'a> {
+    /// Name lookups that failed, paired with their operation IDs.
+    pub unowned: &'a [(OperationId, OwnerError)],
+    /// Steps whose lowering could not supply intermediate names.
+    pub unlowered: &'a [OperationId],
+}
+
+pub use analysis::{Slots, with_catalog_parts};
+
+mod analysis {
+    use super::{
+        BTreeMap, Dialect, ObjectKey, OperationId, OwnerError, Owners, SlotEffects, SlotKey,
+        SlotUnread, Snapshot, add_catalog_parts,
+    };
+    use crate::order::catalog::graph::{Catalog, Root};
+
+    /// Every step's slots and the unread steps (DEC-2993.8).
+    ///
+    /// A reader must account for unread steps before using the rows.
+    ///
+    /// ```compile_fail
+    /// fn read_steps(analysis: pbps_diff::order::slots::Slots) {
+    ///     let _ = analysis.effects;
+    /// }
+    /// ```
+    #[derive(Debug, Clone, Default)]
+    pub struct Slots {
+        /// Actual catalog names promoted to their typed action owner for graph AND replay.
+        pub catalog_owned: BTreeMap<SlotKey, ObjectKey>,
+        effects: Vec<SlotEffects>,
+        unowned: Vec<(OperationId, OwnerError)>,
+        unlowered: Vec<OperationId>,
+    }
+
+    impl Slots {
+        pub(super) fn new(
+            effects: Vec<SlotEffects>,
+            unowned: Vec<(OperationId, OwnerError)>,
+            unlowered: Vec<OperationId>,
+        ) -> Self {
+            Self {
+                catalog_owned: BTreeMap::new(),
+                effects,
+                unowned,
+                unlowered,
+            }
+        }
+
+        /// Every step's slots, or both lists of unread steps.
+        pub fn effects(&self) -> Result<&[SlotEffects], SlotUnread<'_>> {
+            let (rows, unread) = self.effects_with_unread();
+            if unread.unowned.is_empty() && unread.unlowered.is_empty() {
+                Ok(rows)
+            } else {
+                Err(unread)
+            }
+        }
+
+        /// Position-aligned slots together with both lists of unread steps.
+        /// Each row contains the names the analysis could read for that step.
+        pub fn effects_with_unread(&self) -> (&[SlotEffects], SlotUnread<'_>) {
+            (
+                &self.effects,
+                SlotUnread {
+                    unowned: &self.unowned,
+                    unlowered: &self.unlowered,
+                },
+            )
+        }
+
+        /// Replace the rows while keeping the catalog evidence and unread steps.
+        pub fn with_effects(mut self, effects: Vec<SlotEffects>) -> Self {
+            self.effects = effects;
+            self
+        }
+    }
+
+    /// Describe exact owned names for the shared edge builder and replay.
+    pub fn with_catalog_parts(
+        mut slots: Slots,
+        catalog: &Catalog,
+        root: &Root,
+        owners: &dyn Owners,
+        before: Snapshot<'_>,
+        dialect: &(impl Dialect + ?Sized),
+    ) -> Result<Slots, String> {
+        add_catalog_parts(
+            &mut slots.catalog_owned,
+            &mut slots.effects,
+            catalog,
+            root,
+            owners,
+            before,
+            dialect,
+        )?;
+        Ok(slots)
+    }
 }
 
 /// Reads every step's names through the dialect's namespaces.
@@ -72,7 +161,9 @@ pub fn analyse(
     before: Snapshot<'_>,
     dialect: &(impl Dialect + ?Sized),
 ) -> Slots {
-    let mut out = Slots::default();
+    let mut rows = Vec::new();
+    let mut unowned = Vec::new();
+    let mut unlowered = Vec::new();
     for op in operations {
         let mut fx = SlotEffects::default();
         match names(dialect, op, owners, before, operations) {
@@ -128,7 +219,7 @@ pub fn analyse(
                         .collect();
                 }
             }
-            Err(error) => out.unowned.push((op.id(), error)),
+            Err(error) => unowned.push((op.id(), error)),
         }
         // A rename passes through another name in two cases: a move between
         // schemas, and a rename to a name that differs only in ASCII case,
@@ -145,7 +236,7 @@ pub fn analyse(
                         .flat_map(|t| table_slots(dialect, &t))
                         .collect();
                 }
-                Err(_) => out.unlowered.push(op.id()),
+                Err(_) => unlowered.push(op.id()),
             }
         }
         if let Change::Type(TypeChange::RenameType { from, to, .. }) = op.change()
@@ -158,39 +249,39 @@ pub fn analyse(
                         namespace: pbps_dialect::slots::Namespace::Types(name.schema().to_owned()),
                         name: name.name().to_owned(),
                     })),
-                Err(_) => out.unlowered.push(op.id()),
+                Err(_) => unlowered.push(op.id()),
             }
         }
-        out.effects.push(fx);
+        rows.push(fx);
     }
     // A part the plan drops is gone before its table moves: the move neither
     // carries it out of its schema nor into the new one, its drop releases it
     // (review of #1346, as `rename_order` reads it).
     let dropped: BTreeSet<ObjectKey> = operations
         .iter()
-        .zip(&out.effects)
+        .zip(&rows)
         .filter(|(op, _)| !matches!(op.change(), Change::Table(TableChange::RenameTable { .. })))
         .flat_map(|(_, fx)| fx.releases.iter().map(|(_, h)| h.clone()))
         .filter(|h| matches!(h, ObjectKey::Part { .. }))
         .collect();
-    for (op, fx) in operations.iter().zip(&mut out.effects) {
+    for (op, fx) in operations.iter().zip(&mut rows) {
         if matches!(op.change(), Change::Table(TableChange::RenameTable { .. })) {
             fx.claims.retain(|(_, h)| !dropped.contains(h));
             fx.releases.retain(|(_, h)| !dropped.contains(h));
         }
     }
-    out
+    Slots::new(rows, unowned, unlowered)
 }
 
-/// Describe exact owned names once; both the shared edge builder and replay consume them.
-pub fn with_catalog_parts(
-    mut slots: Slots,
+fn add_catalog_parts(
+    catalog_owned: &mut BTreeMap<SlotKey, ObjectKey>,
+    rows: &mut [SlotEffects],
     catalog: &super::catalog::graph::Catalog,
     root: &super::catalog::graph::Root,
     owners: &dyn Owners,
     before: Snapshot<'_>,
     dialect: &(impl Dialect + ?Sized),
-) -> Result<Slots, String> {
+) -> Result<(), String> {
     use super::catalog::{
         Holds, Part,
         graph::{Held, Ownership, Root},
@@ -258,11 +349,11 @@ pub fn with_catalog_parts(
             },
         };
         for slot in slots_of(dialect, &named.address) {
-            if slots.catalog_owned.get(&slot).is_some_and(|h| h != &holder) {
+            if catalog_owned.get(&slot).is_some_and(|h| h != &holder) {
                 return Err(bad());
             }
-            slots.catalog_owned.insert(slot.clone(), holder.clone());
-            for fx in &mut slots.effects {
+            catalog_owned.insert(slot.clone(), holder.clone());
+            for fx in rows.iter_mut() {
                 if fx.releases.iter().any(|(_, h)| h == &holder)
                     && !fx.releases.contains(&(slot.clone(), holder.clone()))
                 {
@@ -273,14 +364,13 @@ pub fn with_catalog_parts(
     }
     // An explicit part retirement leaves no such part for a later container
     // drop to release. Keep graph and replay on this same truthful description.
-    let owned: BTreeSet<_> = slots.catalog_owned.values().cloned().collect();
-    let claimed: BTreeSet<_> = slots
-        .effects
+    let owned: BTreeSet<_> = catalog_owned.values().cloned().collect();
+    let claimed: BTreeSet<_> = rows
         .iter()
         .flat_map(|fx| fx.claims.iter().map(|(_, h)| h.clone()))
         .collect();
     let mut separate = BTreeSet::new();
-    for fx in &slots.effects {
+    for fx in rows.iter() {
         let containers: BTreeSet<_> = fx
             .releases
             .iter()
@@ -301,7 +391,7 @@ pub fn with_catalog_parts(
             }
         }));
     }
-    for fx in &mut slots.effects {
+    for fx in rows {
         let containers: BTreeSet<_> = fx
             .releases
             .iter()
@@ -318,7 +408,7 @@ pub fn with_catalog_parts(
             if separate.contains(h) && containers.contains(table))
         });
     }
-    Ok(slots)
+    Ok(())
 }
 
 /// Names unavailable at a construction boundary. Unknown reads cannot mean vacant.
@@ -329,12 +419,13 @@ pub fn unavailable_names(
     released: &BTreeSet<ObjectKey>,
 ) -> Result<BTreeSet<String>, String> {
     let facts = facts.require("name-slot occupancy")?;
+    // An unread owner supplies no claim and proves no release for this check.
+    let (rows, _unread) = slots.effects_with_unread();
     let mut out = BTreeSet::new();
     for occupant in &facts.occupants {
         let freed = slots.catalog_owned.get(&occupant.slot).is_some_and(|h| {
             released.contains(h)
-                && slots
-                    .effects
+                && rows
                     .iter()
                     .any(|fx| fx.releases.contains(&(occupant.slot.clone(), h.clone())))
         });
@@ -343,9 +434,7 @@ pub fn unavailable_names(
         }
     }
     out.extend(
-        slots
-            .effects
-            .iter()
+        rows.iter()
             .flat_map(|fx| &fx.claims)
             .filter(|(s, _)| namespaces.contains(&s.namespace))
             .map(|(s, _)| s.name.clone()),
@@ -507,14 +596,15 @@ pub fn carried(
 /// The slots `a` and `b` are one name in, by the facts at hand: equal slots
 /// always, and alike spellings where the catalog says so.
 fn groups(
-    slots: &Slots,
+    rows: &[SlotEffects],
     facts: Option<&CatalogFacts>,
     carried: &[Carried],
 ) -> BTreeMap<SlotKey, SlotKey> {
     // Each slot's representative: itself, or the least slot the catalog
     // reports alike with it.
+    // Unread names add no spellings to the groups. Carried names still enter separately.
     let mut all: BTreeSet<&SlotKey> = BTreeSet::new();
-    for fx in &slots.effects {
+    for fx in rows {
         all.extend(fx.reads.iter().map(|(s, _)| s));
         all.extend(fx.claims.iter().map(|(s, _)| s));
         all.extend(fx.releases.iter().map(|(s, _)| s));
@@ -523,7 +613,7 @@ fn groups(
         all.insert(&c.slot);
         all.extend(&c.lands);
     }
-    for fx in &slots.effects {
+    for fx in rows {
         all.extend(&fx.intermediate);
     }
     let mut rep: BTreeMap<SlotKey, SlotKey> =
@@ -567,22 +657,27 @@ enum Holder<'a> {
 /// statements, and the catalog's occupants as the first holders of theirs
 /// (`carried`, DEC-1957.1).
 pub fn edges(slots: &Slots, facts: Option<&CatalogFacts>, carried: &[Carried]) -> Vec<SlotEdge> {
-    handovers_of(slots, facts, carried, true)
+    // An unread name supplies no edge from its row.
+    let (rows, _unread) = slots.effects_with_unread();
+    handovers_of(rows, &slots.catalog_owned, facts, carried, true)
 }
 
 /// [`edges`], with the names steps pass through as holders where `passing`.
 fn handovers_of(
-    slots: &Slots,
+    rows: &[SlotEffects],
+    catalog_owned: &BTreeMap<SlotKey, ObjectKey>,
     facts: Option<&CatalogFacts>,
     carried: &[Carried],
     passing: bool,
 ) -> Vec<SlotEdge> {
-    let rep = groups(slots, facts, carried);
+    // Missing reads, claims and releases supply no handover. Missing intermediate
+    // names supply no passing holder.
+    let rep = groups(rows, facts, carried);
     // Per name: each holder's claims and releases, by step.
     type Steps = (Vec<usize>, Vec<usize>);
     let mut by_slot: BTreeMap<&SlotKey, BTreeMap<Holder<'_>, Steps>> = BTreeMap::new();
-    let released: BTreeSet<_> = slots.effects.iter().flat_map(|fx| &fx.releases).collect();
-    for (i, fx) in slots.effects.iter().enumerate() {
+    let released: BTreeSet<_> = rows.iter().flat_map(|fx| &fx.releases).collect();
+    for (i, fx) in rows.iter().enumerate() {
         for claimed in &fx.claims {
             let (s, h) = claimed;
             // An inherited clone belongs to its standing parent trigger.
@@ -613,7 +708,7 @@ fn handovers_of(
     // A step that passes through a name takes it and gives it up again: a
     // holder between the name's first and last, which waits for the first
     // and which the last waits for, as a borrower does.
-    for (i, fx) in slots.effects.iter().enumerate().filter(|_| passing) {
+    for (i, fx) in rows.iter().enumerate().filter(|_| passing) {
         for s in &fx.intermediate {
             let steps = by_slot
                 .entry(&rep[s])
@@ -627,7 +722,7 @@ fn handovers_of(
     // An occupant holds its name from the start and gives it up at its
     // step; carried to another schema, it takes the name it lands on there.
     for c in carried {
-        if slots.catalog_owned.contains_key(&c.slot) {
+        if catalog_owned.contains_key(&c.slot) {
             continue;
         }
         by_slot
@@ -648,7 +743,7 @@ fn handovers_of(
         }
     }
     let mut out = BTreeSet::new();
-    for (reader, fx) in slots.effects.iter().enumerate() {
+    for (reader, fx) in rows.iter().enumerate() {
         for (s, holder) in &fx.reads {
             if let Some(holders) = by_slot.get(&rep[s])
                 && let Some((claims, releases)) = holders.get(&Holder::Managed(holder))
@@ -852,16 +947,19 @@ pub fn verify(
     owners: &dyn Owners,
     before: Snapshot<'_>,
 ) -> Result<(Vec<SlotViolation>, Vec<Skipped>), OwnerError> {
+    // Replay checks the names present in each row. Separate catalog actions
+    // still apply to steps with unread names.
+    let (rows, _unread) = slots.effects_with_unread();
     let mut violations = Vec::new();
     let mut skipped = Vec::new();
     let mut held: Vec<(SlotKey, Occupier)> = Vec::new();
     // First holders: a step that gives a name up before it takes it held the
     // name at the start.
     let mut seen: BTreeSet<(&SlotKey, &ObjectKey)> = BTreeSet::new();
-    for fx in &slots.effects {
+    for fx in rows {
         for (s, h) in &fx.releases {
             if seen.insert((s, h))
-                && !slots.effects.iter().any(|fx| {
+                && !rows.iter().any(|fx| {
                     fx.reads
                         .iter()
                         .any(|(rs, rh)| rh == h && same(dialect, facts, rs, s) != Same::No)
@@ -880,8 +978,7 @@ pub fn verify(
     // passes through: a table that stays where a move stops on its way
     // (review of #2052). Only those names are asked: a name nothing claims
     // cannot be refused.
-    let wanted: BTreeSet<&SlotKey> = slots
-        .effects
+    let wanted: BTreeSet<&SlotKey> = rows
         .iter()
         .flat_map(|fx| {
             fx.claims
@@ -964,8 +1061,7 @@ pub fn verify(
             match same(dialect, facts, s, h) {
                 Same::Yes => {
                     let gives_up = match who {
-                        Occupier::Managed(k) => slots
-                            .effects
+                        Occupier::Managed(k) => rows
                             .iter()
                             .any(|fx| fx.releases.iter().any(|(rs, rh)| rs == h && rh == k)),
                         // An occupant leaves with its table or its column;
@@ -987,7 +1083,7 @@ pub fn verify(
         }
         None
     };
-    for ((op, fx), action) in operations.iter().zip(&slots.effects).zip(&actions) {
+    for ((op, fx), action) in operations.iter().zip(rows).zip(&actions) {
         for (s, h) in &fx.reads {
             if !held.iter().any(|(slot, who)| {
                 same(dialect, facts, slot, s) == Same::Yes && who == &Occupier::Managed(h.clone())
@@ -1063,7 +1159,7 @@ pub fn verify(
     // The occupants and the names steps pass through are the replay's above,
     // not edges here: it refuses a claim on one still held, and an edge would
     // name the same fault twice.
-    for e in handovers_of(slots, facts, &[], false) {
+    for e in handovers_of(rows, &slots.catalog_owned, facts, &[], false) {
         if e.before >= e.after {
             violations.push(SlotViolation::Edge {
                 before: operations[e.before].id(),

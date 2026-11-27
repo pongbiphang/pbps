@@ -203,10 +203,11 @@ fn rebuild_swap_uses_shared_slots_with_distinct_reserved_holders() {
         },
         &MinimalDialect,
     );
-    assert!(slots.unowned.is_empty() && slots.unlowered.is_empty());
+    let (rows, unread) = slots.effects_with_unread();
+    assert!(unread.unowned.is_empty() && unread.unlowered.is_empty());
     let edges = super::slots::edges(&slots, None, &[]);
     assert!(edges.iter().any(|e| e.before == 1 && e.after == 0));
-    assert_ne!(slots.effects[0].claims[0].1, slots.effects[1].releases[0].1);
+    assert_ne!(rows[0].claims[0].1, rows[1].releases[0].1);
 }
 
 #[test]

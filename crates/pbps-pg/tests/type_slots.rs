@@ -138,7 +138,8 @@ fn check(
         ids: base_ids,
     };
     let slots = slots::analyse(ops.as_slice(), &owners, before, &pbps_pg::Postgres::new());
-    assert!(slots.unowned.is_empty(), "{:?}", slots.unowned);
+    let (_, unread) = slots.effects_with_unread();
+    assert!(unread.unowned.is_empty(), "{:?}", unread.unowned);
     slots::verify(
         ops.as_slice(),
         &slots,

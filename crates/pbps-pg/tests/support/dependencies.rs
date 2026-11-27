@@ -688,8 +688,9 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
                 .any(|e| e.before == release && e.after == claim)
         );
         assert!(!edges.iter().any(|e| e.before >= 2 && e.after == claim));
-        let mut allocation_slots = enriched.clone();
-        allocation_slots.effects[claim].claims.clear();
+        let (rows, _) = enriched.effects_with_unread();
+        let mut allocation_rows = rows.to_vec();
+        allocation_rows[claim].claims.clear();
         let occupancy = Fact::Present(
             [(
                 "app".into(),
@@ -701,12 +702,13 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
             )]
             .into(),
         );
-        let freed = allocation_slots.effects[release]
+        let freed = allocation_rows[release]
             .releases
             .iter()
             .map(|(_, h)| h.clone())
             .collect();
         let definition = fixture::index_recipe().definition;
+        let allocation_slots = enriched.clone().with_effects(allocation_rows);
         let mut allocator = pbps_pg::partition_index::Allocation::new(
             &root,
             &catalog,
@@ -848,10 +850,11 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
         // This clone-slot fragment omits temp-tree creation and name swaps.
         // Keep its original claim/release oracle independent of input-lifetime
         // coverage, which the complete rebuild_read_boundary proof supplies.
-        let mut clone_slots = enriched.clone();
-        for fx in &mut clone_slots.effects {
+        let mut clone_rows = rows.to_vec();
+        for fx in &mut clone_rows {
             fx.reads.clear();
         }
+        let clone_slots = enriched.clone().with_effects(clone_rows);
         let (violations, _) = slots::verify(
             ops.as_slice(),
             &clone_slots,
@@ -863,10 +866,11 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
         .unwrap();
         assert_eq!(violations.is_empty(), release < claim);
         let released = [holder].into();
-        let mut vacant = enriched.clone();
-        for fx in &mut vacant.effects {
+        let mut vacant_rows = rows.to_vec();
+        for fx in &mut vacant_rows {
             fx.claims.clear();
         }
+        let vacant = enriched.clone().with_effects(vacant_rows);
         assert!(
             !slots::unavailable_names(
                 &vacant,
@@ -928,8 +932,9 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
         &dialect,
     )
     .unwrap();
+    let (rows, _) = returned.effects_with_unread();
     assert!(
-        returned.effects[2]
+        rows[2]
             .releases
             .contains(&(slot.clone(), returned.catalog_owned[&slot].clone()))
     );

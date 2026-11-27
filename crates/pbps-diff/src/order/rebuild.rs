@@ -164,12 +164,12 @@ impl Factory<'_> {
             before,
             self.dialect,
         )?;
-        if !result.unowned.is_empty() || !result.unlowered.is_empty() {
+        if let Err(unread) = result.effects() {
             return Err(format!(
                 "{}: rebuild slots are unavailable: {:?} {:?}",
                 self.input.root.table.shown(),
-                result.unowned,
-                result.unlowered
+                unread.unowned,
+                unread.unlowered
             ));
         }
         Ok(result)
@@ -482,9 +482,11 @@ pub fn prepare(
     }
     let ops = rule.out.operations();
     let slot_description = rule.describe()?;
+    // The description has already refused unread steps.
+    let (rows, _unread) = slot_description.effects_with_unread();
     let released = ops
         .iter()
-        .zip(&slot_description.effects)
+        .zip(rows)
         .filter(|(o, _)| o.role() == pbps_model::operation::Role::Teardown)
         .flat_map(|(_, fx)| fx.releases.iter().map(|(_, h)| h.clone()))
         .collect();

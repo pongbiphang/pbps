@@ -500,7 +500,10 @@ pub fn catalog_facts(
         }
     }
     let mut compared: BTreeSet<SlotKey> = occupants.iter().map(|o| o.slot.clone()).collect();
-    for fx in &analysed.effects {
+    // Missing names supply no spellings to compare.
+    // Catalog and baseline spellings still enter.
+    let (rows, _unread) = analysed.effects_with_unread();
+    for fx in rows {
         compared.extend(
             fx.reads
                 .iter()

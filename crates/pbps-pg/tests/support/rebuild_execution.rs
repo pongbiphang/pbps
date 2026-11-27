@@ -87,10 +87,9 @@ fn only_complete_storage_ownership_excludes_a_spelling_without_freeing_it() {
             .any(|(from, link)| *from == obj(3) && link.dependent == obj(4))
     );
     assert!(prepared.slots().catalog_owned.is_empty());
+    let (rows, _) = prepared.slots().effects_with_unread();
     assert!(
-        !prepared
-            .slots()
-            .effects
+        !rows
             .iter()
             .flat_map(|fx| &fx.releases)
             .any(|(slot, _)| slot.name == "opaque_index")
@@ -219,14 +218,12 @@ fn independent_replay_rejects_premature_analysis_and_final_name_claims() {
     let a = ops.iter().position(|o|matches!(o.change(),Change::Table(TableChange::RenameTable{uid,..}) if f.root.intent.source.tables.contains_key(uid))).unwrap();
     let b = ops.iter().position(|o|matches!(o.change(),Change::Table(TableChange::RenameTable{uid,to,..}) if f.root.intent.replacement.tables.contains_key(uid) && to==&f.root.table)).unwrap();
     ops.swap(a, b);
-    let mut description = prepared.slots().clone();
-    description.effects = ops
+    let (rows, _) = prepared.slots().effects_with_unread();
+    let reordered_rows = ops
         .iter()
-        .map(|op| {
-            prepared.slots().effects[canonical.iter().position(|p| p.id() == op.id()).unwrap()]
-                .clone()
-        })
+        .map(|op| rows[canonical.iter().position(|p| p.id() == op.id()).unwrap()].clone())
         .collect();
+    let description = prepared.slots().clone().with_effects(reordered_rows);
     let (violations, skipped) = slots::verify(
         &ops,
         &description,

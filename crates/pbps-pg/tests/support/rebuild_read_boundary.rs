@@ -188,7 +188,8 @@ fn one_split_origin_orders_source_temp_and_backup_reads_through_shared_slots() {
     );
     assert!(graph.unmet.is_empty(), "{:?}", graph.unmet);
     let slots = order::slots::analyse(ops.as_slice(), &owners, before, &dialect);
-    assert!(slots.unowned.is_empty(), "{:?}", slots.unowned);
+    let (rows, unread) = slots.effects_with_unread();
+    assert!(unread.unowned.is_empty(), "{:?}", unread.unowned);
     let slot_edges = order::slots::edges(&slots, None, &[]);
     for (a, b) in [(0, 2), (2, 4), (2, 5), (3, 5), (4, 6)] {
         assert!(
@@ -262,10 +263,8 @@ fn one_split_origin_orders_source_temp_and_backup_reads_through_shared_slots() {
         vec![6, 0, 1, 2, 3, 4, 5, 7],
     ] {
         let reordered: Vec<_> = order.iter().map(|&i| ops.as_slice()[i].clone()).collect();
-        let reordered_slots = order::slots::Slots {
-            effects: order.iter().map(|&i| slots.effects[i].clone()).collect(),
-            ..Default::default()
-        };
+        let reordered_rows = order.iter().map(|&i| rows[i].clone()).collect();
+        let reordered_slots = order::slots::Slots::default().with_effects(reordered_rows);
         let (violations, _) = order::slots::verify(
             &reordered,
             &reordered_slots,
