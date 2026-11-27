@@ -334,6 +334,9 @@ impl<'a> Narrowing<'a> {
                 UnaffectedReason::ByDependency
             }
         };
+        // Asked of an unparsed surface too: a routine's header (its parameter
+        // and return types, its parameter defaults) is bound at creation
+        // whatever the body's language, and it is part of the text.
         if !self.effects.arriving_relations_and_types.is_empty() {
             let texts = surface_texts(kept_surface, schema, filter_binds)?;
             if self.effects.arriving_relations_and_types.iter().any(|a| {
@@ -2420,6 +2423,55 @@ mod dependency_facts_tests {
             Some(&unreadable_ancestors),
         );
         assert_eq!(found.count(Answer::Resolve), 4, "{found:?}");
+    }
+
+    /// A routine's header is bound at creation whatever its body's language,
+    /// so an unparsed routine whose text names an arriving type stays a
+    /// question; one that does not is unaffected beside the same plan.
+    #[test]
+    fn an_unparsed_routine_naming_an_arriving_type_in_its_text_stays_resolve() {
+        let mut schema = Schema::default();
+        schema.modules.insert(
+            "app.f_plain()".parse().unwrap(),
+            routine("RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END; $$"),
+        );
+        schema.modules.insert(
+            "app.f_returns()".parse().unwrap(),
+            routine("RETURNS money2 LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$"),
+        );
+        let mut facts = clear_facts(BTreeMap::from([
+            (
+                module_surface("app.f_plain()"),
+                SurfaceDependencies::Unparsed,
+            ),
+            (
+                module_surface("app.f_returns()"),
+                SurfaceDependencies::Unparsed,
+            ),
+        ]));
+        facts
+            .catalog_names
+            .insert("money2".into(), CatalogName::Clear);
+        let found = run(
+            &schema,
+            &schema,
+            vec![Change::Table(TableChange::CreateTable {
+                uid: Uid::generate(UidKind::Table),
+                name: "early.money2".parse().unwrap(),
+                table: Box::new(table_with_columns(&["a"])),
+                beside_default: None,
+                moves_at_most: None,
+            })],
+            Some(&facts),
+        );
+        assert_eq!(
+            found.questions[&module_surface("app.f_returns()")],
+            Answer::Resolve
+        );
+        assert_eq!(
+            found.unaffected_reason(&module_surface("app.f_plain()")),
+            Some(UnaffectedReason::Unparsed)
+        );
     }
 
     /// Excluded plan classes stay today's answer for every kept surface even
