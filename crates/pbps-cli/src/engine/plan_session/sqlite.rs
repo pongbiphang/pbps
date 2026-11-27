@@ -336,10 +336,11 @@ fn order_name_handovers<S: Clone>(
     };
     let shadowed =
         pbps_diff::order::analyse_with_catalog(&ops, &owners, before, after, dialect, Some(facts))?;
-    if shadowed.unowned.is_empty() {
+    // An unread step leaves the slot handovers as the only constraints.
+    if let Ok(step_effects) = shadowed.effects() {
         let fx_graph = pbps_diff::order::graph(
             ops.as_slice(),
-            &shadowed.effects,
+            step_effects,
             &pbps_diff::order::Baseline::of(before, &owners)?,
             &frame.hints.annotations.modules(frame.written.schema),
             pbps_diff::order::Checks::ALL,
@@ -2294,6 +2295,93 @@ mod tests {
                 "{msg}"
             );
         }
+    }
+
+    #[test]
+    fn unread_step_leaves_sqlite_name_handovers_to_slots() {
+        use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+        use pbps_model::{Change, ConstraintChange, ModuleChange, ModuleId, TableChange};
+
+        let base = plain_schema();
+        let mut ids = IdsFile::default();
+        let uid = table_id(&mut ids, "items");
+        col_id(&mut ids, "items", "id");
+        let desired = Schema::default();
+        let desired_ids = IdsFile::default();
+        let recorded = pbps_diff::Side {
+            schema: &base,
+            ids: &ids,
+        };
+        let written = pbps_diff::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        };
+        let baseline = StateSnapshot::new(
+            pbps_model::StateKind::Baseline,
+            pbps_sqlite::types::DIALECT,
+            base.clone(),
+            ids.clone(),
+            "test",
+        );
+        let frame = Frame {
+            label: "test.db",
+            recorded,
+            written,
+            base: recorded,
+            declared: written,
+            hints: &Default::default(),
+            baseline: &baseline,
+        };
+        let table = TableName::new("main", "items");
+        let changes = change_set(vec![
+            Change::Module(ModuleChange::CreateModule {
+                id: ModuleId::Named(table.clone()),
+                module: view_module("CREATE VIEW items AS SELECT 1"),
+            }),
+            Change::Table(TableChange::DropTable {
+                uid,
+                name: table,
+                detach_from: None,
+            }),
+            Change::Constraint(ConstraintChange::DropCheck {
+                table: TableName::new("main", "unknown"),
+                name: "ck".into(),
+            }),
+        ]);
+        let dialect = Sqlite::default();
+        let facts = Default::default();
+        let owners = PlanOwners::new(
+            pbps_model::plan_names::PlanNames::of(&changes.changes, &desired_ids).unwrap(),
+            &ids,
+            &desired_ids,
+        );
+        let ops = Operations::of_plan(&changes.changes, ModuleEdits::InPlace);
+        let analysis = pbps_diff::order::analyse_with_catalog(
+            &ops,
+            &owners,
+            Snapshot {
+                schema: &base,
+                ids: &ids,
+            },
+            Snapshot {
+                schema: &desired,
+                ids: &desired_ids,
+            },
+            &dialect,
+            Some(&facts),
+        )
+        .expect("read the analysis baseline");
+        assert_eq!(analysis.effects().unwrap_err().id, ops.as_slice()[2].id());
+        let mut plan = pbps_diff::order::propose(changes.clone());
+        order_name_handovers(&mut plan, frame, &dialect, &facts).expect("slot handover settles");
+        assert_eq!(
+            plan.changes[..],
+            [
+                changes.changes[1].clone(),
+                changes.changes[0].clone(),
+                changes.changes[2].clone()
+            ]
+        );
     }
 
     #[test]

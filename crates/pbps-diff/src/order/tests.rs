@@ -140,6 +140,105 @@ fn create_then_add_column() -> Plan {
     }
 }
 
+fn shadow(plan: &Plan) -> (Operations, super::Shadowed) {
+    let ops = Operations::of_plan(&plan.logical, ModuleEdits::InPlace);
+    let names = PlanNames::of(&plan.logical, &plan.after_ids).unwrap();
+    let owners = PlanOwners::new(names, &plan.before_ids, &plan.after_ids);
+    let analysed = super::analyse(
+        &ops,
+        &owners,
+        Snapshot {
+            schema: &plan.before,
+            ids: &plan.before_ids,
+        },
+        Snapshot {
+            schema: &plan.after,
+            ids: &plan.after_ids,
+        },
+        &pbps_dialect::MinimalDialect,
+    )
+    .expect("read the analysis baseline");
+    (ops, analysed)
+}
+
+fn drop_check_on_undeclared_table(table: &str) -> PlannedChange {
+    p(Change::Constraint(ConstraintChange::DropCheck {
+        table: t(table),
+        name: "ck".into(),
+    }))
+}
+
+#[test]
+fn unread_steps_refuse_complete_effect_access() {
+    use pbps_model::operation::OwnerError;
+    let mut plan = create_then_add_column();
+    plan.logical
+        .insert(1, drop_check_on_undeclared_table("first"));
+    plan.logical.push(drop_check_on_undeclared_table("last"));
+    let (ops, analysed) = shadow(&plan);
+    let refused = analysed
+        .effects()
+        .expect_err("an unread step refuses complete effects");
+    let steps = ops.as_slice();
+    let error = |at: usize, table| OwnerError::Unmanaged {
+        name: t(table).shown().to_string(),
+        spelling: steps[at].origin().spelling(),
+    };
+    assert_eq!(refused.id, steps[1].id());
+    assert_eq!(refused.error, error(1, "first"));
+    // Inspect alignment without treating the unread steps as independent.
+    let (effects, unread) = analysed.effects_with_unread();
+    assert_eq!(effects.len(), ops.len());
+    assert_eq!(effects[1], Effects::default());
+    assert_eq!(effects[3], Effects::default());
+    assert_ne!(effects[0], Effects::default());
+    assert_ne!(effects[2], Effects::default());
+    assert_eq!(unread.len(), 2);
+    assert_eq!(unread[0].id, refused.id);
+    assert_eq!(unread[0].error, refused.error);
+    assert_eq!(unread[1].id, steps[3].id());
+    assert_eq!(unread[1].error, error(3, "last"));
+}
+
+#[test]
+fn readable_steps_supply_both_effect_views() {
+    let (ops, analysed) = shadow(&create_then_add_column());
+    let complete = analysed.effects().expect("read every step");
+    assert_eq!(complete.len(), ops.len());
+    assert!(complete.iter().all(|fx| *fx != Effects::default()));
+    // A fully read plan has no unread steps to account for.
+    let (effects, unread) = analysed.effects_with_unread();
+    assert_eq!(effects, complete);
+    assert!(unread.is_empty());
+}
+
+#[test]
+fn rewrite_order_is_unchanged_when_an_unread_step_has_no_trigger() {
+    let mut plan = create_then_add_column();
+    plan.logical = vec![drop_check_on_undeclared_table("unknown")];
+    let (_, analysed) = shadow(&plan);
+    assert!(analysed.effects().is_err());
+    let changes = pbps_model::ChangeSet {
+        changes: plan.logical,
+    };
+    let ordered = super::before_rewrites(
+        super::propose(changes.clone()),
+        crate::Side {
+            schema: &plan.before,
+            ids: &plan.before_ids,
+        },
+        crate::Side {
+            schema: &plan.after,
+            ids: &plan.after_ids,
+        },
+        &pbps_dialect::MinimalDialect,
+        &ModuleDeps::new(),
+        None,
+    )
+    .expect("no trigger requires settlement");
+    assert_eq!(ordered.changes().changes, changes.changes);
+}
+
 /// Parent and child tables, the child's key into the parent, both dropped.
 fn two_dropped_tables() -> Plan {
     let mut child = table_with(&["pid"]);
@@ -585,12 +684,11 @@ fn an_obligation_nothing_can_provide_is_recorded_and_does_not_fail_the_run() {
     let mut plan = create_then_add_column();
     plan.logical.remove(0);
     let (alone, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
-    let report = Shadowed {
-        symbolic: Default::default(),
-        effects: vec![fx[0].clone()],
-        unowned: Vec::new(),
-    }
-    .report(&alone, &baseline, &ModuleDeps::new());
+    let report = Shadowed::from_read_effects(vec![fx[0].clone()]).report(
+        &alone,
+        &baseline,
+        &ModuleDeps::new(),
+    );
     assert!(!report.violations.is_empty(), "the replay still sees it");
     let findings = judge(alone.as_slice(), &report, Stage::Differ);
     assert!(!findings.fails(), "{findings:?}");
@@ -608,12 +706,11 @@ fn an_obligation_some_order_could_meet_but_this_one_meets_too_late_fails_the_run
     let plan = create_then_add_column();
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     let swapped = crate::order::reordered_operations(&ops, &[1, 0]);
-    let report = Shadowed {
-        symbolic: Default::default(),
-        effects: vec![fx[1].clone(), fx[0].clone()],
-        unowned: Vec::new(),
-    }
-    .report(&swapped, &baseline, &ModuleDeps::new());
+    let report = Shadowed::from_read_effects(vec![fx[1].clone(), fx[0].clone()]).report(
+        &swapped,
+        &baseline,
+        &ModuleDeps::new(),
+    );
     let findings = judge(swapped.as_slice(), &report, Stage::Differ);
     assert!(findings.fails(), "{findings:?}");
     assert!(
@@ -633,12 +730,7 @@ fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_
     let mut standing = two_dropped_tables();
     standing.logical.remove(0);
     let (ops, fx, baseline) = standing.analysed(ModuleEdits::InPlace);
-    let report = Shadowed {
-        symbolic: Default::default(),
-        effects: fx,
-        unowned: Vec::new(),
-    }
-    .report(&ops, &baseline, &ModuleDeps::new());
+    let report = Shadowed::from_read_effects(fx).report(&ops, &baseline, &ModuleDeps::new());
     assert!(!report.violations.is_empty(), "the replay still sees it");
     let findings = judge(ops.as_slice(), &report, Stage::Differ);
     assert!(!findings.fails(), "{findings:?}");
@@ -653,12 +745,11 @@ fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_
     let both = two_dropped_tables();
     let (ops, fx, baseline) = both.analysed(ModuleEdits::InPlace);
     let swapped = crate::order::reordered_operations(&ops, &[1, 0]);
-    let report = Shadowed {
-        symbolic: Default::default(),
-        effects: vec![fx[1].clone(), fx[0].clone()],
-        unowned: Vec::new(),
-    }
-    .report(&swapped, &baseline, &ModuleDeps::new());
+    let report = Shadowed::from_read_effects(vec![fx[1].clone(), fx[0].clone()]).report(
+        &swapped,
+        &baseline,
+        &ModuleDeps::new(),
+    );
     let findings = judge(swapped.as_slice(), &report, Stage::Differ);
     assert!(findings.fails(), "{findings:?}");
     assert!(
@@ -1570,18 +1661,17 @@ fn computed_then(second: Change, id: Option<ModuleId>) -> (Operations, Vec<Effec
 #[test]
 fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change_is_not() {
     use super::shadow::{Shadowed, Stage, Verdict, Waiver, judge};
-    let judged_at =
-        |stage: Stage, ops: &Operations, fx: &[Effects], baseline: &Baseline, order: &[usize]| {
-            let reordered = crate::order::reordered_operations(ops, order);
-            let effects: Vec<Effects> = order.iter().map(|&i| fx[i].clone()).collect();
-            let report = Shadowed {
-                symbolic: Default::default(),
-                effects,
-                unowned: Vec::new(),
-            }
-            .report(&reordered, baseline, &ModuleDeps::new());
-            judge(reordered.as_slice(), &report, stage)
-        };
+    let judged_at = |stage: Stage,
+                     ops: &Operations,
+                     fx: &[Effects],
+                     baseline: &Baseline,
+                     order: &[usize]| {
+        let reordered = crate::order::reordered_operations(ops, order);
+        let effects: Vec<Effects> = order.iter().map(|&i| fx[i].clone()).collect();
+        let report =
+            Shadowed::from_read_effects(effects).report(&reordered, baseline, &ModuleDeps::new());
+        judge(reordered.as_slice(), &report, stage)
+    };
     let judged = |ops: &Operations, fx: &[Effects], baseline: &Baseline, order: &[usize]| {
         judged_at(Stage::Differ, ops, fx, baseline, order)
     };
@@ -4383,13 +4473,10 @@ fn a_parent_row_is_deleted_after_a_foreign_key_the_plan_rebuilds() {
     let shadowed =
         super::shadow::analyse(&ops, &owners, before, after, &pbps_dialect::MinimalDialect)
             .expect("read the analysis baseline");
-    let fx = shadowed.effects;
-    assert_eq!(
-        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
-        []
-    );
+    let fx = shadowed.effects().expect("read every step");
+    assert_eq!(run(&ops, fx, &baseline, &[0, 1, 2], &none, Checks::ALL), []);
     assert!(
-        run(&ops, &fx, &baseline, &[1, 0, 2], &none, Checks::ALL)
+        run(&ops, fx, &baseline, &[1, 0, 2], &none, Checks::ALL)
             .iter()
             .any(|v| matches!(v, Violation::Edge { .. }))
     );
@@ -5210,12 +5297,8 @@ fn a_before_rewrite_requirement_orders_every_other_rewrite_without_requiring_pre
     }
     // Only the class-order observer may defer this edge: the shared and
     // final schedule must still reject it if the hook fails to repair it.
-    let report = super::shadow::Shadowed {
-        symbolic: Default::default(),
-        effects: fx.clone(),
-        unowned: vec![],
-    }
-    .report(&ops, &base, &declared);
+    let report =
+        super::shadow::Shadowed::from_read_effects(fx.clone()).report(&ops, &base, &declared);
     use super::shadow::{Stage, Verdict, Waiver, judge};
     let pending = judge(ops.as_slice(), &report, Stage::BeforeSchedule);
     assert!(!pending.fails(), "{pending:?}");

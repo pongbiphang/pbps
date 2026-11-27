@@ -74,10 +74,10 @@ fn analysed(
     };
     let analysed =
         order::analyse(&ops, &owners, base, end, &Mssql).expect("read the analysis baseline");
-    assert!(analysed.unowned.is_empty(), "{:?}", analysed.unowned);
+    let step_effects = analysed.effects().expect("read every step");
     (
         ops,
-        analysed.effects,
+        step_effects.to_vec(),
         Baseline::of(base, &owners).expect("read the test baseline"),
     )
 }

@@ -105,14 +105,15 @@ pub fn release_schedule(
         plan.captured(),
     )
     .map_err(|e| e.to_string())?;
-    if let Some((id, why)) = effects.unowned.first() {
-        return Err(format!(
-            "policy release operation {id} has unread effects: {why}"
-        ));
-    }
+    let step_effects = effects.effects().map_err(|unread| {
+        format!(
+            "policy release operation {} has unread effects: {}",
+            unread.id, unread.error
+        )
+    })?;
     let graph = super::graph(
         operations.as_slice(),
-        &effects.effects,
+        step_effects,
         &super::Baseline::of(before, &owners).map_err(|e| e.to_string())?,
         deps,
         super::Checks::ALL,

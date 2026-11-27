@@ -897,9 +897,9 @@ fn the_last_columns_drop_requires_its_replacement_to_exist_first() {
         let baseline = Baseline::of(before, &owners).expect("read the test baseline");
         let shadowed = analyse(&ops, &owners, before, after, &Sqlite::default())
             .expect("read the analysis baseline");
-        assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
+        let step_effects = shadowed.effects().expect("read every step");
         let ordered = reordered_operations(&ops, order);
-        let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
+        let effects: Vec<_> = order.iter().map(|&i| step_effects[i].clone()).collect();
         verify(ordered.as_slice(), &effects, &baseline, &Default::default())
     };
     // `a` replaced by `b`: the add first is the order SQLite performs.

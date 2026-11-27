@@ -164,15 +164,10 @@ fn sql_server_default_holders_have_catalog_proof_and_a_retype_release_gap() {
         };
         let analysis =
             order::analyse(&ops, &owners, base, end, &Mssql).expect("read the analysis baseline");
-        assert!(analysis.unowned.is_empty(), "{:?}", analysis.unowned);
+        let step_effects = analysis.effects().expect("read every step");
         let baseline = order::Baseline::of(base, &owners).expect("read the test baseline");
         assert_eq!(
-            order::verify(
-                ops.as_slice(),
-                &analysis.effects,
-                &baseline,
-                &Default::default()
-            ),
+            order::verify(ops.as_slice(), step_effects, &baseline, &Default::default()),
             []
         );
         if both {
@@ -181,7 +176,7 @@ fn sql_server_default_holders_have_catalog_proof_and_a_retype_release_gap() {
             );
             assert!(release < retype && retype < restore);
             assert!(
-                analysis.effects[retype]
+                step_effects[retype]
                     .requires
                     .iter()
                     .any(|r| matches!(r, Requirement::ReleaseGap(ObjectKey::Default(_))))
@@ -196,7 +191,7 @@ fn sql_server_default_holders_have_catalog_proof_and_a_retype_release_gap() {
             assert!(
                 !order::verify(
                     ops.as_slice(),
-                    &a.effects,
+                    a.effects().expect("read every step"),
                     &order::Baseline::of(base, &owners).expect("read the test baseline"),
                     &Default::default()
                 )

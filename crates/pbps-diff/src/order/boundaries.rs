@@ -448,9 +448,9 @@ pub(super) fn replay<S>(
         plan.captured(),
     )
     .map_err(|e| e.to_string())?;
-    if let Some((_, error)) = effects.unowned.first() {
-        return Err(error.to_string());
-    }
+    let step_effects = effects
+        .effects()
+        .map_err(|unread| unread.error.to_string())?;
     // The full ordered physical column list is checked at ATTACH, not against
     // either endpoint's parent shape. PhysicalSources retains source order.
     let actual = PlanNames::of(&plan.changes, after.ids).map_err(|e| e.to_string())?;
@@ -516,7 +516,7 @@ pub(super) fn replay<S>(
     }
     plan.boundaries.discharge(
         operations.as_slice(),
-        &effects.effects,
+        step_effects,
         &effects.symbolic,
         &annotations,
     )?;

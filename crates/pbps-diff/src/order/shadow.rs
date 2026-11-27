@@ -23,15 +23,59 @@ pub struct Report {
     pub unowned: Vec<(OperationId, OwnerError)>,
 }
 
-/// The effects of every operation, portable and the dialect's.
-///
-/// An operation the models cannot own has no effects here, and is listed so
-/// that nothing reads it as independent.
+/// A step whose effects could not be read.
 #[derive(Debug, Clone)]
-pub struct Shadowed {
-    pub symbolic: pbps_model::operation::symbolic::State,
-    pub effects: Vec<Effects>,
-    pub unowned: Vec<(OperationId, OwnerError)>,
+pub struct Unread {
+    pub id: OperationId,
+    pub error: OwnerError,
+}
+
+pub use analysis::Shadowed;
+
+mod analysis {
+    use super::{Effects, Unread};
+    use pbps_model::operation::symbolic::State;
+
+    /// The effects of an ordered plan, including the dialect's (DEC-2993.7).
+    ///
+    /// A reader must account for unread steps before using the effects.
+    ///
+    /// ```compile_fail
+    /// fn read_steps(analysis: pbps_diff::order::Shadowed) {
+    ///     let _ = analysis.effects;
+    /// }
+    /// ```
+    #[derive(Debug, Clone)]
+    pub struct Shadowed {
+        pub symbolic: State,
+        effects: Vec<Effects>,
+        unread: Vec<Unread>,
+    }
+
+    impl Shadowed {
+        pub(super) fn new(symbolic: State, effects: Vec<Effects>, unread: Vec<Unread>) -> Self {
+            Self {
+                symbolic,
+                effects,
+                unread,
+            }
+        }
+
+        /// Every step's effects, or the first unread step in plan order.
+        pub fn effects(&self) -> Result<&[Effects], &Unread> {
+            match self.unread.first() {
+                Some(unread) => Err(unread),
+                None => Ok(&self.effects),
+            }
+        }
+
+        /// Position-aligned effects together with the unread steps.
+        /// An unread step contributes no effects to the first part.
+        /// The caller must state its rule for handling the second part.
+        pub fn effects_with_unread(&self) -> (&[Effects], &[Unread]) {
+            (&self.effects, &self.unread)
+        }
+    }
 }
 
 /// Explicit operation-level analysis, including the membership contract.
@@ -243,7 +287,7 @@ pub(super) fn analyse_scoped(
         }
     }
     let empty = super::generated::empty_columns(&payload, after.ids);
-    let mut unowned = Vec::new();
+    let mut unread = Vec::new();
     let mut effects: Vec<_> = operations
         .iter()
         .enumerate()
@@ -274,7 +318,7 @@ pub(super) fn analyse_scoped(
             match (portable, engine) {
                 (Ok(p), Ok(e)) => p.merged(e),
                 (Err(error), _) | (_, Err(error)) => {
-                    unowned.push((op.id(), error));
+                    unread.push(Unread { id: op.id(), error });
                     Effects::default()
                 }
             }
@@ -289,14 +333,15 @@ pub(super) fn analyse_scoped(
         );
         super::boundaries::transfers(&mut effects, &facts.base, dialect);
     }
-    Ok(Shadowed {
-        effects,
-        unowned,
-        symbolic: facts.base,
-    })
+    Ok(Shadowed::new(facts.base, effects, unread))
 }
 
 impl Shadowed {
+    #[cfg(test)]
+    pub(super) fn from_read_effects(effects: Vec<Effects>) -> Self {
+        Self::new(Default::default(), effects, Vec::new())
+    }
+
     /// Verifies the order the operations are in.
     pub fn report(
         self,
@@ -306,12 +351,17 @@ impl Shadowed {
     ) -> Report {
         let baseline = baseline.clone().with_symbolic(self.symbolic.clone());
         let ops = operations.as_slice();
-        let violations = verify_with(ops, &self.effects, &baseline, declared, Checks::ALL);
-        let g = graph(ops, &self.effects, &baseline, declared, Checks::ALL);
+        // Replay the known effects and carry unread steps into the report as unowned.
+        let (effects, unread) = self.effects_with_unread();
+        let violations = verify_with(ops, effects, &baseline, declared, Checks::ALL);
+        let g = graph(ops, effects, &baseline, declared, Checks::ALL);
         Report {
             violations,
             graph: g,
-            unowned: self.unowned,
+            unowned: unread
+                .iter()
+                .map(|step| (step.id, step.error.clone()))
+                .collect(),
         }
     }
 }

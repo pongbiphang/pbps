@@ -292,16 +292,11 @@ fn measure(shape: Shape, reversed: bool) -> Result<Measured, OwnerError> {
     let started = Instant::now();
     let shadowed = analyse(&operations, &owners, before, after, &dialect)?;
     let baseline = Baseline::of(before, &owners)?;
+    let step_effects = shadowed.effects().expect("read every step");
     let effects = started.elapsed();
     let ops = operations.as_slice();
     let started = Instant::now();
-    let g = graph(
-        ops,
-        &shadowed.effects,
-        &baseline,
-        &shape.declared,
-        Checks::ALL,
-    );
+    let g = graph(ops, step_effects, &baseline, &shape.declared, Checks::ALL);
     let graph_time = started.elapsed();
     // What the resolver does with the graph: settle it into an order.
     let started = Instant::now();
@@ -318,13 +313,7 @@ fn measure(shape: Shape, reversed: bool) -> Result<Measured, OwnerError> {
         assert!(settled.is_ok(), "{}: {settled:?}", shape.name);
     }
     let started = Instant::now();
-    let violations = verify_with(
-        ops,
-        &shadowed.effects,
-        &baseline,
-        &shape.declared,
-        Checks::ALL,
-    );
+    let violations = verify_with(ops, step_effects, &baseline, &shape.declared, Checks::ALL);
     let verify = started.elapsed();
     Ok(Measured {
         shape: shape.name,

@@ -133,10 +133,10 @@ fn a_partition_fallback_models_the_emitted_value_and_refuses_the_wrong_goal() {
     .expect("read the analysis baseline");
     let g = graph(
         ops.as_slice(),
-        &fx.effects,
+        fx.effects().expect("read every step"),
         &Baseline::of(before, &owners)
             .expect("read the test baseline")
-            .with_symbolic(fx.symbolic),
+            .with_symbolic(fx.symbolic.clone()),
         &Default::default(),
         Checks::ALL,
     );

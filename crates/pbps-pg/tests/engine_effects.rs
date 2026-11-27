@@ -116,9 +116,9 @@ fn type_order_violations(drop: bool, order: &[usize]) -> Vec<Violation> {
     };
     let shadow = analyse(&operations, &owners, before, after, &Postgres::new())
         .expect("read the analysis baseline");
-    assert!(shadow.unowned.is_empty(), "{:?}", shadow.unowned);
+    let step_effects = shadow.effects().expect("read every step");
     let reordered = pbps_diff::order::reordered_operations(&operations, order);
-    let effects: Vec<_> = order.iter().map(|&i| shadow.effects[i].clone()).collect();
+    let effects: Vec<_> = order.iter().map(|&i| step_effects[i].clone()).collect();
     pbps_diff::order::verify(
         reordered.as_slice(),
         &effects,
@@ -213,9 +213,9 @@ fn violations(from: &str, to: &str, order: &[usize]) -> Vec<Violation> {
     let baseline = Baseline::of(was, &owners).expect("read the test baseline");
     let analysed =
         analyse(&ops, &owners, was, will, &Postgres::new()).expect("read the analysis baseline");
-    assert!(analysed.unowned.is_empty(), "{:?}", analysed.unowned);
+    let step_effects = analysed.effects().expect("read every step");
     let ordered = pbps_diff::order::reordered_operations(&ops, order);
-    let effects: Vec<_> = order.iter().map(|&i| analysed.effects[i].clone()).collect();
+    let effects: Vec<_> = order.iter().map(|&i| step_effects[i].clone()).collect();
     pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
 }
 
@@ -381,8 +381,8 @@ fn an_index_key_naming_a_package_class_requires_the_package_and_an_engine_class_
             },
         );
         let effects = analyse(&ops, &owners, before, after, &Postgres::new())
-            .expect("read the analysis baseline")
-            .effects;
+            .expect("read the analysis baseline");
+        let effects = effects.effects().expect("read every step");
         let at = changes
             .iter()
             .position(|c| matches!(c.change, Change::Index(IndexChange::AddIndex { .. })))
@@ -499,8 +499,8 @@ fn a_package_drop_requires_the_absence_of_an_index_it_releases() {
                 },
             );
             let effects = analyse(&ops, &owners, before, after, &Postgres::new())
-                .expect("read the analysis baseline")
-                .effects;
+                .expect("read the analysis baseline");
+            let effects = effects.effects().expect("read every step");
             effects[1].requires.iter().any(|r| {
                 matches!(
                     r,
@@ -559,7 +559,9 @@ fn search_objects_and_packages_wait_for_each_other_through_the_effects() {
         (
             analyse(&ops, &owners, before, after, &Postgres::new())
                 .expect("read the analysis baseline")
-                .effects,
+                .effects()
+                .expect("read every step")
+                .to_vec(),
             base_ids,
             ids,
         )
@@ -635,8 +637,8 @@ fn search_objects_and_packages_wait_for_each_other_through_the_effects() {
             },
         );
         let effects = analyse(&ops, &owners, before, after, &Postgres::new())
-            .expect("read the analysis baseline")
-            .effects;
+            .expect("read the analysis baseline");
+        let effects = effects.effects().expect("read every step");
         effects[1]
             .requires
             .iter()
@@ -691,8 +693,8 @@ fn search_objects_and_packages_wait_for_each_other_through_the_effects() {
         },
     );
     let effects = analyse(&ops, &owners, before, after, &Postgres::new())
-        .expect("read the analysis baseline")
-        .effects;
+        .expect("read the analysis baseline");
+    let effects = effects.effects().expect("read every step");
     assert!(
         !effects[1]
             .requires

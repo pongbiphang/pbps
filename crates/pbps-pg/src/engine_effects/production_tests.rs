@@ -157,10 +157,10 @@ fn read_input(
         &Postgres::new().with_server_version(180000),
     )
     .expect("read the analysis baseline");
-    assert!(fx.unowned.is_empty(), "{:?}", fx.unowned);
+    let step_effects = fx.effects().expect("read every step");
     let g = graph(
         ops.as_slice(),
-        &fx.effects,
+        step_effects,
         &Baseline::of(before, &owners)
             .expect("read the test baseline")
             .with_symbolic(fx.symbolic.clone()),
@@ -173,12 +173,12 @@ fn read_input(
     let ordered = pbps_diff::order::reordered_operations(&ops, &sequence);
     let effects = sequence
         .iter()
-        .map(|&at| fx.effects[at].clone())
+        .map(|&at| step_effects[at].clone())
         .collect::<Vec<_>>();
     assert!(
         pbps_diff::order::membership::project(ordered.as_slice(), &effects, &fx.symbolic).is_ok()
     );
-    class::assert_permitted_orders(&ops, &fx.effects, &fx.symbolic, &g, "production cut");
+    class::assert_permitted_orders(&ops, step_effects, &fx.symbolic, &g, "production cut");
     (sequence, g)
 }
 #[test]
@@ -293,7 +293,11 @@ fn scoped_membership_analysis_refuses_an_unreadable_baseline_name() {
         pbps_diff::order::analyse_with_membership(&ops, owners, before, after, &pg, None, None)
     };
     let readable = analyse(&normal).expect("read the membership baseline");
-    assert!(!readable.effects[0].symbolic.is_empty());
+    assert!(
+        !readable.effects().expect("read every step")[0]
+            .symbolic
+            .is_empty()
+    );
     assert_eq!(
         analyse(&Unreadable(normal, name.clone())).err(),
         Some(OwnerError::Names {
@@ -370,8 +374,8 @@ fn a_rebuilt_routines_binding_is_final_on_the_restored_parent_default() {
         Some(&catalog),
     )
     .expect("read the analysis baseline");
-    assert!(fx.unowned.is_empty(), "{:?}", fx.unowned);
-    let write = fx.effects[1]
+    let step_effects = fx.effects().expect("read every step");
+    let write = step_effects[1]
         .symbolic
         .iter()
         .find_map(|c| match c {
@@ -611,10 +615,12 @@ fn a_partition_restoration_never_invents_a_goal_or_its_bindings() {
             &Postgres::new().with_server_version(180000),
         )
         .expect("read the analysis baseline")
-        .effects
-        .pop()
+        .effects()
+        .expect("read every step")
+        .last()
         .unwrap()
         .symbolic
+        .clone()
     };
     assert!(inspect(steps.clone()).iter().any(|c| matches!(c, Clause::Require(Fact::Unsupported { reason, .. }) if reason.contains("disagrees"))));
     steps[2] = Change::Partition(PartitionChange::SetPartitionDefault {
@@ -684,12 +690,12 @@ fn a_new_parent_keeps_its_existing_birth_and_attachment_contract() {
             &pg,
         )
         .expect("read the analysis baseline");
-        assert!(fx.unowned.is_empty());
-        assert!(fx.effects.iter().all(|e| e.symbolic.is_empty()));
+        let step_effects = fx.effects().expect("read every step");
+        assert!(step_effects.iter().all(|e| e.symbolic.is_empty()));
         assert_eq!(fx.symbolic, Default::default());
         let graph = graph(
             ops.as_slice(),
-            &fx.effects,
+            step_effects,
             &Baseline::of(
                 Snapshot {
                     schema: &s.before,
@@ -813,15 +819,16 @@ fn ordinary_analysis_does_not_invent_membership_catalog_reads() {
         None,
     )
     .expect("read the analysis baseline");
-    assert!(ordinary.unowned.is_empty());
-    assert!(ordinary.effects.iter().all(|e| e.symbolic.is_empty()));
+    let step_effects = ordinary.effects().expect("read every step");
+    assert!(step_effects.iter().all(|e| e.symbolic.is_empty()));
     assert_eq!(ordinary.symbolic, Default::default());
     // An explicit successful but empty read does not prove expression bindings.
     let empty_read = Default::default();
     let observed = inspect(&s.after, Some(&empty_read));
     assert!(
         observed
-            .effects
+            .effects()
+            .expect("read every step")
             .iter()
             .flat_map(|e| &e.symbolic)
             .any(|c| matches!(c, Clause::Recurse(w) if w.from == Fact::Unread))
@@ -838,7 +845,8 @@ fn ordinary_analysis_does_not_invent_membership_catalog_reads() {
     let changed = inspect(&s.after, None);
     assert!(
         changed
-            .effects
+            .effects()
+            .expect("read every step")
             .iter()
             .flat_map(|e| &e.symbolic)
             .any(|c| matches!(c, Clause::Recurse(w) if w.from == Fact::Unread))

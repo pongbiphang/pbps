@@ -350,15 +350,17 @@ mod unowned_steps {
         );
         let shadowed = analyse(&operations, &owners, before, after, &Candidates)
             .expect("read the analysis baseline");
+        // The resolver must keep the unread step at its position in the expanded plan.
+        let (_, unread) = shadowed.effects_with_unread();
         if let Some(at) = order.iter().position(|&i| i == 2) {
             assert!(matches!(
-                shadowed.unowned.as_slice(),
-                [(id, OwnerError::Unmanaged { name, .. })]
+                unread,
+                [crate::order::Unread { id, error: OwnerError::Unmanaged { name, .. } }]
                     if *id == operations.as_slice()[at].id() && name == &external_shown
             ));
             assert_ne!(operations.as_slice()[at].id().source() as usize, at);
         } else {
-            assert!(shadowed.unowned.is_empty());
+            assert!(unread.is_empty());
         }
         let schedule = scheduled(
             &changes,

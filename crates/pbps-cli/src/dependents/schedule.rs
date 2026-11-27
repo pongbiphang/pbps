@@ -573,12 +573,12 @@ fn keep_handover_dependents(
     };
     let effects = shadow::analyse_with_catalog(&operations, &owners, before, after, dialect, None)
         .map_err(|e| Refusal(e.to_string()))?;
-    if let Some((_, error)) = effects.unowned.first() {
-        return Err(Refusal(error.to_string()));
-    }
+    let step_effects = effects
+        .effects()
+        .map_err(|unread| Refusal(unread.error.to_string()))?;
     let graph = edges::graph(
         operations.as_slice(),
-        &effects.effects,
+        step_effects,
         &edges::Baseline::of(before, &owners).map_err(|e| Refusal(e.to_string()))?,
         &declared.module_deps(),
         edges::Checks::ALL,
