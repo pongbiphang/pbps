@@ -1283,11 +1283,15 @@ def run_with_resolver_fixtures(command, assigned, source):
     The connection variables and the image exist only in that child. The proof's
     inputs digest stays the caller's environment, as the gate's does.
     """
-    # The default names carry this process's id: the sourced script reuses a
-    # container of its names, so two proofs on one name could share and remove
-    # each other's servers. A second proof on the same ports then fails to start
-    # and removes only its own.
-    env = dict(source, PBPS_LIVE_PREFIX=source.get("PBPS_LIVE_PREFIX") or f"pbps-proof{os.getpid()}-")
+    # Every name carries this process's id, the caller's prefix or names
+    # included: the sourced script reuses a container of its names, so two
+    # proofs on one name could share and remove each other's servers. A second
+    # proof on the same ports then fails to start and removes only its own.
+    pid = os.getpid()
+    env = dict(source, PBPS_LIVE_PREFIX=f"{source.get('PBPS_LIVE_PREFIX') or 'pbps-proof'}{pid}-")
+    for name in ("PBPS_TEST_MSSQL_NAME", "PBPS_TEST_MSSQL_SCRATCH_NAME"):
+        if env.get(name):
+            env[name] = f"{env[name]}-{pid}"
     # The runner sets NAME to its own primary before sourcing the script; an
     # inherited one would start, or reuse, a container outside the owned names.
     env.pop("NAME", None)

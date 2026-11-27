@@ -1112,17 +1112,22 @@ class ResolverFixtureProofs(Harness):
                 self.assertEqual(self.remaining(), [])
                 self.assertFalse(path.exists())
 
-    def test_a_proof_never_reuses_or_removes_a_container_it_did_not_create(self):
-        for name in self.OWNED:
-            with self.subTest(name=name):
-                (self.containers / name).write_text("another owner")
-                result, path = self.proof(env={"PBPS_LIVE_PREFIX": "pbps-proof"})
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("fixture containers already exist: " + name, result.stderr)
-                self.assertEqual(self.remaining(), [name])
-                self.assertEqual(self.docker_calls("run") + self.docker_calls("rm"), [])
-                self.assertFalse(path.exists())
-                (self.containers / name).unlink()
+    def test_a_callers_prefix_or_names_never_lead_the_proof_to_anothers_containers(self):
+        # Another proof under the same prefix or names, or one of an older
+        # driver's fixed names (draft review round 2): none is reused or removed.
+        others = [*self.OWNED, "mine-s0", "mine-s0-scratch"]
+        for name in others:
+            (self.containers / name).write_text("another owner")
+        for env in ({"PBPS_LIVE_PREFIX": "pbps-proof"}, {"PBPS_TEST_MSSQL_NAME": "mine"}):
+            with self.subTest(env=env):
+                self.docker_log.unlink(missing_ok=True)
+                result, path = self.proof(env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(path.read_text())["status"], "ok")
+                self.assertFalse(set(self.started()) & set(others))
+                self.assertEqual(len(self.started()), 2)
+                self.assertFalse({c[-1] for c in self.docker_calls("rm")} & set(others))
+                self.assertEqual(self.remaining(), sorted(others))
 
     def test_a_concurrent_proofs_default_containers_are_neither_reused_nor_removed(self):
         # Another proof's servers, under the default names its own process id
@@ -1148,11 +1153,14 @@ class ResolverFixtureProofs(Harness):
 
     def test_caller_chosen_fixture_names_and_ports_do_not_change_the_inputs(self):
         before = self.gate(check=0)
+        self.docker_log.unlink(missing_ok=True)
         result, path = self.proof(requires=self.exported(26350, 26352), env={
             "PBPS_TEST_MSSQL_NAME": "mine", "PBPS_TEST_PORT": "26350",
             "PBPS_TEST_MSSQL_SCRATCH_PORT": "26352"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertLessEqual({"mine-s0", "mine-s0-scratch"}, set(self.started()))
+        self.assertTrue(all(re.fullmatch(r"mine-[0-9]+-s0(-scratch)?", n) for n in self.started()),
+                        self.started())
+        self.assertEqual(len(self.started()), 2)
         self.assertEqual(self.remaining(), [])
         self.assertEqual(json.loads(path.read_text())["inputs"],
                          json.loads((before / "manifest.json").read_text())["inputs"])

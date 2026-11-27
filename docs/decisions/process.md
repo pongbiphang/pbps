@@ -2268,8 +2268,9 @@ passing proofs (#3088, seen on #3082). `proof --resolver-mssql-fixtures` records
 the caller's digest as before, then sources that script from the proved worktree
 and runs the one named test in the same shell, as DEC-2749.1 does for the image
 defaults. Ownership follows the driver's fixture rule: names and ports come from
-the shard-zero assignment with the prefix `pbps-proof<pid>-`, so the script,
-which reuses a container of its names, never shares one with a concurrent proof;
+the shard-zero assignment with the prefix `pbps-proof<pid>-`, and a caller's
+prefix or names get the process id too, so the script, which reuses a container
+of its names, never shares one with a concurrent proof;
 an existing container refuses the proof, and both containers are removed after a pass, a failure, an
 interruption or a failed start. An inherited `NAME` is dropped, because the
 script would take it for the primary's name. A script that fails or is missing
