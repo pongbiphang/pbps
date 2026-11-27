@@ -94,6 +94,8 @@ mod literal_inputs2378;
 #[path = "support/drop_requirements2400.rs"]
 mod drop_requirements2400;
 
+#[path = "support/dependency_facts2987.rs"]
+mod dependency_facts2987;
 #[path = "support/index_gist2448.rs"]
 mod index_gist2448;
 #[path = "support/index_policy2448.rs"]

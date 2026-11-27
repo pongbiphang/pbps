@@ -49,6 +49,7 @@ pub enum Case<'a> {
 
 /// Decide the case for the ordinary plan of `base -> desired`. Pure: it
 /// reads the typed plan and nothing else, so deciding opens nothing.
+#[cfg(test)]
 pub fn case<'a>(
     selection: Option<&'a ResolverSelection>,
     base: pbps_diff::Side<'_>,
@@ -56,10 +57,25 @@ pub fn case<'a>(
     ordinary: &pbps_model::ChangeSet,
     dialect: &dyn pbps_dialect::Dialect,
 ) -> Case<'a> {
+    case_with_facts(selection, base, desired, ordinary, dialect, None)
+}
+
+/// Decide the case for the ordinary plan of `base -> desired`, optionally
+/// narrowed by connected catalog [`pbps_model::resolver::DependencyFacts`]
+/// (DEC-2987.1). With `facts = None`, every answer is DEC-1515.1's.
+pub fn case_with_facts<'a>(
+    selection: Option<&'a ResolverSelection>,
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    ordinary: &pbps_model::ChangeSet,
+    dialect: &dyn pbps_dialect::Dialect,
+    facts: Option<&pbps_model::resolver::DependencyFacts>,
+) -> Case<'a> {
     let Some(selection) = selection else {
         return Case::Fallback;
     };
-    let assessment = pbps_diff::resolver::assess(base, desired, ordinary, dialect);
+    let assessment =
+        pbps_diff::resolver::assess_with_facts(base, desired, ordinary, dialect, facts);
     if assessment.requires_resolution() {
         Case::Required {
             selection,
@@ -67,6 +83,37 @@ pub fn case<'a>(
         }
     } else {
         Case::NotNeeded { assessment }
+    }
+}
+
+/// Stable finding identifier for the advisory note emitted when connected
+/// dependency facts could not be read and assessment fell back to plan-level
+/// answers.
+pub const DEPENDENCY_FACTS_UNREAD_ID: &str = "resolver.dependency-facts-unread";
+
+/// Consume the result of a connected dependency-facts read. A failed read is
+/// never a plan error: it yields `None` (plan-level assessment) and one note.
+pub fn unwrap_dependency_facts(
+    result: Result<Option<pbps_model::resolver::DependencyFacts>, pbps_db::DbError>,
+) -> (
+    Option<pbps_model::resolver::DependencyFacts>,
+    Option<crate::output::Finding>,
+) {
+    match result {
+        Ok(facts) => (facts, None),
+        Err(error) => {
+            let message = format!(
+                "Could not read catalog dependency facts for lightweight binding assessment; \
+                 falling back to plan-level assessment: {error}"
+            );
+            (
+                None,
+                Some(crate::output::Finding::note(
+                    DEPENDENCY_FACTS_UNREAD_ID,
+                    message,
+                )),
+            )
+        }
     }
 }
 
@@ -1274,6 +1321,81 @@ mod tests {
             panic!("an arriving routine is a binding question");
         };
         assert_eq!(named(&assessment), "app.v");
+    }
+
+    #[test]
+    fn failed_dependency_facts_read_falls_back_to_plan_level_assessment_with_one_note() {
+        let (base, desired) = arrival();
+        let selected = selection();
+        let base_ids = ids(&base, &IdsFile::default());
+        let desired_ids = ids(&desired, &base_ids);
+        let base_side = pbps_diff::Side {
+            schema: &base,
+            ids: &base_ids,
+        };
+        let desired_side = pbps_diff::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        };
+        let pg = pbps_pg::Postgres::new();
+        let ordinary =
+            pbps_diff::resolver::ordinary(base_side, desired_side, &pg, &Hints::default()).unwrap();
+
+        let (facts, note) = unwrap_dependency_facts(Err(pbps_db::DbError::Refused(
+            "permission denied for table pg_depend".into(),
+        )));
+        assert!(facts.is_none());
+        let note = note.expect("a failed read emits one advisory note");
+        assert_eq!(note.id, DEPENDENCY_FACTS_UNREAD_ID);
+        assert_eq!(note.severity, crate::output::Severity::Note);
+        assert!(
+            note.message
+                .contains("falling back to plan-level assessment")
+        );
+        assert!(
+            note.message
+                .contains("permission denied for table pg_depend")
+        );
+
+        // With fallback facts = None, the answer matches plan-level `case(...)`.
+        let Case::Required { assessment, .. } = case_with_facts(
+            Some(&selected),
+            base_side,
+            desired_side,
+            &ordinary,
+            &pg,
+            facts.as_ref(),
+        ) else {
+            panic!("fallback with no facts must keep plan-level Required");
+        };
+        assert_eq!(named(&assessment), "app.v");
+
+        // Positive: Ok(Some(facts)) emits no note and narrows unrelated views to NotNeeded.
+        let good_facts = pbps_model::resolver::DependencyFacts {
+            surfaces: std::collections::BTreeMap::from([(
+                pbps_model::resolver::Surface::Module("app.v".parse().unwrap()),
+                pbps_model::resolver::SurfaceDependencies::Parsed(Default::default()),
+            )]),
+            relation_ancestors: pbps_model::resolver::ReadFact::Known(Default::default()),
+            catalog_names: std::collections::BTreeMap::from([(
+                "t".into(),
+                pbps_model::resolver::CatalogName::Clear,
+            )]),
+            companion_types: Default::default(),
+        };
+        let (ok_facts, no_note) = unwrap_dependency_facts(Ok(Some(good_facts)));
+        assert!(no_note.is_none());
+        assert!(matches!(
+            case_with_facts(
+                Some(&selected),
+                base_side,
+                desired_side,
+                &ordinary,
+                &pg,
+                ok_facts.as_ref(),
+            ),
+            Case::NotNeeded { .. }
+        ));
     }
 }
 

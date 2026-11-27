@@ -3356,6 +3356,13 @@ pub trait Dialect {
         sequence.name.clone()
     }
 
+    /// First-choice companion type names this engine creates alongside an
+    /// arriving relation or type (for example a row/element type's array type).
+    /// Empty on engines that create no companion type.
+    fn companion_type_names(&self, _name: &pbps_model::ObjectName) -> Vec<pbps_model::ObjectName> {
+        Vec::new()
+    }
+
     /// The default calling an owned sequence, for a partition taking its
     /// parent's default back (DEC-2218.1). The dialect owns both the name
     /// and the expression; the differ must not invent either. Engines that

@@ -36,5 +36,6 @@ pub use evidence::{
 
 mod facts;
 pub use facts::{
-    Ancestor, CatalogName, DependencyEdge, DependencyFacts, ReadFact, SurfaceDependencies,
+    Ancestor, CatalogName, DependencyEdge, DependencyFacts, NameAvailability, ReadFact,
+    SurfaceDependencies,
 };
