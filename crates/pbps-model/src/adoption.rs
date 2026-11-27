@@ -32,6 +32,34 @@ pub struct RelationIndex {
     pub constraint: Option<Text>,
 }
 
+/// What stands on an index. An attach pairs one of the table's with one of the
+/// parent's of the same kind only (DEC-1671.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    /// No constraint.
+    Plain,
+    PrimaryKey,
+    Unique,
+    Exclusion,
+}
+
+impl RelationIndex {
+    /// Read from the constraint's definition as the engine prints it. `None` is
+    /// a definition that is none of these, which pairs with nothing.
+    pub fn kind(&self) -> Option<IndexKind> {
+        let Some(constraint) = &self.constraint else {
+            return Some(IndexKind::Plain);
+        };
+        [
+            ("PRIMARY KEY", IndexKind::PrimaryKey),
+            ("UNIQUE", IndexKind::Unique),
+            ("EXCLUDE", IndexKind::Exclusion),
+        ]
+        .into_iter()
+        .find_map(|(word, kind)| constraint.raw().starts_with(word).then_some(kind))
+    }
+}
+
 /// An index as a database holds it now. An invalid one is never taken by an
 /// attach, and its definition does not show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,9 +92,25 @@ pub struct AttachRehearsal {
     pub parent: Vec<RelationIndex>,
     /// The table's, before any of the plan's drops.
     pub table: Vec<RelationIndex>,
-    /// Each of the table's own indexes the plan leaves standing, and the
-    /// parent's index the rehearsal's engine gave it to.
+    /// Each of the table's own indexes the plan leaves standing, a key's or an
+    /// exclusion's by its name, and the parent's index the rehearsal's engine
+    /// gave it to.
     pub kept: BTreeMap<ObjectLocalName, ObjectLocalName>,
+}
+
+impl AttachRehearsal {
+    /// Whether both lists hold these two names and the indexes are of one kind.
+    /// A constraint's index under a plain index of the parent's would leave the
+    /// constraint the table's own, and PostgreSQL 16 also gives a key to a
+    /// unique constraint, so nothing else may be left to an attach.
+    pub fn pairs(&self, own: &ObjectLocalName, parents: &ObjectLocalName) -> bool {
+        let kind = |list: &[RelationIndex], name: &ObjectLocalName| {
+            list.iter()
+                .find(|index| index.name == *name)
+                .and_then(RelationIndex::kind)
+        };
+        kind(&self.table, own).is_some_and(|own| kind(&self.parent, parents) == Some(own))
+    }
 }
 
 /// A rehearsal's answer on its way to the differ, which checks it against the
@@ -80,7 +124,7 @@ pub struct AttachAnswer {
 
 /// Whether `change` takes the index `index` off `relation`: the forms a plan
 /// removes an index in ahead of an attach.
-fn drops(change: &Change, relation: &TableName, index: &RelationIndex) -> bool {
+pub fn drops(change: &Change, relation: &TableName, index: &RelationIndex) -> bool {
     if let Change::Index(IndexChange::DropIndex { table, name })
     | Change::Constraint(ConstraintChange::DropUnique { table, name })
     | Change::Constraint(ConstraintChange::SetExclusion {
@@ -101,12 +145,7 @@ fn drops(change: &Change, relation: &TableName, index: &RelationIndex) -> bool {
         // A key the model holds no name for is the relation's one primary key.
         table == relation
             && key.name.as_ref().map_or_else(
-                || {
-                    index
-                        .constraint
-                        .as_ref()
-                        .is_some_and(|c| c.raw().starts_with("PRIMARY KEY"))
-                },
+                || index.kind() == Some(IndexKind::PrimaryKey),
                 |name| *name == index.name,
             )
     } else {
@@ -238,10 +277,16 @@ pub fn validate(plan: &SavedPlan) -> Result<(), String> {
         let distinct = |list: &[RelationIndex]| {
             list.iter().map(|i| &i.name).collect::<BTreeSet<_>>().len() == list.len()
         };
-        let plain = |list: &'_ [RelationIndex], name: &ObjectLocalName| {
-            list.iter()
-                .find(|i| i.name == *name && i.constraint.is_none())
-                .cloned()
+        // A name the partition declares as its own is never left to be the
+        // copy of the parent's.
+        let declared = |name: &ObjectLocalName| {
+            shape.indexes.contains_key(name)
+                || shape.unique.contains_key(name)
+                || shape.exclude.contains_key(name)
+                || shape
+                    .primary_key
+                    .as_ref()
+                    .is_some_and(|key| key.name.as_ref() == Some(name))
         };
         let taken: BTreeSet<_> = rehearsal.kept.values().collect();
         let holds = plan.dialect == "postgres"
@@ -251,14 +296,15 @@ pub fn validate(plan: &SavedPlan) -> Result<(), String> {
             && distinct(&rehearsal.table)
             && taken.len() == rehearsal.kept.len()
             && rehearsal.kept.iter().all(|(own, theirs)| {
-                plain(&rehearsal.parent, theirs).is_some()
-                    && !shape.indexes.contains_key(own)
-                    && plain(&rehearsal.table, own).is_some_and(|own| {
-                        !plan
-                            .changes
-                            .changes
-                            .iter()
-                            .any(|p| drops(&p.change, table, &own))
+                rehearsal.pairs(own, theirs)
+                    && !declared(own)
+                    && !rehearsal.table.iter().any(|index| {
+                        index.name == *own
+                            && plan
+                                .changes
+                                .changes
+                                .iter()
+                                .any(|p| drops(&p.change, table, index))
                     })
             });
         if !holds {
@@ -564,6 +610,140 @@ mod tests {
             })),
         );
         cases.push(("a plan that updates an extension", updating));
+        for (why, plan) in cases {
+            assert_eq!(
+                validate(&plan),
+                Err("invalid attach rehearsal on app.c".to_owned()),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kind_is_read_from_the_constraint_the_engine_prints() {
+        assert_eq!(index("a").kind(), Some(IndexKind::Plain));
+        for (constraint, kind) in [
+            ("PRIMARY KEY (k)", Some(IndexKind::PrimaryKey)),
+            ("UNIQUE NULLS NOT DISTINCT (k)", Some(IndexKind::Unique)),
+            ("EXCLUDE USING gist (r WITH &&)", Some(IndexKind::Exclusion)),
+            ("CHECK (k > 0)", None),
+            ("", None),
+        ] {
+            assert_eq!(keyed("a", constraint).kind(), kind, "{constraint}");
+        }
+    }
+
+    /// [`recorded`] keeping a key, a unique constraint and an exclusion, each
+    /// under the parent's of its kind.
+    fn constrained(edit: impl FnOnce(&mut AttachRehearsal, &mut crate::Table)) -> SavedPlan {
+        edited(|record, shape| {
+            let each = |prefix: &str| {
+                vec![
+                    keyed(&format!("{prefix}_pk"), "PRIMARY KEY (k)"),
+                    keyed(&format!("{prefix}_u"), "UNIQUE (n)"),
+                    keyed(&format!("{prefix}_x"), "EXCLUDE USING btree (n WITH =)"),
+                    index(&format!("{prefix}_n")),
+                ]
+            };
+            record.parent = each("p");
+            record.table = each("c");
+            record.kept = ["pk", "u", "x"]
+                .map(|of| (format!("c_{of}").into(), format!("p_{of}").into()))
+                .into();
+            edit(record, shape);
+        })
+    }
+
+    #[test]
+    fn a_kept_constraint_is_admitted_only_under_one_of_its_kind_that_the_plan_leaves() {
+        assert_eq!(validate(&constrained(|_, _| {})), Ok(()));
+        let one = |own: &str, by: &str| [(own.into(), by.into())].into();
+        let mut cases = Vec::new();
+        for (own, by) in [
+            ("c_pk", "p_u"),
+            ("c_u", "p_pk"),
+            ("c_x", "p_u"),
+            ("c_u", "p_x"),
+            ("c_u", "p_n"),
+            ("c_x", "p_n"),
+            ("c_n", "p_u"),
+        ] {
+            cases.push((
+                format!("{own} under {by}"),
+                constrained(|r, _| r.kept = one(own, by)),
+            ));
+        }
+        cases.push((
+            "a constraint of no known kind on both sides".to_owned(),
+            constrained(|r, _| {
+                r.parent[1] = keyed("p_u", "CHECK (n > 0)");
+                r.table[1] = keyed("c_u", "CHECK (n > 0)");
+            }),
+        ));
+        cases.push((
+            "an exclusion the declaration holds".to_owned(),
+            constrained(|_, shape| {
+                shape.exclude.insert(
+                    "c_x".into(),
+                    crate::ExclusionConstraint {
+                        method: Default::default(),
+                        keys: Vec::new(),
+                        include: Vec::new(),
+                        filter: None,
+                        storage_parameters: Default::default(),
+                        timing: crate::ExclusionTiming::Immediate,
+                    },
+                );
+            }),
+        ));
+        let table = TableName::new("app", "c");
+        let key = |name: Option<&str>| crate::schema::PrimaryKey {
+            name: name.map(Into::into),
+            columns: vec!["k".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        };
+        let primary = |name| {
+            Change::Constraint(ConstraintChange::SetPrimaryKey {
+                table: table.clone(),
+                from: Some(key(name)),
+                to: None,
+                nonclustered: false,
+            })
+        };
+        for (why, change) in [
+            ("a kept key dropped by name", primary(Some("c_pk"))),
+            ("a kept key dropped without one", primary(None)),
+            (
+                "a kept unique constraint dropped",
+                Change::Constraint(ConstraintChange::DropUnique {
+                    table: table.clone(),
+                    name: "c_u".into(),
+                }),
+            ),
+            (
+                "a kept exclusion dropped",
+                Change::Constraint(ConstraintChange::SetExclusion {
+                    table: table.clone(),
+                    name: "c_x".into(),
+                    from: Some(Box::new(crate::ExclusionConstraint {
+                        method: Default::default(),
+                        keys: Vec::new(),
+                        include: Vec::new(),
+                        filter: None,
+                        storage_parameters: Default::default(),
+                        timing: crate::ExclusionTiming::Immediate,
+                    })),
+                    to: None,
+                }),
+            ),
+        ] {
+            let mut plan = constrained(|_, _| {});
+            plan.changes
+                .changes
+                .insert(0, crate::PlannedChange::new(change));
+            cases.push((why.to_owned(), plan));
+        }
         for (why, plan) in cases {
             assert_eq!(
                 validate(&plan),

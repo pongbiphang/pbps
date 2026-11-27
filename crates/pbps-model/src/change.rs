@@ -1226,8 +1226,8 @@ pub enum PartitionChange {
         /// `CREATE`.
         shape: Box<Table>,
         /// What a resolver's rehearsal answered, on a plan that leaves an own
-        /// index to the attach: apply holds both relations to it before the
-        /// attach (DEC-1671.2). `None` where the plan keeps none.
+        /// index, key or exclusion to the attach: apply holds both relations to
+        /// it before the attach (DEC-1671.2). `None` where the plan keeps none.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rehearsal: Option<Box<crate::adoption::AttachRehearsal>>,
     },
