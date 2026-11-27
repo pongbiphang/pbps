@@ -228,6 +228,7 @@ impl Engine for MssqlEngine {
                 gaps: render(crate::doctor::missing(&held)),
                 advised: render(crate::doctor::advised(&held)),
                 absent_schemas: held.absent_schemas,
+                unasked: Vec::new(),
             })
         })
     }

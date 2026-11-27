@@ -273,7 +273,7 @@ pub(super) fn in_a_unit<T>(
 
 /// The `(name, kind)` of every catalog entry of `main` that has one of `names`,
 /// ASCII case ignored as SQLite ignores it, sorted by name.
-pub(super) fn occupants(c: &Connection, names: &[&str]) -> Result<Vec<(String, String)>, DbError> {
+pub(crate) fn occupants(c: &Connection, names: &[&str]) -> Result<Vec<(String, String)>, DbError> {
     let slots = (1..=names.len())
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()

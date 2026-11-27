@@ -4849,8 +4849,9 @@ fn cmd_convert(
     let dialect = dialect(project)?;
     if !dialect.records_conversions() {
         bail!(
-            "convert is only supported for PostgreSQL: this engine converts a column's values \
-             itself and has no `USING` clause (ADR-0012 section 5)"
+            "convert is only supported for PostgreSQL: `{}` has no `USING` clause for column \
+             type conversions (ADR-0012 section 5)",
+            dialect.name()
         );
     }
     let loaded = load(project, dialect.as_ref())?;

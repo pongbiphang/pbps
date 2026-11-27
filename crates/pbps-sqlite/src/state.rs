@@ -45,8 +45,10 @@ mod write;
 
 pub use busy::BUSY_WAIT;
 pub(crate) use busy::{explained_as, waiting};
+pub(crate) use ddl::occupants;
 pub use ddl::{ensure_tables, is_initialized};
 pub use identity::{ENVIRONMENT_ID_CHARS, environment_identity};
+pub(crate) use lock::database_file;
 pub use lock::{
     LOCK_FILE_SUFFIX, LockGuard, Proof, RowOnly, Taken, lock, lock_holder, release,
     session_application_name, session_lookup, sidecar_path, unlock,

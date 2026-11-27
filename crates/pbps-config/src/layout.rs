@@ -90,7 +90,7 @@ impl Config {
     pub(crate) fn check_databases(&self) -> Result<(), String> {
         if self.databases.is_some() {
             if self.dialect != DialectName::Mssql {
-                return Err("databases: is supported only for SQL Server; PostgreSQL projects use the single-database layout".into());
+                return Err(databases_unsupported(self.dialect.as_str()));
             }
             if self.ids_file.as_os_str() != crate::DEFAULT_IDS_FILE {
                 return Err("databases: keeps schema.ids.json inside each database directory; remove the project-level ids_file override".into());
@@ -98,6 +98,13 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn databases_unsupported(dialect: &str) -> String {
+    format!(
+        "databases: is supported only for SQL Server; {dialect} projects use the \
+         single-database layout"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,5 +154,24 @@ impl Project {
             )
         }))
         .map_err(fail)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn databases_unsupported_names_whatever_non_mssql_dialect_is_passed() {
+        let pg = databases_unsupported(DialectName::Postgres.as_str());
+        assert_eq!(
+            pg,
+            "databases: is supported only for SQL Server; postgres projects use the single-database layout"
+        );
+        let sqlite = databases_unsupported("sqlite");
+        assert!(
+            sqlite.contains("sqlite projects") && !sqlite.contains("PostgreSQL"),
+            "{sqlite}"
+        );
     }
 }

@@ -12,8 +12,9 @@ pub fn problems(
             out.push((
                 "dialect.rejected",
                 format!(
-                    "dependency `{}`: cross-database dependencies are supported only on SQL Server",
-                    name.shown()
+                    "dependency `{}`: cross-database dependencies are supported only on SQL Server, not `{}`",
+                    name.shown(),
+                    dialect.name()
                 ),
             ));
             continue;
@@ -56,4 +57,52 @@ pub fn render(dependencies: &PlannedDependencies) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_model::dependency::{Dependency, DependencyColumn, DependencyKind, DependencyName};
+
+    #[test]
+    fn cross_database_dependencies_are_refused_naming_the_dialect_outside_sql_server() {
+        let mut deps = Dependencies::new();
+        let name: DependencyName = "other.dbo.t".parse().unwrap();
+        deps.insert(
+            name,
+            Dependency {
+                kind: DependencyKind::Table,
+                columns: [(
+                    "id".into(),
+                    DependencyColumn {
+                        ty: "int".parse().unwrap(),
+                        nullable: false,
+                    },
+                )]
+                .into(),
+            },
+        );
+        for (dialect, expected) in [
+            (
+                &pbps_sqlite::dialect::Sqlite::default() as &dyn pbps_dialect::Dialect,
+                "sqlite",
+            ),
+            (
+                &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
+                "postgres",
+            ),
+        ] {
+            let found = problems(&deps, dialect);
+            assert_eq!(found.len(), 1, "{expected}: {found:?}");
+            assert_eq!(found[0].0, "dialect.rejected");
+            assert!(
+                found[0]
+                    .1
+                    .contains(&format!("only on SQL Server, not `{expected}`")),
+                "{found:?}"
+            );
+        }
+        // Negative: SQL Server accepts valid cross-database dependencies.
+        assert!(problems(&deps, &pbps_mssql::Mssql).is_empty());
+    }
 }

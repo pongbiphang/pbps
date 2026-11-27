@@ -39,6 +39,7 @@ use pbps_dialect::TransactionFraming;
 
 pub mod catalog;
 pub mod dialect;
+pub mod doctor;
 pub mod drop_requirements;
 pub mod emit;
 pub mod engine;

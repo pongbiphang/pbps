@@ -312,8 +312,8 @@ impl Connection {
         let shown = path.display().to_string();
         if shown.is_empty() || shown == ":memory:" {
             return Err(DbError::BadConnectionString(
-                "an empty path or `:memory:` is not a database file; \
-                 use `open_in_memory` for a private memory database"
+                "an empty path or `:memory:` is not a database file on disk; \
+                 pass the path to a SQLite database file instead"
                     .into(),
             ));
         }
@@ -325,8 +325,9 @@ impl Connection {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
         {
             return Err(DbError::BadConnectionString(format!(
-                "`{shown}` starts with `file:`, which SQLite would read as a URI; \
-                 write the path as `./{shown}`"
+                "`{shown}` starts with `file:`, which SQLite reads as a URI and pbps refuses; \
+                 pass a plain database file path instead (prefix a relative filename that \
+                 literally begins with `file:` with `./`)"
             )));
         }
         match std::fs::metadata(path) {
@@ -910,6 +911,35 @@ fn driver_error(error: rusqlite::Error) -> DbError {
 #[cfg(test)]
 mod copy_tests;
 
+/// Whether the operating system would let this process write `path`: for a
+/// file, change it; for a directory, create a file in it.
+///
+/// Asked, never tried: nothing is opened, created or locked, so a readiness
+/// check can ask it of a database another process is writing. `None` where the
+/// platform has no such question (on Windows the answer is in the access
+/// control lists, and only an attempt reads them).
+#[cfg(unix)]
+pub fn may_write(path: &Path, directory: bool) -> std::io::Result<Option<bool>> {
+    use rustix::fs::Access;
+    use rustix::io::Errno;
+    let wanted = if directory {
+        Access::WRITE_OK | Access::EXEC_OK
+    } else {
+        Access::WRITE_OK
+    };
+    match rustix::fs::access(path, wanted) {
+        Ok(()) => Ok(Some(true)),
+        Err(Errno::ACCESS | Errno::ROFS | Errno::PERM) => Ok(Some(false)),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// See the Unix half: there is nothing to ask here without trying.
+#[cfg(not(unix))]
+pub fn may_write(_path: &Path, _directory: bool) -> std::io::Result<Option<bool>> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -1044,9 +1074,16 @@ mod tests {
         for text in ["", ":memory:"] {
             let error = Connection::open(Path::new(text), OpenMode::CreateIfMissing)
                 .expect_err("must refuse");
+            let DbError::BadConnectionString(message) = error else {
+                panic!("expected BadConnectionString for {text:?}, got {error:?}");
+            };
             assert!(
-                matches!(error, DbError::BadConnectionString(_)),
-                "{text:?}: {error:?}"
+                message.contains("not a database file") && message.contains("pass the path"),
+                "{text:?}: {message}"
+            );
+            assert!(
+                !message.contains("open_in_memory"),
+                "CLI refusal must not name an internal Rust function: {message}"
             );
         }
         let dir = dir();
@@ -1057,15 +1094,30 @@ mod tests {
         );
         // With URI handling on, this would open a private memory database and
         // succeed; it is refused before SQLite sees it, and nothing is created.
-        let error = Connection::open(
-            Path::new("file:pbps_uri_probe?mode=memory"),
-            OpenMode::ExistingOnly,
-        )
-        .expect_err("a file: path must not be read as a URI");
-        assert!(
-            matches!(error, DbError::BadConnectionString(_)),
-            "{error:?}"
-        );
+        for uri in [
+            "file:pbps_uri_probe?mode=memory",
+            "file:/abs/path.db",
+            "FILE:/abs/upper.db",
+        ] {
+            let error = Connection::open(Path::new(uri), OpenMode::ExistingOnly)
+                .expect_err("a file: path must not be read as a URI");
+            let DbError::BadConnectionString(message) = error else {
+                panic!("expected BadConnectionString for {uri:?}, got {error:?}");
+            };
+            assert!(
+                message.contains("starts with `file:`")
+                    && message.contains("plain database file path"),
+                "{uri:?}: {message}"
+            );
+            assert!(
+                !message.contains(&format!("./{uri}")),
+                "must never suggest ./file:/abs/path: {message}"
+            );
+        }
+        // Negative: a real file whose relative name starts with `./file:` opens cleanly.
+        let literal = dir.path().join("file:literal.db");
+        let opened = Connection::open(&literal, OpenMode::CreateIfMissing);
+        assert!(opened.is_ok(), "{opened:?}");
     }
 
     #[test]

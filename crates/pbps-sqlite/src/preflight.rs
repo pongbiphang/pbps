@@ -122,7 +122,7 @@ pub fn connection_problems(c: &Connection) -> Result<Vec<String>, DbError> {
 /// enough to have written pages reports success and leaves them in the file. So
 /// a failed apply could keep part of what ran, and the probe of [`writable`]
 /// rests on a rollback too.
-fn journal_off(c: &Connection) -> Result<Option<String>, DbError> {
+pub(crate) fn journal_off(c: &Connection) -> Result<Option<String>, DbError> {
     let rows = c.query("PRAGMA journal_mode", &[])?;
     let Some(row) = rows.first() else {
         return Err(DbError::BadRow(

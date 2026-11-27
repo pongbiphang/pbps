@@ -162,7 +162,7 @@ fn two_distinct_key_files_with_one_id_are_errors_in_the_report() {
     }
     std::fs::write(dir.0.join("pbps.yml"), "dialect: postgres\nenvironments:\n  a: {url_env: A, fingerprint_key_file: one.key}\n  b: {url_env: B, fingerprint_key_file: two.key}\n").unwrap();
     let project = Project::load(&dir.0.join("pbps.yml")).unwrap();
-    let findings = for_request(&project, None);
+    let findings = for_request(&project, None, pbps_db::Driver::Postgres);
     assert_eq!(findings.len(), 2);
     assert!(
         findings
@@ -197,14 +197,14 @@ fn two_distinct_key_files_with_one_id_are_errors_in_the_report() {
         name: Some("a".into()),
         target: Err(anyhow::anyhow!("key-only test does not resolve a target")),
     };
-    let selected = for_request(&project, Some(&request));
+    let selected = for_request(&project, Some(&request), pbps_db::Driver::Postgres);
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].severity, Severity::Note);
     let raw = Requested {
         name: None,
         target: Err(anyhow::anyhow!("key-only test does not resolve a target")),
     };
-    assert!(for_request(&project, Some(&raw)).is_empty());
+    assert!(for_request(&project, Some(&raw), pbps_db::Driver::Postgres).is_empty());
 
     let mut findings = report.findings;
     findings.push(Finding::error(
@@ -285,4 +285,39 @@ fn historical_shared_sources_keep_the_baseline_refusal_cause() {
     assert!(!dir.0.join("different-old.key").exists());
     assert_eq!(std::fs::read_to_string(config).unwrap(), distinct);
     assert_eq!(git(&dir.0, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn an_engine_without_a_resolver_omits_the_no_fingerprint_key_note() {
+    let project = project();
+    // Without a resolver (SQLite), unconfigured fingerprint keys produce no note.
+    let sqlite_findings = for_request(&project, None, pbps_db::Driver::Sqlite);
+    assert!(
+        sqlite_findings.is_empty(),
+        "expected no fingerprint-key note for an engine without a resolver: {sqlite_findings:?}"
+    );
+    // Negative: server engines (PostgreSQL, SQL Server) still emit the note.
+    for driver in [pbps_db::Driver::Postgres, pbps_db::Driver::Mssql] {
+        let server_findings = for_request(&project, None, driver);
+        assert_eq!(server_findings.len(), 3, "{driver:?}: {server_findings:?}");
+        assert!(
+            server_findings
+                .iter()
+                .all(|f| f.id == "environment.no-fingerprint-key"),
+            "{driver:?}: {server_findings:?}"
+        );
+    }
+    // Negative: if an environment explicitly configures a broken key, even an
+    // engine without a resolver reports that error rather than swallowing it.
+    let dir = Directory::new();
+    std::fs::write(
+        dir.0.join("pbps.yml"),
+        "dialect: postgres\nenvironments:\n  a: {url_env: A, fingerprint_key_file: missing.key}\n  b: {url_env: B}\n",
+    )
+    .unwrap();
+    let broken = Project::load(&dir.0.join("pbps.yml")).unwrap();
+    let findings = for_request(&broken, None, pbps_db::Driver::Sqlite);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].id, "environment.fingerprint-key");
+    assert_eq!(findings[0].severity, Severity::Error);
 }

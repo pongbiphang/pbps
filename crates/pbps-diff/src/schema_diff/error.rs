@@ -162,11 +162,11 @@ pub enum DiffError {
         next: String,
     },
 
-    /// The identity file records conversions for an engine that converts
-    /// implicitly and has no `USING` (#2331, ADR-0012 section 5).
+    /// The identity file records conversions for an engine that has no `USING`
+    /// clause (#2331, ADR-0012 section 5).
     #[error(
         "the identity file records {count} conversion(s), but this engine has no `USING` clause \
-         and converts a column's values itself, so nothing would run the expression. Remove \
+         for column type conversions, so nothing would run the expression. Remove \
          the `conversions` entries from the identity file"
     )]
     ConversionsUnsupported { count: usize },

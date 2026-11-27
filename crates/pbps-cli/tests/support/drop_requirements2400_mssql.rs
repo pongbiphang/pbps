@@ -122,7 +122,7 @@ fn guarded_drops_record_replace_clear_checksum_and_apply_on_sql_server() {
         PREDICATE
     );
     let explained = ok(d.run(&["explain", "--plan", path.to_str().unwrap()]));
-    assert!(stdout(&explained).contains("exclusive table lock through the drop, so writers wait"));
+    assert!(stdout(&explained).contains("exclusive write lock through the drop, so writers wait"));
     let sql = d.dir.join("guarded.sql");
     let refused = d.run(&["plan", "--db", connection, "--sql", sql.to_str().unwrap()]);
     assert_ne!(code(&refused), 0);

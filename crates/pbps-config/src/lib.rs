@@ -63,9 +63,12 @@ pub enum ConfigError {
     RenamedResolverBaseline { path: PathBuf, resolver: String },
 
     #[error(
-        "resolver `{resolver}` sets `same_instance`, which applies only to SQL Server server entries; remove it for PostgreSQL"
+        "resolver `{resolver}` sets `same_instance`, which applies only to SQL Server server entries; remove it for {dialect}"
     )]
-    InapplicableSameInstance { resolver: String },
+    InapplicableSameInstance {
+        resolver: String,
+        dialect: &'static str,
+    },
 
     #[error(
         "resolver profile names must start with an ASCII letter or digit and contain only letters, digits, dots, underscores or hyphens"
@@ -534,7 +537,7 @@ impl Config {
         {
             return Err(ConfigError::InvalidResolverName);
         }
-        if config.dialect == DialectName::Postgres {
+        if config.dialect != DialectName::Mssql {
             for (name, profile) in &config.resolvers {
                 if matches!(
                     profile,
@@ -545,6 +548,7 @@ impl Config {
                 ) {
                     return Err(ConfigError::InapplicableSameInstance {
                         resolver: name.clone(),
+                        dialect: config.dialect.as_str(),
                     });
                 }
             }

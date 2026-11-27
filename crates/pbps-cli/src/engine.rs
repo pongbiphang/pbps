@@ -1828,6 +1828,26 @@ pub fn permission_read_advice(driver: Driver) -> String {
     (profile::profile(driver).permission_read_advice)()
 }
 
+/// What `doctor` calls the permission subject (`"account"` or `"process"`).
+pub const fn permission_subject(driver: Driver) -> &'static str {
+    profile::profile(driver).permission_subject
+}
+
+/// What `doctor` advises checking when an environment cannot be reached.
+pub const fn unreachable_remedy(driver: Driver) -> &'static str {
+    profile::profile(driver).unreachable_remedy
+}
+
+/// What `doctor` labels the engine's version line (`"server"` or `"library"`).
+pub const fn version_label(driver: Driver) -> &'static str {
+    profile::profile(driver).version_label
+}
+
+/// Whether this engine has a target resolver / owned scratch server (`Profile::owned_test`).
+pub const fn has_resolver(driver: Driver) -> bool {
+    profile::profile(driver).owned_test.is_some()
+}
+
 /// Whether `strategy: online` depends on something only a connection can read.
 ///
 /// On SQL Server it does: online index operations are an Enterprise-edition

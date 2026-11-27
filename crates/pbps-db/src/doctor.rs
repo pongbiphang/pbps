@@ -363,6 +363,9 @@ pub struct Permissions {
     pub advised: Vec<PermissionGap>,
     /// The managed schemas the database does not have yet.
     pub absent_schemas: BTreeSet<String>,
+    /// What could not be asked without trying it, each with why. Neither a
+    /// gap nor an all-clear: `doctor` says it was not checked.
+    pub unasked: Vec<PermissionGap>,
 }
 
 // ---------------------------------------------------------------------------
