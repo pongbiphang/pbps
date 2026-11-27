@@ -721,9 +721,12 @@ fn create_and_a_binding_change_in_one_plan_is_refused_by_name() {
             ),
         )
         .unwrap();
+        // Named after a word of the kept view's text, so the view's
+        // dependencies alone cannot prove it unaffected and the scratch is
+        // still asked (DEC-2987.1).
         std::fs::write(
-            g.d.dir.join("schema/app.t2.yml"),
-            "table: app.t2\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: {name: pk_t2, columns: [id]}\n",
+            g.d.dir.join("schema/app.amount.yml"),
+            "table: app.amount\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: {name: pk_amount, columns: [id]}\n",
         )
         .unwrap();
         minted(&g);

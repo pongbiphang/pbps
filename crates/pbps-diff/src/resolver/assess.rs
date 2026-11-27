@@ -588,6 +588,18 @@ struct PlanEffects {
     arriving_companion_types: BTreeSet<ObjectName>,
 }
 
+/// Whether an index or a key on `table` is copied to other tables, or is such
+/// a copy: the engine makes one per partition under a name it chooses, and
+/// drops them with the parent's.
+fn copies_indexes(table: &TableName, base: crate::Side<'_>, desired: crate::Side<'_>) -> bool {
+    [base, desired].iter().any(|side| {
+        side.schema
+            .tables
+            .get(table)
+            .is_some_and(|t| t.partition_by.is_some() || t.partition_of.is_some())
+    })
+}
+
 fn is_excluded_table(table: &Table) -> bool {
     table.partition_by.is_some() || table.partition_of.is_some() || !table.computed.is_empty()
 }
@@ -901,6 +913,7 @@ impl PlanEffects {
             }) => {
                 if engine.indexes_are_relations {
                     self.moves_bindings = true;
+                    self.exclude_narrowing |= copies_indexes(table, base, desired);
                     self.record_pk(&table.schema, from.as_ref(), false);
                     self.record_pk(&table.schema, to.as_ref(), true);
                 }
@@ -909,6 +922,7 @@ impl PlanEffects {
             | Change::Index(IndexChange::AddIndex { table, name, .. }) => {
                 if engine.indexes_are_relations {
                     self.moves_bindings = true;
+                    self.exclude_narrowing |= copies_indexes(table, base, desired);
                     self.arrive_rel_or_type(ObjectName::new(&table.schema, name.raw()));
                 }
             }
@@ -916,6 +930,7 @@ impl PlanEffects {
             | Change::Index(IndexChange::DropIndex { table, name }) => {
                 if engine.indexes_are_relations {
                     self.moves_bindings = true;
+                    self.exclude_narrowing |= copies_indexes(table, base, desired);
                     self.touched_relations
                         .insert(ObjectName::new(&table.schema, name.raw()));
                 }
@@ -928,6 +943,7 @@ impl PlanEffects {
             }) => {
                 if engine.indexes_are_relations {
                     self.moves_bindings = true;
+                    self.exclude_narrowing |= copies_indexes(table, base, desired);
                     let rel = ObjectName::new(&table.schema, name.raw());
                     if from.is_some() {
                         self.touched_relations.insert(rel.clone());
@@ -3342,6 +3358,62 @@ mod dependency_facts_tests {
         assert_eq!(needed.surfaces, BTreeSet::from([module_surface("app.v_u")]));
         assert!(needed.arriving_names.is_empty());
         assert!(needed.arriving_companion_types.is_empty());
+    }
+
+    /// An index on a partitioned table, or on a partition, has copies the
+    /// engine names and drops with it: nothing here names them, so such a
+    /// plan is not narrowed. The same index on a plain table is.
+    #[test]
+    fn an_index_change_on_a_partitioned_table_is_not_narrowed() {
+        let plain = two_table_schema();
+        let table: TableName = "app.t".parse().unwrap();
+        let mut parent = plain.clone();
+        parent.tables.get_mut(&table).unwrap().partition_by = Some(pbps_model::PartitionBy {
+            external: false,
+            columns: vec!["id".into()],
+            strategy: Default::default(),
+        });
+        let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
+        let eng = Engine {
+            indexes_are_relations: true,
+            normalize: &normalize,
+            filter_binds: true,
+        };
+        let hooks = plain_hooks(&pbps_model::module::SHARED, false);
+        let facts = DependencyFacts {
+            surfaces: BTreeMap::from([(
+                module_surface("app.v_u"),
+                parsed([DependencyEdge::Column(
+                    "app.u".parse::<TableName>().unwrap().column("id"),
+                )]),
+            )]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::new(),
+            companion_types: BTreeMap::new(),
+        };
+        let changes = [
+            Change::Index(IndexChange::DropIndex {
+                table: table.clone(),
+                name: "t_w".into(),
+            }),
+            Change::Constraint(ConstraintChange::DropUnique {
+                table: table.clone(),
+                name: "t_k".into(),
+            }),
+        ];
+        for change in changes {
+            let ordinary = ChangeSet {
+                changes: vec![PlannedChange::new(change)],
+            };
+            let answer = |schema: &Schema| {
+                let ids = resolve_ids(schema, &IdsFile::default());
+                let side = crate::Side { schema, ids: &ids };
+                assessed_with_facts(side, side, &ordinary, &eng, &hooks, Some(&facts)).questions
+                    [&module_surface("app.v_u")]
+            };
+            assert_eq!(answer(&plain), Answer::Unaffected);
+            assert_eq!(answer(&parent), Answer::Resolve);
+        }
     }
 
     /// Two tables of one plan whose names clip to the same companion name:
