@@ -73,9 +73,9 @@ fn violations_ending_in(after: &Schema, logical: Vec<Change>, order: &[usize]) -
     };
     let shadowed =
         analyse(&ops, &owners, snapshot, ending, &Mssql).expect("read the analysis baseline");
-    assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
+    let step_effects = shadowed.effects().expect("read every step");
     let ordered = pbps_diff::order::reordered_operations(&ops, order);
-    let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
+    let effects: Vec<_> = order.iter().map(|&i| step_effects[i].clone()).collect();
     pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
 }
 
@@ -214,7 +214,7 @@ fn rows_written_while_a_foreign_key_is_rebuilt_do_not_wait_for_it() {
             analyse(&ops, &owners, snapshot, snapshot, &Mssql).expect("read the analysis baseline");
         pbps_diff::order::verify(
             ops.as_slice(),
-            &shadowed.effects,
+            shadowed.effects().expect("read every step"),
             &baseline,
             &Default::default(),
         )
@@ -346,7 +346,9 @@ impl Diffed {
         let baseline = Baseline::of(before, &owners).expect("read the test baseline");
         let effects = analyse(&ops, &owners, before, after, &Mssql)
             .expect("read the analysis baseline")
-            .effects;
+            .effects()
+            .expect("read every step")
+            .to_vec();
         Diffed {
             changes,
             ops,
@@ -609,8 +611,9 @@ fn violations_from(
     );
     let baseline = Baseline::of(b, &owners).expect("read the test baseline");
     let shadowed = analyse(&ops, &owners, b, a, &Mssql).expect("read the analysis baseline");
+    let step_effects = shadowed.effects().expect("read every step");
     let ordered = pbps_diff::order::reordered_operations(&ops, order);
-    let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
+    let effects: Vec<_> = order.iter().map(|&i| step_effects[i].clone()).collect();
     pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
 }
 
@@ -848,9 +851,9 @@ fn a_callers_binding_requirement_reads_its_own_payload() {
             &Mssql,
         )
         .expect("read the analysis baseline");
-        assert!(fx.unowned.is_empty());
+        let step_effects = fx.effects().expect("read every step");
         assert_eq!(
-            fx.effects[0].requires.contains(&Requirement::Is(
+            step_effects[0].requires.contains(&Requirement::Is(
                 ObjectKey::Module(callee),
                 Incarnation::Final
             )),
@@ -1686,9 +1689,9 @@ fn connected_callee_answers_override_folding_only_for_compared_names() {
             facts.as_ref(),
         )
         .expect("read the analysis baseline");
-        assert!(effects.unowned.is_empty());
+        let step_effects = effects.effects().expect("read every step");
         assert_eq!(
-            effects.effects[0].requires.contains(&Requirement::Is(
+            step_effects[0].requires.contains(&Requirement::Is(
                 ObjectKey::Module(callee.clone()),
                 Incarnation::Final,
             )),
@@ -1828,9 +1831,9 @@ fn replacement_violations(order: &[usize], keeps: bool) -> Vec<Violation> {
     let baseline = Baseline::of(before, &owners).expect("read the test baseline");
     let shadowed =
         analyse(&ops, &owners, before, after, &Mssql).expect("read the analysis baseline");
-    assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
+    let step_effects = shadowed.effects().expect("read every step");
     let ordered = pbps_diff::order::reordered_operations(&ops, order);
-    let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
+    let effects: Vec<_> = order.iter().map(|&i| step_effects[i].clone()).collect();
     pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
 }
 
@@ -1908,9 +1911,9 @@ fn identity_replacement_violations(order: &[usize]) -> Vec<Violation> {
     let baseline = Baseline::of(before, &owners).expect("read the test baseline");
     let shadowed =
         analyse(&ops, &owners, before, after, &Mssql).expect("read the analysis baseline");
-    assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
+    let step_effects = shadowed.effects().expect("read every step");
     let ordered = pbps_diff::order::reordered_operations(&ops, order);
-    let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
+    let effects: Vec<_> = order.iter().map(|&i| step_effects[i].clone()).collect();
     pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
 }
 

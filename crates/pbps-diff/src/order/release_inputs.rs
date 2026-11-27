@@ -90,12 +90,12 @@ pub fn carry_inserts<S>(
         &plan.annotation_edges()?,
     )
     .map_err(|e| e.to_string())?;
-    if let Some((_, error)) = effects.unowned.first() {
-        return Err(error.to_string());
-    }
+    let step_effects = effects
+        .effects()
+        .map_err(|unread| unread.error.to_string())?;
     let mut graph = graph(
         operations.as_slice(),
-        &effects.effects,
+        step_effects,
         &Baseline::of(base, &owners)
             .map_err(|e| e.to_string())?
             .with_symbolic(effects.symbolic.clone()),

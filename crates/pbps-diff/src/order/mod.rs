@@ -91,7 +91,8 @@ pub use saved::{
 };
 pub use schedule::{Constraint, Refusal, Schedule, Settled};
 pub use shadow::{
-    Report, Shadowed, analyse, analyse_captured, analyse_with_catalog, analyse_with_membership,
+    Report, Shadowed, Unread, analyse, analyse_captured, analyse_with_catalog,
+    analyse_with_membership,
 };
 pub use verify::{Violation, verify};
 

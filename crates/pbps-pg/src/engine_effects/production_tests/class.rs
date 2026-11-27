@@ -114,16 +114,16 @@ fn column_membership_classes_finish_or_name_the_retained_endpoint_limit() {
                         &pg,
                     )
                     .expect("read the analysis baseline");
-                    assert!(fx.unowned.is_empty(), "{label}: {:?}", fx.unowned);
+                    let step_effects = fx.effects().expect("read every step");
                     let result = pbps_diff::order::membership::project(
                         operations.as_slice(),
-                        &fx.effects,
+                        step_effects,
                         &fx.symbolic,
                     );
                     assert!(result.is_ok(), "{label}: {result:?}");
                     let g = graph(
                         operations.as_slice(),
-                        &fx.effects,
+                        step_effects,
                         &Baseline::of(
                             Snapshot {
                                 schema: &s.before,
@@ -136,7 +136,7 @@ fn column_membership_classes_finish_or_name_the_retained_endpoint_limit() {
                         &Default::default(),
                         Checks::ALL,
                     );
-                    assert_permitted_orders(&operations, &fx.effects, &fx.symbolic, &g, &label);
+                    assert_permitted_orders(&operations, step_effects, &fx.symbolic, &g, &label);
 
                     cases += 1;
                 }
@@ -294,7 +294,8 @@ fn a_missing_ordinary_uid_is_an_obligation_before_any_name_projection() {
             &Postgres::new().with_server_version(180000),
         )
         .expect("read the analysis baseline");
-        assert!(fx.effects[1].symbolic.iter().any(|c|matches!(c,pbps_model::operation::symbolic::Clause::Require(pbps_model::operation::symbolic::Fact::Unsupported{reason,..}) if reason.contains("ordinary column without a recorded UID"))),"{:?}",fx.effects[1].symbolic);
+        let symbolic = &fx.effects().expect("read every step")[1].symbolic;
+        assert!(symbolic.iter().any(|c|matches!(c,pbps_model::operation::symbolic::Clause::Require(pbps_model::operation::symbolic::Fact::Unsupported{reason,..}) if reason.contains("ordinary column without a recorded UID"))),"{:?}",symbolic);
     }
 }
 

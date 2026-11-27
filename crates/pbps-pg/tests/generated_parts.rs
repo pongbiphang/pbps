@@ -122,13 +122,8 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
         };
         let baseline = Baseline::of(before, &owners).expect("read the test baseline");
         let facts = analyse(&ops, &owners, before, after, &pg).expect("read the analysis baseline");
-        assert!(facts.unowned.is_empty(), "{:?}", facts.unowned);
-        let violations = verify(
-            ops.as_slice(),
-            &facts.effects,
-            &baseline,
-            &Default::default(),
-        );
+        let step_effects = facts.effects().expect("read every step");
+        let violations = verify(ops.as_slice(), step_effects, &baseline, &Default::default());
         assert!(
             violations.is_empty(),
             "placeholder={placeholder}: {violations:?}"
@@ -150,7 +145,7 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
         order.insert(before_columns, row);
         let effects = order
             .iter()
-            .map(|&i| facts.effects[i].clone())
+            .map(|&i| step_effects[i].clone())
             .collect::<Vec<_>>();
         if placeholder {
             let edges = generated::constraints(&cs, &schema, &Default::default(), &pg);

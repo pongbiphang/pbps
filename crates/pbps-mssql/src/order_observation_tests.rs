@@ -122,16 +122,16 @@ fn assert_observational(shape: Shape) {
     };
     let analysed = order::analyse(&operations, &owners, base, end, &Mssql)
         .expect("read the analysis baseline");
-    assert!(analysed.unowned.is_empty(), "{:?}", analysed.unowned);
-    assert!(analysed.effects.iter().all(|fx| fx.symbolic.is_empty()));
-    assert!(analysed.effects.iter().any(|fx| {
+    let step_effects = analysed.effects().expect("read every step");
+    assert!(step_effects.iter().all(|fx| fx.symbolic.is_empty()));
+    assert!(step_effects.iter().any(|fx| {
         fx.requires
             .iter()
             .any(|r| matches!(r, Requirement::BeforeRewrite(_)))
     }));
     let graph = graph(
         operations.as_slice(),
-        &analysed.effects,
+        step_effects,
         &Baseline::of(base, &owners).expect("read the test baseline"),
         &ModuleDeps::new(),
         Checks::ALL,

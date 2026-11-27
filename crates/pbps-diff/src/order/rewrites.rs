@@ -95,7 +95,10 @@ fn settle_requirements<S: Clone>(
         &changes.annotation_edges()?,
     )
     .map_err(|e| e.to_string())?;
-    if !effects.effects.iter().any(|fx| {
+    // An unread step reads as "no trigger" here. Keep this lenient reading
+    // unchanged (open in DEC-2993.7). Refuse unread steps if settlement runs.
+    let (step_effects, _) = effects.effects_with_unread();
+    if !step_effects.iter().any(|fx| {
         fx.requires.iter().any(|r| {
             matches!(r, Requirement::BeforeRewrite(_))
                 || (catalog.is_some()
@@ -105,12 +108,12 @@ fn settle_requirements<S: Clone>(
     {
         return Ok(changes);
     }
-    if let Some((_, error)) = effects.unowned.first() {
-        return Err(error.to_string());
-    }
+    let step_effects = effects
+        .effects()
+        .map_err(|unread| unread.error.to_string())?;
     let mut graph = graph(
         operations.as_slice(),
-        &effects.effects,
+        step_effects,
         &Baseline::of(base, &owners)
             .map_err(|e| e.to_string())?
             .with_symbolic(effects.symbolic.clone()),
@@ -123,7 +126,7 @@ fn settle_requirements<S: Clone>(
             && matches!(&edge.because,
                 Because::Creates(key @ ObjectKey::Module(_))
                 | Because::Rewrites(key @ ObjectKey::Module(_))
-                    if effects.effects[edge.after].requires
+                    if step_effects[edge.after].requires
                         .contains(&Requirement::Is(key.clone(), Incarnation::Final)));
         if matches!(edge.because, Because::BeforeRewrite(_)) || final_callee {
             moving[edge.before] = true;
@@ -131,7 +134,7 @@ fn settle_requirements<S: Clone>(
         }
     }
     if !changes.boundaries.is_empty() {
-        for (at, fx) in effects.effects.iter().enumerate() {
+        for (at, fx) in step_effects.iter().enumerate() {
             moving[at] |= !fx.symbolic.is_empty();
         }
     }

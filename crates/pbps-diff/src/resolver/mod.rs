@@ -290,9 +290,11 @@ fn scheduled(
     let shadowed =
         crate::order::analyse_captured(operations, owners, before, after, dialect, None, captured)
             .map_err(refusal)?;
+    // Keep every pair involving an unread step (DEC-2158.1).
+    let (effects, unread) = shadowed.effects_with_unread();
     let effect_graph = graph(
         operations.as_slice(),
-        &shadowed.effects,
+        effects,
         &baseline,
         declared,
         Checks::ALL,
@@ -318,12 +320,10 @@ fn scheduled(
     for c in crate::order::generated::constraints(changes, desired.schema, declared, dialect) {
         schedule.edge(c.before, c.after, c.source, c.reason);
     }
-    // Unknown effects do not establish independence: keep every pair rather
-    // than inventing edges that could contradict known effects (DEC-2158.1).
-    for (id, _) in &shadowed.unowned {
+    for step in unread {
         let i = operations
             .iter()
-            .position(|op| op.id() == *id)
+            .position(|op| op.id() == step.id)
             .expect("an unowned operation belongs to the analysed plan");
         for j in 0..operations.len() {
             if i != j {

@@ -339,11 +339,11 @@ mod default_rebuild_matrix {
         };
         let shadow =
             crate::order::shadow::analyse(&planned.operations, &owners, before, after, &Candidates).expect("read the analysis baseline");
-        assert!(shadow.unowned.is_empty(), "{:?}", shadow.unowned);
+        let step_effects = shadow.effects().expect("read every step");
         let baseline = crate::order::edges::Baseline::of(before, &owners).expect("read the test baseline");
         let violations = crate::order::verify::verify(
             planned.operations.as_slice(),
-            &shadow.effects,
+            step_effects,
             &baseline,
             &Default::default(),
         );
@@ -792,12 +792,7 @@ mod default_rebuild_matrix {
             },
             &dialect,
         ).expect("read the analysis baseline");
-        assert!(
-            shadow.unowned.is_empty(),
-            "{}: {:?}",
-            case.name,
-            shadow.unowned
-        );
+        let step_effects = shadow.effects().expect("read every step");
         let baseline = crate::order::edges::Baseline::of(
             Snapshot {
                 schema: &base,
@@ -807,7 +802,7 @@ mod default_rebuild_matrix {
         ).expect("read the test baseline");
         let violations = crate::order::verify::verify(
             planned.operations.as_slice(),
-            &shadow.effects,
+            step_effects,
             &baseline,
             &hints.annotations.modules(after.schema),
         );

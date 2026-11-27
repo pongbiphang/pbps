@@ -421,12 +421,12 @@ pub(super) fn carried_effects(
 ) -> Result<Option<pbps_diff::order::Schedule>, OwnerError> {
     use pbps_diff::order::{Baseline, Checks, Schedule, analyse_with_catalog, graph};
     let effects = analyse_with_catalog(operations, owners, before, after, dialect, None)?;
-    if !effects.unowned.is_empty() {
+    let Ok(step_effects) = effects.effects() else {
         return Ok(None);
-    }
+    };
     let graph = graph(
         operations.as_slice(),
-        &effects.effects,
+        step_effects,
         &Baseline::of(before, owners)?,
         &pbps_model::ModuleDeps::new(),
         Checks::ALL,

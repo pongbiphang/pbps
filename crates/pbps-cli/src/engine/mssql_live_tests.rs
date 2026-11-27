@@ -114,7 +114,7 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
         let analysed =
             order::analyse_with_catalog(&ops, &owners, base, end, &pbps_mssql::Mssql, Some(&facts))
                 .expect("read the analysis baseline");
-        assert!(analysed.unowned.is_empty());
+        let step_effects = analysed.effects().expect("read every step");
         let g = ops
             .iter()
             .position(|op| matches!(op.change(), Change::Module(ModuleChange::CreateModule { id, .. }) if id == &caller))
@@ -130,22 +130,21 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
         );
         let requirement = Requirement::Is(ObjectKey::Module(callee.clone()), Incarnation::Final);
         assert_eq!(
-            analysed.effects[g].requires.contains(&requirement),
+            step_effects[g].requires.contains(&requirement),
             matches,
             "{collation}"
         );
         let offline = order::analyse(&ops, &owners, base, end, &pbps_mssql::Mssql)
             .expect("read the analysis baseline");
         assert!(
-            !offline.effects[g].requires.contains(&requirement),
+            !offline.effects().expect("read every step")[g]
+                .requires
+                .contains(&requirement),
             "offline stays lexical"
         );
         let verify = |indices: &[usize]| {
             let ordered = order::reordered_operations(&ops, indices);
-            let effects: Vec<_> = indices
-                .iter()
-                .map(|&i| analysed.effects[i].clone())
-                .collect();
+            let effects: Vec<_> = indices.iter().map(|&i| step_effects[i].clone()).collect();
             order::verify(
                 ordered.as_slice(),
                 &effects,

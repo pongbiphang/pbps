@@ -2397,3 +2397,18 @@ Rejected:
 - Skipping typed waivers and writing the release settlement directly. The debug check and the settlement would each keep a waiver list, and the two would drift.
 
 Unread steps and release settlement belong to later pull requests for this issue.
+
+<a id="dec-2993-7"></a>
+
+**DEC-2993.7. Order analysis couples step effects with the answer about unread steps (#2993).** The ordinary door gives every step's effects or the first unread operation ID and owner error. Six callers refuse on that answer. The carried-name and SQLite name-handover callers fall back. The second door pairs the effects with all unread steps. The resolver keeps every pair involving an unread step (DEC-2158.1). The report carries unread steps as `unowned` notes. The rewrite trigger scan uses the second door and settlement uses the ordinary door.
+
+An empty effect set means the step touches nothing. Thirteen readers had to check a separate list or they could read unknown effects as independence. The position-aligned list stays private because the graph indexes it by operation position. An unread step contributes no effects to the paired view.
+
+The order, refusal text and recorded notes stay the same. The recorder counts, existing text assertions and new access and fallback tests pin those rules. A compile-negative doc test pins the privacy boundary.
+
+Rejected:
+
+- Refusing inside analysis at the first unread step would replace the resolver's keep rule and both fallbacks with refusals. That could refuse a valid plan. A rebuild can be its root alone before expansion, with no pair to order.
+- Changing the callers' rules for unread steps belongs to a later measurement.
+
+The rewrite trigger scan reads an unread step as having no trigger before its refusal check. Whether an accepted plan relies on that rule remains unmeasured. The name-slot analysis still exposes the same pair of lists. Settlement in release builds is also open.

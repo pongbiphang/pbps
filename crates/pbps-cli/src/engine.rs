@@ -2394,7 +2394,7 @@ mod tests {
                 .expect("read the analysis baseline");
                 pbps_diff::order::verify(
                     operations.as_slice(),
-                    &effects.effects,
+                    effects.effects().expect("read every step"),
                     &pbps_diff::order::Baseline::of(base, &owners).expect("read the test baseline"),
                     &pbps_model::ModuleDeps::new(),
                 )

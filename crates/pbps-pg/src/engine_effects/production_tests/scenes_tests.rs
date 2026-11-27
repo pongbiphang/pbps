@@ -39,10 +39,10 @@ fn every_reference_class_scene_has_the_same_cut_or_named_endpoint_limit() {
                         &Postgres::new().with_server_version(version),
                     )
                     .expect("read the analysis baseline");
-                    assert!(fx.unowned.is_empty());
+                    let step_effects = fx.effects().expect("read every step");
                     let graph = graph(
                         ops.as_slice(),
-                        &fx.effects,
+                        step_effects,
                         &Baseline::of(before, &owners)
                             .expect("read the test baseline")
                             .with_symbolic(fx.symbolic.clone()),
@@ -108,7 +108,7 @@ fn every_reference_class_scene_has_the_same_cut_or_named_endpoint_limit() {
                         }
                         let reordered = pbps_diff::order::reordered_operations(&ops, &order);
                         let effects: Vec<_> =
-                            order.iter().map(|i| fx.effects[*i].clone()).collect();
+                            order.iter().map(|i| step_effects[*i].clone()).collect();
                         let replay = pbps_diff::order::membership::project(
                             reordered.as_slice(),
                             &effects,
@@ -205,7 +205,8 @@ fn a_missing_ordinary_uid_is_an_obligation_before_any_name_projection() {
             &Postgres::new().with_server_version(180000),
         )
         .expect("read the analysis baseline");
-        assert!(fx.effects[1].symbolic.iter().any(|c|matches!(c,pbps_model::operation::symbolic::Clause::Require(pbps_model::operation::symbolic::Fact::Unsupported{reason,..}) if reason.contains("ordinary column without a recorded UID"))),"{:?}",fx.effects[1].symbolic);
+        let symbolic = &fx.effects().expect("read every step")[1].symbolic;
+        assert!(symbolic.iter().any(|c|matches!(c,pbps_model::operation::symbolic::Clause::Require(pbps_model::operation::symbolic::Fact::Unsupported{reason,..}) if reason.contains("ordinary column without a recorded UID"))),"{:?}",symbolic);
     }
 }
 

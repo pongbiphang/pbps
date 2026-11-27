@@ -560,6 +560,43 @@ fn carried_move_effects_refuse_an_unreadable_baseline_name() {
 }
 
 #[test]
+fn carried_move_effects_fall_back_when_a_step_is_unread() {
+    use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+    use pbps_model::{Change, ConstraintChange, PlannedChange};
+
+    let snapshot = Snapshot {
+        schema: &Default::default(),
+        ids: &Default::default(),
+    };
+    let changes = [PlannedChange::new(Change::Constraint(
+        ConstraintChange::DropCheck {
+            table: TableName::new("app", "unknown"),
+            name: "ck".into(),
+        },
+    ))];
+    let owners = PlanOwners::new(
+        pbps_model::plan_names::PlanNames::of(&changes, snapshot.ids).unwrap(),
+        snapshot.ids,
+        snapshot.ids,
+    );
+    let analyse = |steps| {
+        super::names::carried_effects(
+            &Operations::of_plan(steps, ModuleEdits::Rebuilt),
+            &owners,
+            snapshot,
+            snapshot,
+            &pbps_pg::Postgres::new(),
+        )
+    };
+    assert!(
+        analyse(&changes)
+            .expect("an unread step allows the fallback")
+            .is_none()
+    );
+    assert!(analyse(&[]).expect("read an empty plan").is_some());
+}
+
+#[test]
 fn created_column_guard_keys_stay_raw_and_missing_names_are_shown_once() {
     use pbps_model::TableChange;
     use pbps_model::{Change, ChangeSet, Column, PlannedChange, Table};

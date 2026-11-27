@@ -103,14 +103,15 @@ fn policy_release_schedule(
     let effects =
         pbps_diff::order::analyse_with_catalog(&operations, &owners, before, after, dialect, None)
             .map_err(|e| Refusal(e.to_string()))?;
-    if let Some((id, why)) = effects.unowned.first() {
-        return Err(Refusal(format!(
-            "policy release operation {id} has unread effects: {why}"
-        )));
-    }
+    let step_effects = effects.effects().map_err(|unread| {
+        Refusal(format!(
+            "policy release operation {} has unread effects: {}",
+            unread.id, unread.error
+        ))
+    })?;
     let graph = pbps_diff::order::graph(
         operations.as_slice(),
-        &effects.effects,
+        step_effects,
         &pbps_diff::order::Baseline::of(before, &owners).map_err(|e| Refusal(e.to_string()))?,
         &declared.module_deps(),
         pbps_diff::order::Checks::ALL,
