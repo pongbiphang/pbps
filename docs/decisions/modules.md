@@ -2433,3 +2433,17 @@ The second-door readers use unread steps as follows.
 - SQLite `catalog_facts` compares the spellings present in the rows, baseline and catalog. Unread names add no spelling from their step.
 
 Refusing inside `edges`, `handovers` or `verify` would change results for plans accepted today. The number of affected plans is unmeasured. Measuring those plans comes before deciding whether these readers should refuse. Settlement in release builds remains open.
+
+<a id="dec-2993-9"></a>
+
+**DEC-2993.9. Rewrite and SQLite name-handover ordering refuse unread step effects (#2993).** The rewrite pass reads every step before it looks for a trigger. SQLite reads every step before it settles a name handover. Each refusal names the object. SQLite also gives the step ID and the escaped target label.
+
+An unread step may have a trigger or a prerequisite. Treating it as independent can silently put the steps in the wrong order. The resolver still keeps every pair involving an unread step (DEC-2158.1). The carried-name fallback keeps the current order when it cannot read the effects. Both rules handle the unknown conservatively.
+
+The offline study found unread effects in two of 4,101 rewrite scans, both in `a_held_text_search_object_does_not_stop_a_base_building`. SQLite read every step in seven name-handover calls. The before and after recorder runs differ by three `unowned` lines from that rehearsal test. Giving its column a UID removes those lines. Every other recorder count is equal.
+
+A SQLite-only fallback would leave one exception to remember. The rewrite pass must know whether a step has a trigger to order it. It has no safe order to fall back to when effects are unread.
+
+If one of these refusals stops a valid plan, the fix is to make that step readable by stating the fact it lacks. The lenient reading does not come back.
+
+The name-slot readers still apply their own rules through the paired view. Settlement in release builds remains open.

@@ -336,23 +336,26 @@ fn order_name_handovers<S: Clone>(
     };
     let shadowed =
         pbps_diff::order::analyse_with_catalog(&ops, &owners, before, after, dialect, Some(facts))?;
-    // An unread step leaves the slot handovers as the only constraints.
-    if let Ok(step_effects) = shadowed.effects() {
-        let fx_graph = pbps_diff::order::graph(
+    let fx_graph = {
+        let step_effects = shadowed.effects().map_err(|pbps_diff::order::Unread { id, error }| {
+            let label = pbps_model::escape::Escaped(frame.label);
+            anyhow::anyhow!("SQLite cannot order these name handovers for `{label}`: unread step {id}: {error}")
+        })?;
+        pbps_diff::order::graph(
             ops.as_slice(),
             step_effects,
             &pbps_diff::order::Baseline::of(before, &owners)?,
             &frame.hints.annotations.modules(frame.written.schema),
             pbps_diff::order::Checks::ALL,
+        )
+    };
+    for edge in &fx_graph.edges {
+        schedule.edge(
+            edge.before,
+            edge.after,
+            pbps_diff::order::Source::Effect,
+            pbps_diff::order::schedule::reason(edge, ops.as_slice()),
         );
-        for edge in &fx_graph.edges {
-            schedule.edge(
-                edge.before,
-                edge.after,
-                pbps_diff::order::Source::Effect,
-                pbps_diff::order::schedule::reason(edge, ops.as_slice()),
-            );
-        }
     }
     let settled = schedule.settle(changes.clone()).map_err(|refusal| {
         anyhow::anyhow!(
@@ -2424,15 +2427,28 @@ mod tests {
     }
 
     #[test]
-    fn unread_step_leaves_sqlite_name_handovers_to_slots() {
-        use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
-        use pbps_model::{Change, ConstraintChange, ModuleChange, ModuleId, TableChange};
+    fn sqlite_name_handovers_require_complete_effects() {
+        use pbps_model::{
+            Change, ConstraintChange, ModuleChange, ModuleId, ModuleKind, PlannedChange,
+            TableChange,
+        };
 
-        let base = plain_schema();
+        let table = TableName::new("main", "items");
+        let reader = ModuleId::Named(TableName::new("main", "reader"));
+        let replacement = ModuleId::Named(table.clone());
+        let module = view_module("CREATE VIEW items AS SELECT 1");
+        let mut base = plain_schema();
+        base.modules.insert(
+            reader.clone(),
+            *view_module("CREATE VIEW reader AS SELECT id FROM items"),
+        );
+        let mut desired = Schema::default();
+        desired
+            .modules
+            .insert(replacement.clone(), (*module).clone());
         let mut ids = IdsFile::default();
         let uid = table_id(&mut ids, "items");
         col_id(&mut ids, "items", "id");
-        let desired = Schema::default();
         let desired_ids = IdsFile::default();
         let recorded = pbps_diff::Side {
             schema: &base,
@@ -2450,7 +2466,7 @@ mod tests {
             "test",
         );
         let frame = Frame {
-            label: "test.db",
+            label: "test\n.db",
             recorded,
             written,
             base: recorded,
@@ -2458,55 +2474,48 @@ mod tests {
             hints: &Default::default(),
             baseline: &baseline,
         };
-        let table = TableName::new("main", "items");
-        let changes = change_set(vec![
+        let mut changes = change_set(vec![
             Change::Module(ModuleChange::CreateModule {
-                id: ModuleId::Named(table.clone()),
-                module: view_module("CREATE VIEW items AS SELECT 1"),
+                id: replacement,
+                module,
             }),
             Change::Table(TableChange::DropTable {
                 uid,
                 name: table,
                 detach_from: None,
             }),
-            Change::Constraint(ConstraintChange::DropCheck {
-                table: TableName::new("main", "unknown"),
-                name: "ck".into(),
+            Change::Module(ModuleChange::DropModule {
+                id: reader,
+                kind: ModuleKind::View,
             }),
         ]);
         let dialect = Sqlite::default();
         let facts = Default::default();
-        let owners = PlanOwners::new(
-            pbps_model::plan_names::PlanNames::of(&changes.changes, &desired_ids).unwrap(),
-            &ids,
-            &desired_ids,
-        );
-        let ops = Operations::of_plan(&changes.changes, ModuleEdits::InPlace);
-        let analysis = pbps_diff::order::analyse_with_catalog(
-            &ops,
-            &owners,
-            Snapshot {
-                schema: &base,
-                ids: &ids,
-            },
-            Snapshot {
-                schema: &desired,
-                ids: &desired_ids,
-            },
-            &dialect,
-            Some(&facts),
-        )
-        .expect("read the analysis baseline");
-        assert_eq!(analysis.effects().unwrap_err().id, ops.as_slice()[2].id());
         let mut plan = pbps_diff::order::propose(changes.clone());
-        order_name_handovers(&mut plan, frame, &dialect, &facts).expect("slot handover settles");
+        order_name_handovers(&mut plan, frame, &dialect, &facts)
+            .expect("fully read handover settles");
+        // The effect edge removes the dependent view before the slot handover.
         assert_eq!(
             plan.changes[..],
             [
+                changes.changes[2].clone(),
                 changes.changes[1].clone(),
-                changes.changes[0].clone(),
-                changes.changes[2].clone()
+                changes.changes[0].clone()
             ]
+        );
+
+        changes.changes.push(PlannedChange::new(Change::Constraint(
+            ConstraintChange::DropCheck {
+                table: TableName::new("main", "unknown"),
+                name: "ck".into(),
+            },
+        )));
+        let mut plan = pbps_diff::order::propose(changes);
+        let error = order_name_handovers(&mut plan, frame, &dialect, &facts)
+            .expect_err("an unread step refuses SQLite handovers");
+        assert_eq!(
+            error.to_string(),
+            r"SQLite cannot order these name handovers for `test\n.db`: unread step 3.0: no managed object is recorded under `main.unknown` (before change 3)"
         );
     }
 

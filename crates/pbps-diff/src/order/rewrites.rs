@@ -95,9 +95,9 @@ fn settle_requirements<S: Clone>(
         &changes.annotation_edges()?,
     )
     .map_err(|e| e.to_string())?;
-    // An unread step reads as "no trigger" here. Keep this lenient reading
-    // unchanged (open in DEC-2993.7). Refuse unread steps if settlement runs.
-    let (step_effects, _) = effects.effects_with_unread();
+    let step_effects = effects
+        .effects()
+        .map_err(|unread| unread.error.to_string())?;
     if !step_effects.iter().any(|fx| {
         fx.requires.iter().any(|r| {
             matches!(r, Requirement::BeforeRewrite(_))
@@ -108,9 +108,6 @@ fn settle_requirements<S: Clone>(
     {
         return Ok(changes);
     }
-    let step_effects = effects
-        .effects()
-        .map_err(|unread| unread.error.to_string())?;
     let mut graph = graph(
         operations.as_slice(),
         step_effects,
