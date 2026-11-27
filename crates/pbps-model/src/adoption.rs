@@ -9,8 +9,9 @@
 //! that record.
 
 use crate::{
-    Change, ChangeSet, ConstraintChange, IndexChange, ObjectLocalName, PartitionChange, SavedPlan,
-    TableName, Text,
+    Change, ChangeSet, ColumnChange, ConstraintChange, ExtensionChange, IndexChange, ModuleChange,
+    ModuleId, ObjectLocalName, PartitionChange, SavedPlan, TableChange, TableName, Text,
+    TypeChange, TypeValueChange,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -173,6 +174,35 @@ pub fn difference(expected: &[RelationIndex], found: &[HeldIndex]) -> Option<Str
     })
 }
 
+/// A change that can alter what an index definition prints, or what it depends
+/// on, between planning's read and the attach: a rename of a table, a column, a
+/// type or an enum label, an enum rebuilt, an extension moved, or a routine
+/// altered or dropped. A recorded list would then differ from the database only
+/// because the plan ran, so a plan that holds one records no rehearsal: the
+/// planning half asks nothing for it, and admission refuses one that does
+/// (DEC-1671.2).
+pub fn unsettles(change: &Change) -> bool {
+    matches!(
+        change,
+        Change::Table(TableChange::RenameTable { .. })
+            | Change::Column(ColumnChange::RenameColumn { .. })
+            | Change::Type(TypeChange::RenameType { .. })
+            | Change::TypeValue(
+                TypeValueChange::RenameEnumValue { .. } | TypeValueChange::EnumRebuild { .. }
+            )
+            | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+            | Change::Module(
+                ModuleChange::AlterModule {
+                    id: ModuleId::Routine(_),
+                    ..
+                } | ModuleChange::DropModule {
+                    id: ModuleId::Routine(_),
+                    ..
+                }
+            )
+    )
+}
+
 /// Admission of what a saved plan records. The record is what apply compares the
 /// database with and what a reviewer is told stays, so one that does not agree
 /// with its own plan is refused.
@@ -198,6 +228,7 @@ pub fn validate(plan: &SavedPlan) -> Result<(), String> {
         let taken: BTreeSet<_> = rehearsal.kept.values().collect();
         let holds = plan.dialect == "postgres"
             && !rehearsal.kept.is_empty()
+            && !plan.changes.changes.iter().any(|p| unsettles(&p.change))
             && distinct(&rehearsal.parent)
             && distinct(&rehearsal.table)
             && taken.len() == rehearsal.kept.len()
@@ -482,6 +513,20 @@ mod tests {
         let mut elsewhere = recorded();
         elsewhere.dialect = "mssql".into();
         cases.push(("another engine", elsewhere));
+        // A plan that renames a column, even of another table, can change what
+        // a recorded definition prints before the attach (draft round 1).
+        let mut renaming = recorded();
+        renaming.changes.changes.insert(
+            0,
+            crate::PlannedChange::new(Change::Column(ColumnChange::RenameColumn {
+                uid: crate::Uid::generate(crate::UidKind::Column),
+                table: "app.other".parse().unwrap(),
+                from: "a".into(),
+                to: "b".into(),
+                table_was: None,
+            })),
+        );
+        cases.push(("a plan that renames a column", renaming));
         for (why, plan) in cases {
             assert_eq!(
                 validate(&plan),

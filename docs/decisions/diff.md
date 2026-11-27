@@ -10493,6 +10493,13 @@ repeats a name in either list or gives one index of the parent's two, one whose
 kept index is not a plain index of the table taken by a plain index of the
 parent's, and one that keeps an index the plan drops or the declaration holds as
 the partition's own.
+It also refuses a record in a plan that renames a table, a column, a type or an
+enum label, rebuilds an enum, moves an extension, or alters or drops a routine
+(`adoption::unsettles`). Each can change what a recorded definition prints, or
+what it binds to, before the attach, so either apply would refuse the plan only
+because a resolver answered, or the record would be compared under names it no
+longer holds. The planning half asks nothing for such a plan, and its attach
+is planned as DEC-1671.1 says.
 
 **Apply** compares the database with the record twice, reading both relations
 from the catalog under the canonical path, and refuses by the relation and the
