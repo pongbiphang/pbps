@@ -51,7 +51,7 @@ mod census;
 mod properties;
 
 use pbps_model::ValueSource;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::{Conn, DbError, Param, Row};
 
@@ -59,6 +59,9 @@ use pbps_model::{Schema, SessionZone, TableName};
 
 // What the spelling checks found is `pbps-db`'s shape (DECISIONS 417).
 pub use pbps_db::catalog::Spellings;
+
+use crate::adoption;
+use pbps_model::adoption::Relations;
 
 use crate::introspect::{
     GrantedKind, Limitation, LimitationTarget, Pulled, RawCatalog, RawColumn, RawConstraint,
@@ -1316,7 +1319,19 @@ pub(crate) fn session_zone(conn: &Conn) -> Result<SessionZone, DbError> {
 /// makes "a read that failed halfway leaves the session changed" not a case to
 /// handle but a case that cannot arise.
 pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
-    introspect_in(conn, Scope::Own).await
+    introspect_wanting(conn, &BTreeSet::new())
+        .await
+        .map(|(pulled, _)| pulled)
+}
+
+/// [`introspect`], with the relations an attach rehearsal asks for read by the
+/// same statement, so their indexes are those of the schema read beside them
+/// (DEC-1671.2).
+pub async fn introspect_wanting(
+    conn: &mut Conn,
+    wanted: &BTreeSet<TableName>,
+) -> Result<(Pulled, Relations), DbError> {
+    introspect_in(conn, Scope::Own, wanted).await
 }
 
 /// Reads the managed set back **inside the transaction the caller holds**,
@@ -1336,13 +1351,19 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 /// All catalog queries now share one statement snapshot; the CLI revalidates
 /// the managed projection before recording it (DECISIONS 423).
 pub async fn introspect_within_transaction(conn: &mut Conn) -> Result<Pulled, DbError> {
-    introspect_in(conn, Scope::CallersTransaction).await
+    introspect_in(conn, Scope::CallersTransaction, &BTreeSet::new())
+        .await
+        .map(|(pulled, _)| pulled)
 }
 
-async fn introspect_in(conn: &mut Conn, scope: Scope) -> Result<Pulled, DbError> {
+async fn introspect_in(
+    conn: &mut Conn,
+    scope: Scope,
+    wanted: &BTreeSet<TableName>,
+) -> Result<(Pulled, Relations), DbError> {
     open(conn, scope).await?;
-    let outcome = read_all(conn).await;
-    let raw = close(conn, scope, outcome)
+    let outcome = read_wanting(conn, wanted).await;
+    let (raw, relations) = close(conn, scope, outcome)
         .await
         .map_err(schema_changed_underneath)?;
 
@@ -1364,7 +1385,7 @@ async fn introspect_in(conn: &mut Conn, scope: Scope) -> Result<Pulled, DbError>
     pulled.unmanaged_modules.extend(raw.2);
     pulled.unmanaged_modules.sort();
     pulled.unmanaged_modules.dedup();
-    Ok(pulled)
+    Ok((pulled, relations))
 }
 
 type CatalogRead = (
@@ -1515,10 +1536,21 @@ fn policy_roles(row: &serde_json::Value) -> Result<pbps_model::PolicyRoles, DbEr
     Ok(pbps_model::PolicyRoles::Roles(roles))
 }
 
-async fn read_batch(conn: &mut Conn) -> Result<CatalogBatch, DbError> {
+async fn read_batch(
+    conn: &mut Conn,
+    wanted: &BTreeSet<TableName>,
+) -> Result<CatalogBatch, DbError> {
     let identity = baseline_identity_query(conn).await?;
+    let mut sql = batch_query(&identity);
+    if !wanted.is_empty() {
+        sql.push_str(&format!(
+            " UNION ALL SELECT '{ATTACH_PART}'::text AS part, COALESCE(jsonb_agg(to_jsonb(r)), \
+             '[]'::jsonb)::text AS payload FROM ({}) r",
+            adoption::query(wanted)
+        ));
+    }
     let mut batch = CatalogBatch::new();
-    for row in conn.query(&batch_query(&identity)).await? {
+    for row in conn.query(&sql).await? {
         let part = text(&row, "part")?;
         let payload = text(&row, "payload")?;
         let rows = serde_json::from_str(&payload)
@@ -1530,10 +1562,30 @@ async fn read_batch(conn: &mut Conn) -> Result<CatalogBatch, DbError> {
     Ok(batch)
 }
 
+#[cfg(test)]
 async fn read_all(conn: &mut Conn) -> Result<CatalogRead, DbError> {
+    read_wanting(conn, &BTreeSet::new())
+        .await
+        .map(|(read, _)| read)
+}
+
+/// The batch part of the relations a caller asked for.
+const ATTACH_PART: &str = "attach_relations";
+
+async fn read_wanting(
+    conn: &mut Conn,
+    wanted: &BTreeSet<TableName>,
+) -> Result<(CatalogRead, Relations), DbError> {
     let scope = canonical_path_of(conn)?;
     conn.query(&scope).await?;
-    decode_batch(&read_batch(conn).await?)
+    let batch = read_batch(conn, wanted).await?;
+    let relations = if wanted.is_empty() {
+        Relations::new()
+    } else {
+        let rows = batch.get(ATTACH_PART).ok_or_else(|| missing(ATTACH_PART))?;
+        adoption::decode(wanted, rows)?
+    };
+    Ok((decode_batch(&batch)?, relations))
 }
 
 fn decode_extensions(
@@ -4711,7 +4763,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let batch = read_batch(&mut conn).await.unwrap();
+        let batch = read_batch(&mut conn, &BTreeSet::new()).await.unwrap();
         let table_names = |part: &str| {
             batch[part]
                 .iter()

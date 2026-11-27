@@ -141,7 +141,8 @@ pub async fn compare(
         standard,
         externals,
         provenance,
-        Some(&comparison),
+        domain::Goal::Retained(&comparison),
     )
     .await
+    .map(|answers| answers.retained)
 }

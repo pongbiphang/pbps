@@ -9,6 +9,11 @@
 
 mod comments;
 pub use comments::undeclared as undeclared_comments;
+/// The question an attach's own indexes put to a resolver's rehearsal
+/// (DEC-1671.2).
+pub mod attach {
+    pub use crate::schema_diff::{Question, candidates, questions};
+}
 pub mod conversion;
 pub mod domain_rebuild;
 pub mod drop_requirements;

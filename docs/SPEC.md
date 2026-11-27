@@ -559,7 +559,11 @@ depends_on:
   may read) is dropped before the attach and, where declared, added after it,
   but for a lone index equal to the parent's with nothing for the engine to
   parse; an exclusion's drop that is not added back needs its record
-  (DEC-1671.1). What it keeps of its own is then brought to
+  (DEC-1671.1). With a resolver selected, planning asks its scratch which of
+  the table's plain indexes the engine takes, over empty copies of the table
+  and its parent made from the catalog: those are left to the attach, and the
+  plan records both relations' indexes for apply to hold them to
+  (DEC-1671.2, §7.6). What it keeps of its own is then brought to
   the declaration in the same plan, and its column uids leave the ids file.
   The apply's pre-flight
   refuses rows of the table outside the range, and DEFAULT-partition rows

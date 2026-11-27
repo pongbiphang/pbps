@@ -431,6 +431,7 @@ pub(super) async fn bootstrap_async(
             &pbps_model::Hints {
                 row_guard_defaults: Default::default(),
                 retained_expressions: Vec::new(),
+                attach_rehearsals: Vec::new(),
                 enum_value_renames: loaded.hints.enum_value_renames.clone(),
                 enum_comments: Default::default(),
                 domain_array_holders: Default::default(),
@@ -617,6 +618,7 @@ pub(super) async fn bootstrap_async(
                     &BTreeMap::new(),
                     crate::engine::Read::Snapshot,
                     warnings,
+                    &Default::default(),
                 )
                 .await?;
 

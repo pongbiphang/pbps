@@ -1,20 +1,26 @@
-//! A recorded attach rehearsal held against the database (#1671, DEC-1671.2):
-//! the two relations' indexes read from the catalog, and compared with the
-//! plan's record before the first statement and again before the `ATTACH`.
+//! Which of a table's indexes an attach takes as its parent's clones (#1671,
+//! DEC-1671.2): the two relations read from a database, rehearsed on a scratch,
+//! and held to that reading when the plan is applied.
 //!
 //! The engine takes, for each index of the parent's in the order they were
 //! made, the first of the table's in that order which it holds equal and which
-//! nothing has taken. So the order is part of what is compared.
+//! nothing has taken. Both the comparison, of bound expressions, and the order
+//! are the engine's, so planning copies them onto empty tables and asks it.
 
-use crate::{catalog, emit};
+use crate::{catalog, emit, quote};
+use pbps_db::transport::ExecuteConnection;
 use pbps_db::{Conn, DbError};
-use pbps_model::adoption::{HeldIndex, Relation, RelationIndex, Relations, difference, standing};
-use pbps_model::{Change, ChangeSet, PartitionChange, TableName};
+use pbps_diff::attach::Question;
+use pbps_model::adoption::{
+    AttachRehearsal, HeldIndex, Relation, RelationIndex, Relations, difference, standing,
+};
+use pbps_model::{Change, ChangeSet, ObjectLocalName, PartitionChange, TableName};
+use std::collections::BTreeMap;
 
-/// One row for each relation of `wanted` that is a table, with its indexes in
-/// the order of their object numbers, which is the order the engine looks
-/// through them in. Spelled by the session's path, so it is only ever run under
-/// the catalog's canonical one.
+/// One row for each relation of `wanted` that is a table: its columns as
+/// `CREATE TABLE` spells them, and its indexes in the order of their object
+/// numbers, which is the order the engine looks through them in. Spelled by the
+/// session's path, so it is only ever run under the catalog's canonical one.
 pub(crate) fn query<'a>(wanted: impl IntoIterator<Item = &'a TableName>) -> String {
     let named = wanted
         .into_iter()
@@ -27,6 +33,18 @@ pub(crate) fn query<'a>(wanted: impl IntoIterator<Item = &'a TableName>) -> Stri
     format!(
         "SELECT n.nspname::pg_catalog.text AS schema_name,
                 c.relname::pg_catalog.text AS table_name,
+                pg_catalog.pg_get_partkeydef(c.oid) AS partition_key,
+                ARRAY(SELECT pg_catalog.format('%I %s%s%s', a.attname,
+                             pg_catalog.format_type(a.atttypid, a.atttypmod),
+                             (SELECT pg_catalog.format(' COLLATE %I.%I', cn.nspname, co.collname)
+                                FROM pg_catalog.pg_collation co
+                                JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace
+                               WHERE co.oid = a.attcollation AND a.attcollation <> t.typcollation),
+                             CASE WHEN a.attnotnull THEN ' NOT NULL' END)
+                        FROM pg_catalog.pg_attribute a
+                        JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+                       WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                       ORDER BY a.attnum) AS columns,
                 COALESCE((SELECT pg_catalog.json_agg(pg_catalog.json_build_object(
                                      'name', ic.relname,
                                      'index', pg_catalog.pg_get_indexdef(i.indexrelid),
@@ -50,6 +68,8 @@ pub(crate) fn query<'a>(wanted: impl IntoIterator<Item = &'a TableName>) -> Stri
 struct Row {
     schema_name: String,
     table_name: String,
+    partition_key: Option<String>,
+    columns: Vec<String>,
     indexes: Vec<Index>,
 }
 
@@ -76,6 +96,8 @@ pub(crate) fn decode<'a>(
             .filter(|slot| slot.is_none())
             .ok_or_else(|| DbError::BadRow("an attach relation was not asked for".into()))?;
         *slot = Some(Relation {
+            columns: row.columns,
+            partition_key: row.partition_key,
             indexes: row
                 .indexes
                 .into_iter()
@@ -93,7 +115,7 @@ pub(crate) fn decode<'a>(
     Ok(found)
 }
 
-/// The relations as they stand, spelled as a record spells them: under the
+/// The relations as they stand, spelled as planning read them: under the
 /// canonical path, inside a savepoint of the caller's transaction, which leaves
 /// the session's settings as they were.
 async fn read(conn: &mut Conn, wanted: &[&TableName]) -> Result<Relations, DbError> {
@@ -119,6 +141,132 @@ async fn read(conn: &mut Conn, wanted: &[&TableName]) -> Result<Relations, DbErr
     let payload: Vec<serde_json::Value> = serde_json::from_str(payload)
         .map_err(|e| DbError::BadRow(format!("invalid attach relations: {e}")))?;
     decode(wanted.iter().copied(), &payload)
+}
+
+/// The two empty relations, their indexes made in the order the first database
+/// made them, then `statement`: the parent's index that took each of the
+/// table's. `PR 3` gives another statement.
+async fn replay(
+    conn: &mut Conn,
+    question: &Question,
+    parent: &Relation,
+    table: &Relation,
+    statement: &str,
+) -> Result<BTreeMap<ObjectLocalName, ObjectLocalName>, DbError> {
+    let refused = |e: pbps_dialect::DialectError| DbError::Refused(e.to_string());
+    conn.query(&catalog::canonical_path_of(conn)?).await?;
+    let mut statements = Vec::new();
+    for (name, relation) in [(&question.parent, parent), (&question.table, table)] {
+        let mut create = format!(
+            "CREATE TABLE {} ({})",
+            emit::qualified(name).map_err(refused)?,
+            relation.columns.join(", ")
+        );
+        if let Some(key) = &relation.partition_key {
+            create.push_str(" PARTITION BY ");
+            create.push_str(key);
+        }
+        statements.push(create);
+    }
+    let on = emit::qualified(&question.parent).map_err(refused)?;
+    for held in &parent.indexes {
+        statements.push(match &held.index.constraint {
+            Some(constraint) => {
+                let name = quote(held.index.name.raw()).map_err(refused)?;
+                let mut add = format!("ALTER TABLE {on} ADD CONSTRAINT {name} ");
+                add.push_str(constraint.raw());
+                add
+            }
+            None => held.index.index.raw().to_owned(),
+        });
+    }
+    // None of the table's keys and exclusions: each one the attach could take
+    // is dropped ahead of it, and one it could not take changes no choice. The
+    // same holds for what the question names as dropped. So what is left is
+    // what the attach will find, and the answer is about that.
+    statements.extend(
+        table
+            .indexes
+            .iter()
+            .map(|held| &held.index)
+            .filter(|i| i.constraint.is_none() && !question.dropped.contains(&i.name))
+            .map(|i| i.index.raw().to_owned()),
+    );
+    statements.push(statement.to_owned());
+    // The definitions are another database's text, so each goes to the engine
+    // as one statement and no more (DEC-2354.3).
+    for sql in &statements {
+        conn.execute_extended(sql).await?;
+    }
+    let (schema, name) = (
+        emit::literal(&question.table.schema),
+        emit::literal(&question.table.name),
+    );
+    let rows = conn
+        .query(&format!(
+            "SELECT own.relname::pg_catalog.text AS own, theirs.relname::pg_catalog.text AS taken_by
+               FROM pg_catalog.pg_index i
+               JOIN pg_catalog.pg_class t ON t.oid = i.indrelid
+               JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+               JOIN pg_catalog.pg_class own ON own.oid = i.indexrelid
+               JOIN pg_catalog.pg_inherits h ON h.inhrelid = i.indexrelid
+               JOIN pg_catalog.pg_class theirs ON theirs.oid = h.inhparent
+              WHERE n.nspname = {schema} AND t.relname = {name}"
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let name = |column| {
+                row.try_get::<&str>(column)
+                    .ok()
+                    .flatten()
+                    .map(ObjectLocalName::from)
+                    .ok_or_else(|| DbError::BadRow("an adopted index has no name".into()))
+            };
+            Ok((name("own")?, name("taken_by")?))
+        })
+        .collect()
+}
+
+/// Asks the engine of `scratch`, a session that holds what the definitions call
+/// and neither relation, which of the question's indexes the attach takes.
+/// `None` leaves nothing to it.
+pub async fn rehearse(
+    scratch: &mut Conn,
+    question: &Question,
+    parent: &Relation,
+    table: &Relation,
+) -> Result<Option<AttachRehearsal>, DbError> {
+    // An attach never takes an invalid index, and a copy of it made on empty
+    // tables is valid: the answer would be about another table.
+    if parent
+        .indexes
+        .iter()
+        .chain(&table.indexes)
+        .any(|i| !i.valid)
+    {
+        return Ok(None);
+    }
+    // Any bound takes the same indexes (measured on 16 and 18).
+    let (on, of) = (
+        emit::qualified(&question.parent),
+        emit::qualified(&question.table),
+    );
+    let (Ok(on), Ok(of)) = (on, of) else {
+        return Ok(None);
+    };
+    let attach = format!("ALTER TABLE {on} ATTACH PARTITION {of} DEFAULT");
+    scratch.execute("BEGIN").await?;
+    let taken = replay(scratch, question, parent, table, &attach).await;
+    scratch.execute("ROLLBACK").await?;
+    let mut kept = taken?;
+    kept.retain(|own, _| question.owns.contains(own));
+    let recorded = |relation: &Relation| relation.indexes.iter().map(|i| i.index.clone()).collect();
+    Ok((!kept.is_empty()).then(|| AttachRehearsal {
+        parent: recorded(parent),
+        table: recorded(table),
+        kept,
+    }))
 }
 
 /// Compares each relation with what the record says it holds.
@@ -211,7 +359,8 @@ mod tests {
 
     fn row(name: &str) -> serde_json::Value {
         serde_json::json!({
-            "schema_name": "app", "table_name": name,
+            "schema_name": "app", "table_name": name, "partition_key": null,
+            "columns": ["n integer"],
             "indexes": [{"name": "i", "index": "CREATE INDEX i", "constraint": null, "valid": false}],
         })
     }
@@ -226,7 +375,7 @@ mod tests {
         assert!(found[&wanted[1]].is_none());
         let found = decode(&wanted, &[row("c")]).unwrap();
         assert!(!found[&wanted[0]].as_ref().unwrap().indexes[0].valid);
-        for column in ["indexes", "table_name"] {
+        for column in ["columns", "indexes", "table_name"] {
             let mut broken = row("c");
             broken.as_object_mut().unwrap().remove(column);
             assert!(decode(&wanted, &[broken]).is_err(), "{column}");

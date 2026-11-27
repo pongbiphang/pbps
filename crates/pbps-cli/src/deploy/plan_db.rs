@@ -474,6 +474,14 @@ pub(super) async fn plan_db_selected(
         pbps_diff::enum_labels::read_before_the_renames(&mut to_read, &declared_live, &loaded.hints);
         let local_catalog = std::cell::RefCell::new(Vec::new());
         let catalog = owned.map_or(&local_catalog, |p| &p.findings);
+        // With a resolver selected, the relations an attach rehearsal asks
+        // about are read by the same statement as the schema (DEC-1671.2).
+        let wanted = resolver_selection.as_ref().map_or_else(Default::default, |_| {
+            pbps_diff::attach::candidates(
+                pbps_diff::Side { schema: &entry.snapshot.schema, ids: &recorded_ids },
+                pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
+            )
+        });
         let managed = managed_state_full(
             &mut conn,
             &recorded_ids,
@@ -486,6 +494,7 @@ pub(super) async fn plan_db_selected(
             &to_read,
             crate::engine::Read::Snapshot,
             CatalogWarnings::for_output(json, catalog),
+            &wanted,
         )
         .await;
         findings.extend(catalog.take());
@@ -797,6 +806,20 @@ pub(super) async fn plan_db_selected(
                 pbps_diff::Side { schema: &base, ids: &recorded_ids },
                 pbps_diff::Side { schema: &declared, ids: &resolved.ids },
                 &read_back,
+                &mut hints,
+            )
+            .await?;
+        // Asked before the first diff, which then plans from the answers, as
+        // the resolver's own plan does (DEC-1671.2).
+        dialect
+            .attach_rehearsal_hints(
+                scratch.as_mut(),
+                &mut conn,
+                target,
+                pbps_diff::Side { schema: &base, ids: &recorded_ids },
+                pbps_diff::Side { schema: &declared, ids: &resolved.ids },
+                &read_back,
+                &managed.relations,
                 &mut hints,
             )
             .await?;

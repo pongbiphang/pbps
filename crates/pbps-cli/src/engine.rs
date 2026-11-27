@@ -43,6 +43,7 @@ use pbps_db::doctor::Ask;
 pub use pbps_db::doctor::{Capabilities, Permissions};
 use pbps_db::impact::{ImpactError, ImpactReport, RenameTarget};
 use pbps_db::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
+use pbps_model::adoption::Relations;
 use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
 
 /// The engine a connection over `driver` is to, for the operations every
@@ -583,6 +584,24 @@ pub fn needs_readback_revalidation(driver: Driver, read: Read) -> bool {
 
 pub async fn introspect(conn: &mut Conn, read: Read) -> Result<Pulled, DbError> {
     of(conn.driver()).introspect(conn, read).await
+}
+
+/// [`introspect`] ahead of a connected plan's first diff, with the relations an
+/// attach rehearsal asks about read by the same statement (DEC-1671.2). Only
+/// PostgreSQL rehearses an attach; another engine is read as it always is.
+pub async fn introspect_wanting(
+    conn: &mut Conn,
+    read: Read,
+    wanted: &BTreeSet<TableName>,
+) -> Result<(Pulled, Relations), DbError> {
+    match (conn.driver(), read) {
+        (Driver::Postgres, Read::Snapshot) if !wanted.is_empty() => {
+            pbps_pg::catalog::introspect_wanting(conn, wanted).await
+        }
+        (Driver::Postgres | Driver::Mssql | Driver::Sqlite, _) => {
+            Ok((introspect(conn, read).await?, Relations::new()))
+        }
+    }
 }
 
 /// One advisory per declared filegroup, for a plan made without a database
