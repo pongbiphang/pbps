@@ -309,7 +309,10 @@ fn a_platform_that_cannot_be_asked_is_said_and_never_read_as_writable() {
     ask_the_system(
         &path,
         &["-journal"],
-        |_, d| Ok(Some(!d)),
+        |p, d| match p.to_string_lossy().ends_with("-journal") {
+            true => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            false => Ok(Some(!d)),
+        },
         &mut gaps,
         &mut unasked,
     )
@@ -391,6 +394,31 @@ fn a_journal_file_the_journal_mode_writes_is_asked_when_it_exists() {
     )
     .expect("answered");
     assert!(gaps.is_empty(), "{gaps:?}");
+
+    // The directory is asked only to create a journal file that is not
+    // there: with both kept and writable, a read-only directory is no gap;
+    // with one missing, it is.
+    for (shm_kept, gap) in [(true, false), (false, true)] {
+        let (mut gaps, mut unasked) = (Vec::new(), Vec::new());
+        ask_the_system(
+            &path,
+            &["-wal", "-shm"],
+            |p, directory| match (directory, ends(p, "-shm") && !shm_kept) {
+                (true, _) => Ok(Some(false)),
+                (false, true) => absent(),
+                (false, false) => Ok(Some(true)),
+            },
+            &mut gaps,
+            &mut unasked,
+        )
+        .expect("answered");
+        assert_eq!(
+            gaps.iter().any(|g| g.securable.contains("directory")),
+            gap,
+            "{gaps:?}"
+        );
+        assert_eq!(gaps.len(), usize::from(gap), "{gaps:?}");
+    }
 
     // A journal file whose question failed is an error, never an answer.
     let failed = ask_the_system(

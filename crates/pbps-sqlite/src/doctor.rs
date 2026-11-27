@@ -63,8 +63,11 @@ pub(crate) fn permissions_within(c: &Connection, wait: Duration) -> Result<Permi
     if let Some(path) = path.as_deref() {
         // Only the files this journal mode writes: a `-wal` file left beside
         // a rollback-journal database is not written, and may be read-only.
-        let kept: &[&str] = if write_ahead(c)? {
+        let mode = journal_mode(c)?;
+        let kept: &[&str] = if mode.eq_ignore_ascii_case("wal") {
             &["-wal", "-shm"]
+        } else if mode.eq_ignore_ascii_case("memory") {
+            &[]
         } else {
             &["-journal"]
         };
@@ -111,7 +114,6 @@ fn ask_the_system(
         })
     };
     let file = asked(path, false)?;
-    let beside = asked(directory, true)?;
     if file == Some(false) {
         gaps.push(PermissionGap {
             permission: "WRITE",
@@ -119,9 +121,12 @@ fn ask_the_system(
             why: "the operating system does not let this process write the file".to_owned(),
         });
     }
-    // SQLite also writes the files its journal mode keeps beside the database
-    // (`kept`): a commit in WAL mode goes to the `-wal` file. Each is asked
-    // when it exists; one that does not is created in the directory.
+    // One rule for the files this journal mode writes beside the database
+    // (`kept`; a commit in WAL mode goes to the `-wal` file): one that exists
+    // is asked itself, and one that does not has to be created, which is the
+    // only thing the directory is asked for. A directory this process may not
+    // write is no gap for a database whose journal files are all there.
+    let mut creates = false;
     for suffix in kept {
         let mut name = path.as_os_str().to_owned();
         name.push(suffix);
@@ -135,12 +140,17 @@ fn ask_the_system(
                     .to_owned(),
             }),
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => creates = true,
             Err(_) => {
                 asked(&kept, false)?;
             }
         }
     }
+    let beside = if creates {
+        asked(directory, true)?
+    } else {
+        Some(true)
+    };
     if beside == Some(false) {
         gaps.push(PermissionGap {
             permission: "WRITE",
@@ -162,10 +172,10 @@ fn ask_the_system(
     Ok(())
 }
 
-/// Whether this connection journals to a write-ahead log.
-fn write_ahead(c: &Connection) -> Result<bool, DbError> {
+/// The connection's journal mode, as SQLite names it.
+fn journal_mode(c: &Connection) -> Result<String, DbError> {
     match c.query("PRAGMA journal_mode", &[])?.first() {
-        Some(row) => Ok(row.text(0)?.eq_ignore_ascii_case("wal")),
+        Some(row) => Ok(row.text(0)?.to_owned()),
         None => Err(DbError::BadRow(
             "`PRAGMA journal_mode` returned no row".into(),
         )),
