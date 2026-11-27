@@ -176,7 +176,7 @@ pub fn difference(expected: &[RelationIndex], found: &[HeldIndex]) -> Option<Str
 
 /// A change that can alter what an index definition prints, or what it depends
 /// on, between planning's read and the attach: a rename of a table, a column, a
-/// type or an enum label, an enum rebuilt, an extension moved, or a routine
+/// type or an enum label, an enum rebuilt, an extension moved or updated, or a routine
 /// altered or dropped. A recorded list would then differ from the database only
 /// because the plan ran, so a plan that holds one records no rehearsal: the
 /// planning half asks nothing for it, and admission refuses one that does
@@ -190,7 +190,10 @@ pub fn unsettles(change: &Change) -> bool {
             | Change::TypeValue(
                 TypeValueChange::RenameEnumValue { .. } | TypeValueChange::EnumRebuild { .. }
             )
-            | Change::Extension(ExtensionChange::SetExtensionSchema { .. })
+            | Change::Extension(
+                ExtensionChange::SetExtensionSchema { .. }
+                    | ExtensionChange::UpdateExtension { .. }
+            )
             | Change::Module(
                 ModuleChange::AlterModule {
                     id: ModuleId::Routine(_),
@@ -527,6 +530,25 @@ mod tests {
             })),
         );
         cases.push(("a plan that renames a column", renaming));
+        // An extension update can reprint an operator class an index names
+        // (draft round 2).
+        let mut updating = recorded();
+        let package = |version: &str| crate::Extension {
+            schema: "public".into(),
+            version: version.into(),
+        };
+        updating.changes.changes.insert(
+            0,
+            crate::PlannedChange::new(Change::Extension(ExtensionChange::UpdateExtension {
+                uid: crate::Uid::generate(crate::UidKind::Extension),
+                name: "btree_gist".into(),
+                from: package("1.6"),
+                to: package("1.7"),
+                requires: Default::default(),
+                releases: Default::default(),
+            })),
+        );
+        cases.push(("a plan that updates an extension", updating));
         for (why, plan) in cases {
             assert_eq!(
                 validate(&plan),

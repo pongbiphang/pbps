@@ -10494,7 +10494,8 @@ kept index is not a plain index of the table taken by a plain index of the
 parent's, and one that keeps an index the plan drops or the declaration holds as
 the partition's own.
 It also refuses a record in a plan that renames a table, a column, a type or an
-enum label, rebuilds an enum, moves an extension, or alters or drops a routine
+enum label, rebuilds an enum, moves or updates an extension, or alters or drops a
+routine
 (`adoption::unsettles`). Each can change what a recorded definition prints, or
 what it binds to, before the attach, so either apply would refuse the plan only
 because a resolver answered, or the record would be compared under names it no
