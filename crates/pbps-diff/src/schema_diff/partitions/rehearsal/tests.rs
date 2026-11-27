@@ -6,6 +6,7 @@ use pbps_model::adoption::RelationIndex;
 use pbps_model::{
     Column, IndexColumn, Module, ModuleKind, PartitionBound, PartitionBy, PartitionOf,
 };
+use std::collections::BTreeMap;
 
 fn plain(column: &str) -> Index {
     Index {
@@ -91,9 +92,20 @@ impl World {
         intents: &[pbps_model::Intent],
         with: impl FnOnce(Side<'_>, Side<'_>) -> T,
     ) -> T {
-        let declared_ids = crate::resolve(&self.declared, &self.ids, intents, &context())
-            .unwrap()
-            .ids;
+        let baseline = Side {
+            schema: &self.base,
+            ids: &self.ids,
+        };
+        let declared_ids = crate::resolve_with_annotations_against(
+            &self.declared,
+            &self.ids,
+            intents,
+            0,
+            baseline,
+            &context(),
+        )
+        .unwrap()
+        .ids;
         with(
             Side {
                 schema: &self.base,
@@ -107,7 +119,11 @@ impl World {
     }
 
     fn questions(&self) -> Vec<Question> {
-        self.sides(&[], |base, declared| {
+        self.questions_given(&[])
+    }
+
+    fn questions_given(&self, intents: &[pbps_model::Intent]) -> Vec<Question> {
+        self.sides(intents, |base, declared| {
             questions(
                 base,
                 declared,
@@ -119,7 +135,15 @@ impl World {
     }
 
     fn plan(&self, answers: Vec<AttachAnswer>) -> Vec<Change> {
-        self.sides(&[], |base, declared| {
+        self.plan_given(&[], answers)
+    }
+
+    fn plan_given(
+        &self,
+        intents: &[pbps_model::Intent],
+        answers: Vec<AttachAnswer>,
+    ) -> Vec<Change> {
+        self.sides(intents, |base, declared| {
             let hints = Hints {
                 attach_rehearsals: answers,
                 ..Default::default()
@@ -220,10 +244,11 @@ fn every_plain_index_the_plan_would_drop_is_asked_about() {
     });
 }
 
-/// Neither a key nor an exclusion is ever asked about, and what no parent's
-/// index might take is not either.
+/// A key the plan releases is asked about with the indexes. What no parent's
+/// index might take is not, and is left out of the rehearsal with the other
+/// drops; a certain index is left to the attach as it is.
 #[test]
-fn a_key_an_untaken_index_and_a_certain_one_are_not_asked_about() {
+fn a_released_key_is_asked_about_and_an_untaken_index_and_a_certain_one_are_not() {
     let mut world = World::new();
     let key = pbps_model::UniqueConstraint {
         columns: vec!["id".into()],
@@ -246,15 +271,15 @@ fn a_key_an_untaken_index_and_a_certain_one_are_not_asked_about() {
         .declared
         .tables
         .insert(name("p"), world.base.tables[&name("p")].clone());
-    // The key is dropped ahead of the attach, and is not a candidate.
-    assert!(world.plan(Vec::new()).iter().any(|change| matches!(
-        change,
-        Change::Constraint(ConstraintChange::DropUnique { name, .. }) if name.raw() == "t_u"
-    )));
+    assert_eq!(
+        taken_off(&world.plan(Vec::new())),
+        ["c_a", "c_m", "c_z", "t_u"]
+    );
     let [question] = &world.questions()[..] else {
         panic!("one question: {:?}", world.questions())
     };
-    assert_eq!(question.owns, names(&["c_a", "c_z"]));
+    assert_eq!(question.owns, names(&["c_a", "c_z", "t_u"]));
+    assert_eq!(question.dropped, names(&["c_m"]));
 
     // A lone candidate equal to the parent's index is already left to it.
     let mut certain = World::new();
@@ -600,4 +625,335 @@ fn an_answer_is_not_used_in_a_plan_that_rebuilds_a_function() {
     let plan = world.plan(vec![good]);
     assert_eq!(dropped(&plan), ["c_a", "c_z"]);
     assert_eq!(recorded(&plan), None);
+}
+
+/// Every index, key and exclusion the plan drops, by name, in order of name.
+fn taken_off(changes: &[Change]) -> Vec<&str> {
+    let mut found: Vec<_> = changes
+        .iter()
+        .filter_map(|change| {
+            if let Change::Index(IndexChange::DropIndex { name, .. })
+            | Change::Constraint(ConstraintChange::DropUnique { name, .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { name, to: None, .. }) = change
+            {
+                Some(name.raw())
+            } else if let Change::Constraint(ConstraintChange::SetPrimaryKey {
+                from: Some(key),
+                to: None,
+                ..
+            }) = change
+            {
+                Some(key.name.as_ref().map_or("(unnamed)", |name| name.raw()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+fn on_id() -> pbps_model::UniqueConstraint {
+    pbps_model::UniqueConstraint {
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    }
+}
+
+fn primary_key(name: Option<&str>) -> pbps_model::PrimaryKey {
+    pbps_model::PrimaryKey {
+        name: name.map(Into::into),
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+        filegroup: None,
+    }
+}
+
+/// [`World::new`] with a key and a unique constraint on both sides, and a
+/// unique index of the parent's that might take either, so the plan releases
+/// both.
+fn keyed_world() -> World {
+    let mut world = World::new();
+    let parent = world.base.tables.get_mut(&name("p")).unwrap();
+    parent.primary_key = Some(primary_key(Some("p_pk")));
+    parent.unique.insert("p_u".into(), on_id());
+    parent.indexes.insert(
+        "p_ui".into(),
+        Index {
+            unique: true,
+            ..plain("id")
+        },
+    );
+    let table = world.base.tables.get_mut(&name("t")).unwrap();
+    table.primary_key = Some(primary_key(Some("t_pk")));
+    table.unique.insert("t_u".into(), on_id());
+    let parent = world.base.tables[&name("p")].clone();
+    world.declared.tables.insert(name("p"), parent);
+    world
+}
+
+fn under(name: &str, constraint: &str) -> RelationIndex {
+    RelationIndex {
+        constraint: Some(constraint.into()),
+        ..read(name)
+    }
+}
+
+/// An answer for [`keyed_world`] that keeps both keys and one index.
+fn keyed_answer(world: &World) -> AttachAnswer {
+    let question = world.questions().pop().expect("a question");
+    AttachAnswer {
+        uid: question.uid,
+        parent: question.parent,
+        rehearsal: AttachRehearsal {
+            parent: vec![
+                read("p_n"),
+                read("p_ui"),
+                under("p_u", "UNIQUE (id)"),
+                under("p_pk", "PRIMARY KEY (id)"),
+            ],
+            table: vec![
+                read("c_z"),
+                read("c_a"),
+                under("t_u", "UNIQUE (id)"),
+                under("t_pk", "PRIMARY KEY (id)"),
+            ],
+            kept: [
+                ("c_z".into(), "p_n".into()),
+                ("t_u".into(), "p_u".into()),
+                ("t_pk".into(), "p_pk".into()),
+            ]
+            .into(),
+        },
+    }
+}
+
+#[test]
+fn a_kept_key_and_unique_constraint_lose_their_drops_and_nothing_else_changes() {
+    let world = keyed_world();
+    let [question] = &world.questions()[..] else {
+        panic!("one question: {:?}", world.questions())
+    };
+    assert_eq!(question.owns, names(&["c_a", "c_z", "t_pk", "t_u"]));
+    assert!(question.dropped.is_empty());
+    let without = world.plan(Vec::new());
+    assert_eq!(taken_off(&without), ["c_a", "c_z", "t_pk", "t_u"]);
+
+    let answer = keyed_answer(&world);
+    let with = world.plan(vec![answer.clone()]);
+    assert_eq!(taken_off(&with), ["c_a"]);
+    assert_eq!(recorded(&with), Some(&answer.rehearsal));
+    assert_eq!(with.len() + 3, without.len());
+    assert!(with.iter().all(|change| {
+        matches!(
+            change,
+            Change::Partition(PartitionChange::AttachPartition { .. })
+        ) || without.contains(change)
+    }));
+}
+
+/// One of the table's is left to the attach only under one of the parent's of
+/// its own kind, and only where each list is what the plan found.
+#[test]
+fn an_answer_pairing_two_kinds_or_reading_another_plans_as_without_a_resolver() {
+    let world = keyed_world();
+    let without = world.plan(Vec::new());
+    let good = keyed_answer(&world);
+    assert_ne!(world.plan(vec![good.clone()]), without);
+    let wrong = |edit: &dyn Fn(&mut AttachRehearsal)| {
+        let mut answer = good.clone();
+        edit(&mut answer.rehearsal);
+        vec![answer]
+    };
+    let keep = |own: &str, by: &str| -> BTreeMap<ObjectLocalName, ObjectLocalName> {
+        [(own.into(), by.into())].into()
+    };
+    let cases = [
+        (
+            "a constraint under a plain index",
+            wrong(&|r| r.kept = keep("t_u", "p_ui")),
+        ),
+        (
+            "a unique constraint under the key",
+            wrong(&|r| r.kept = keep("t_u", "p_pk")),
+        ),
+        (
+            "the key under a unique constraint",
+            wrong(&|r| r.kept = keep("t_pk", "p_u")),
+        ),
+        (
+            "an index under a constraint",
+            wrong(&|r| r.kept = keep("c_z", "p_u")),
+        ),
+        (
+            "an own read as another kind than the plan holds",
+            wrong(&|r| {
+                r.table[2] = read("t_u");
+                r.kept = keep("c_z", "p_n");
+            }),
+        ),
+        (
+            "an own whose constraint is of no known kind",
+            wrong(&|r| {
+                r.table[2] = under("t_u", "CHECK (id > 0)");
+                r.kept = keep("c_z", "p_n");
+            }),
+        ),
+        (
+            "a parent that has lost a constraint",
+            wrong(&|r| {
+                r.parent.retain(|i| i.name.raw() != "p_u");
+                r.kept = keep("c_z", "p_n");
+            }),
+        ),
+        (
+            "a parent's constraint read as another kind",
+            wrong(&|r| {
+                r.parent[2] = under("p_u", "EXCLUDE USING btree (id WITH =)");
+                r.kept = keep("c_z", "p_n");
+            }),
+        ),
+    ];
+    for (why, answers) in cases {
+        assert_eq!(world.plan(answers), without, "{why}");
+    }
+}
+
+/// A key under a declared name is dropped whatever the engine says, and a key
+/// the base holds no name for cannot be left out of a rehearsal, so nothing is
+/// asked.
+#[test]
+fn a_key_under_a_declared_name_is_not_asked_about_and_an_unnamed_one_stops_the_question() {
+    let mut declared = keyed_world();
+    declared
+        .declared
+        .tables
+        .get_mut(&name("other"))
+        .unwrap()
+        .indexes
+        .insert("t_u".into(), plain("m"));
+    let [question] = &declared.questions()[..] else {
+        panic!("one question: {:?}", declared.questions())
+    };
+    assert_eq!(question.owns, names(&["c_a", "c_z", "t_pk"]));
+    assert_eq!(question.dropped, names(&["t_u"]));
+
+    let mut unnamed = keyed_world();
+    let good = keyed_answer(&unnamed);
+    let table = unnamed.base.tables.get_mut(&name("t")).unwrap();
+    table.primary_key = Some(primary_key(None));
+    assert_eq!(unnamed.questions(), []);
+    let plan = unnamed.plan(vec![good]);
+    assert_eq!(taken_off(&plan), ["(unnamed)", "c_a", "c_z", "t_u"]);
+    assert_eq!(recorded(&plan), None);
+}
+
+fn excluding(columns: &[&str]) -> pbps_model::ExclusionConstraint {
+    pbps_model::ExclusionConstraint {
+        method: pbps_model::IndexMethod::Btree,
+        keys: columns
+            .iter()
+            .map(|column| pbps_model::ExclusionKey {
+                key: IndexColumn::column(*column),
+                operator: pbps_model::OperatorRef::symbol("=").unwrap(),
+            })
+            .collect(),
+        include: Vec::new(),
+        filter: None,
+        storage_parameters: Default::default(),
+        timing: pbps_model::ExclusionTiming::Immediate,
+    }
+}
+
+/// [`World::new`] with an exclusion of the parent's and one of the table's it
+/// might take, and the record that retires the table's.
+fn excluding_world() -> (World, [pbps_model::Intent; 1]) {
+    let mut world = World::new();
+    for (table, exclusion) in [("p", "p_x"), ("t", "t_x")] {
+        let held = world.base.tables.get_mut(&name(table)).unwrap();
+        held.exclude.insert(exclusion.into(), excluding(&["id"]));
+    }
+    let parent = world.base.tables[&name("p")].clone();
+    world.declared.tables.insert(name("p"), parent);
+    let retired = pbps_model::Intent::DropExclusion {
+        table: name("t"),
+        name: "t_x".into(),
+        reason: "the parent's holds it".parse().unwrap(),
+    };
+    (world, [retired])
+}
+
+fn excluding_answer(question: Question) -> AttachAnswer {
+    let exclusion = |name| under(name, "EXCLUDE USING btree (id WITH =)");
+    AttachAnswer {
+        uid: question.uid,
+        parent: question.parent,
+        rehearsal: AttachRehearsal {
+            parent: vec![read("p_n"), exclusion("p_x")],
+            table: vec![read("c_z"), read("c_a"), exclusion("t_x")],
+            kept: [("t_x".into(), "p_x".into())].into(),
+        },
+    }
+}
+
+#[test]
+fn a_retired_exclusion_the_parents_might_take_is_asked_about_and_may_be_kept() {
+    let (world, retired) = excluding_world();
+    let [question] = &world.questions_given(&retired)[..] else {
+        panic!("one question")
+    };
+    assert_eq!(question.owns, names(&["c_a", "c_z", "t_x"]));
+    let without = world.plan_given(&retired, Vec::new());
+    assert_eq!(taken_off(&without), ["c_a", "c_z", "t_x"]);
+    let answer = excluding_answer(question.clone());
+    let with = world.plan_given(&retired, vec![answer.clone()]);
+    assert_eq!(taken_off(&with), ["c_a", "c_z"]);
+    assert_eq!(recorded(&with), Some(&answer.rehearsal));
+    // Under another kind of the parent's it is dropped as without an answer.
+    let mut crossed = answer;
+    crossed.rehearsal.kept = [("t_x".into(), "p_n".into())].into();
+    assert_eq!(world.plan_given(&retired, vec![crossed]), without);
+}
+
+#[test]
+fn an_exclusion_that_is_declared_unretired_or_untaken_is_never_asked_about() {
+    // Declared: dropped and added back, whatever the engine says.
+    let (mut declared, _) = excluding_world();
+    declared
+        .table()
+        .exclude
+        .insert("t_x".into(), excluding(&["id"]));
+    let [question] = &declared.questions()[..] else {
+        panic!("one question: {:?}", declared.questions())
+    };
+    assert_eq!(question.owns, names(&["c_a", "c_z"]));
+    assert_eq!(question.dropped, names(&["t_x"]));
+
+    // Neither declared nor retired: the plan is refused, and nothing is asked.
+    let (unretired, _) = excluding_world();
+    let side = Side {
+        schema: &unretired.declared,
+        ids: &unretired.ids,
+    };
+    let base = Side {
+        schema: &unretired.base,
+        ids: &unretired.ids,
+    };
+    assert!(crate::diff(base, side, &MinimalDialect, &Hints::default()).is_err());
+    assert_eq!(
+        questions(base, side, &MinimalDialect, &Hints::default(), base.schema),
+        []
+    );
+
+    // Retired, and over another number of keys than any of the parent's: its
+    // drop is the retirement's, and the engine has no say.
+    let (mut untaken, retired) = excluding_world();
+    let table = untaken.base.tables.get_mut(&name("t")).unwrap();
+    table.exclude.insert("t_x".into(), excluding(&["id", "m"]));
+    let [question] = &untaken.questions_given(&retired)[..] else {
+        panic!("one question")
+    };
+    assert_eq!(question.owns, names(&["c_a", "c_z"]));
+    assert_eq!(question.dropped, names(&["t_x"]));
 }

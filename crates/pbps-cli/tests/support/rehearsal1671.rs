@@ -1,13 +1,15 @@
-//! With a resolver selected, an attach keeps each plain index of the table
-//! that the engine takes as a clone of its parent's (#1671, DEC-1671.2).
-//! Without one, or with no answer, the plan is the loose drop's (DEC-1671.1).
-//! `adoption1671.rs` holds apply to the record. Each case here runs on both
-//! pinned engines, over a Docker scratch of the engine's own image.
+//! With a resolver selected, an attach keeps each index, key and exclusion of
+//! the table that the engine takes as a clone of its parent's (#1671,
+//! DEC-1671.2). Without one, or with no answer, the plan is the loose drop's
+//! (DEC-1671.1). `adoption1671.rs` holds apply to the record. Each case here
+//! runs over a Docker scratch of the engine's own image, on both pinned engines
+//! but for the exclusion's, which PostgreSQL 16 does not take on a partitioned
+//! table.
 use super::{
     Demo, OwnDatabase, code, generate_key, key_line, on_server, plan_checksum, stderr, stdout,
     succeeds, text_of,
 };
-use pbps_model::{Change, PartitionChange, SavedPlan};
+use pbps_model::{Change, ConstraintChange, IndexChange, PartitionChange, SavedPlan};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -486,4 +488,265 @@ fn a_staged_plan_can_hold_an_attach_that_keeps_every_own_index() {
         assert_eq!(p.parent_of("late_m"), "app.ev_a");
         p.in_sync();
     });
+}
+
+/// Every index, key and exclusion the plan drops, by name, in order of name.
+fn taken_off(plan: &SavedPlan) -> Vec<String> {
+    let mut names: Vec<String> = plan
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::Index(IndexChange::DropIndex { name, .. })
+            | Change::Constraint(ConstraintChange::DropUnique { name, .. })
+            | Change::Constraint(ConstraintChange::SetExclusion { name, to: None, .. }) =
+                &p.change
+            {
+                Some(name.raw().to_owned())
+            } else if let Change::Constraint(ConstraintChange::SetPrimaryKey {
+                from: Some(key),
+                to: None,
+                ..
+            }) = &p.change
+            {
+                key.name.as_ref().map(|name| name.raw().to_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+impl Project {
+    /// The kind of the constraint on one of `table`'s indexes, and whether it
+    /// is a copy of one of the parent's; nothing where none stands on it.
+    fn constraint_on(&self, table: &str, index: &str) -> String {
+        text_of(
+            self.connection(),
+            &format!(
+                "SELECT coalesce((SELECT contype::text || ' ' || (conparentid <> 0)::text \
+                 FROM pg_constraint WHERE conrelid = 'app.{table}'::regclass \
+                 AND conindid = 'app.{index}'::regclass), '')"
+            ),
+        )
+    }
+}
+
+/// A key and a unique constraint of each side, made before the unique indexes of
+/// the parent's, which the loose rule cannot tell apart from them.
+const KEYS: &str = "CREATE SCHEMA app; \
+    CREATE TABLE app.ev (id integer NOT NULL, k integer NOT NULL, m integer NOT NULL) \
+      PARTITION BY RANGE (k); \
+    ALTER TABLE app.ev ADD CONSTRAINT ev_pkey PRIMARY KEY (id, k); \
+    ALTER TABLE app.ev ADD CONSTRAINT ev_uq UNIQUE (m, k); \
+    CREATE UNIQUE INDEX ev_pk_ix ON app.ev (id, k); \
+    CREATE UNIQUE INDEX ev_uq_ix ON app.ev (m, k); \
+    CREATE TABLE app.late (id integer NOT NULL, k integer NOT NULL, m integer NOT NULL); \
+    ALTER TABLE app.late ADD CONSTRAINT late_pkey PRIMARY KEY (id, k); \
+    ALTER TABLE app.late ADD CONSTRAINT late_uq UNIQUE (m, k); \
+    INSERT INTO app.late VALUES (1, 1, 1)";
+
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16 and a Docker daemon; set PBPS_TEST_PG_DB, PBPS_TEST_PG_OLD_DB and their scratch images"]
+fn a_resolved_plan_keeps_a_primary_key_and_a_unique_constraint_and_applies_them() {
+    engines(|server, image| {
+        let p = Project::new(server, "adopt-keys-1671", KEYS);
+        let held = ["late_pkey", "late_uq"].map(|name| (name, p.oid(name)));
+        p.attach("late", "");
+        let (without, _) = p.plan("without", &[]);
+        let without = saved(&without);
+        assert_eq!(taken_off(&without), ["late_pkey", "late_uq"]);
+        assert_eq!(kept(&without), map(&[]));
+        p.select(Resolver::Docker(image));
+        let (plan, said) = p.plan("kept", &[]);
+        let saved = saved(&plan);
+        assert_eq!(
+            kept(&saved),
+            map(&[("late_pkey", "ev_pkey"), ("late_uq", "ev_uq")]),
+            "{said}"
+        );
+        assert_eq!(taken_off(&saved), Vec::<String>::new(), "{said}");
+        succeeds(p.apply(&plan, &[]));
+        for ((name, oid), (theirs, kind)) in held.iter().zip([("ev_pkey", "p"), ("ev_uq", "u")]) {
+            assert_eq!(&p.oid(name), oid, "{name} was rebuilt");
+            assert_eq!(p.parent_of(name), format!("app.{theirs}"), "{name}");
+            assert_eq!(p.constraint_on("late", name), format!("{kind} true"));
+        }
+        p.in_sync();
+    });
+}
+
+/// A unique index of the parent's made before its two unique constraints takes
+/// the older of the table's, which stays the table's own; without that one it
+/// takes the other the same way. So neither may be kept, which one round would
+/// not show. One of the table's carries the name the engine gives a copy it
+/// builds, which a later round must not read as the table's.
+const TWO_ROUNDS: &str = "CREATE SCHEMA app; \
+    CREATE TABLE app.ev (k integer NOT NULL, n integer NOT NULL) PARTITION BY RANGE (k); \
+    CREATE UNIQUE INDEX ev_ui ON app.ev (k, n); \
+    ALTER TABLE app.ev ADD CONSTRAINT ev_u1 UNIQUE (k, n); \
+    ALTER TABLE app.ev ADD CONSTRAINT ev_u2 UNIQUE (k, n); \
+    CREATE TABLE app.late (k integer NOT NULL, n integer NOT NULL); \
+    ALTER TABLE app.late ADD CONSTRAINT late_k_n_key UNIQUE (k, n); \
+    ALTER TABLE app.late ADD CONSTRAINT late_u2 UNIQUE (k, n); \
+    INSERT INTO app.late VALUES (1, 1)";
+
+/// A key the parent's unique index takes has the engine give the table a second
+/// one and refuse the attach. The rehearsal then asks again without the key, and
+/// still answers for the plain index beside it.
+const SECOND_KEY: &str = "CREATE SCHEMA app; \
+    CREATE TABLE app.ev (id integer NOT NULL, k integer NOT NULL, m integer) \
+      PARTITION BY RANGE (k); \
+    CREATE UNIQUE INDEX ev_ui ON app.ev (id, k); \
+    ALTER TABLE app.ev ADD CONSTRAINT ev_pkey PRIMARY KEY (id, k); \
+    ALTER TABLE app.ev ADD CONSTRAINT ev_uq UNIQUE (id, k); \
+    CREATE INDEX ev_a ON app.ev (m); \
+    CREATE INDEX ev_b ON app.ev (m); \
+    CREATE TABLE app.late (id integer NOT NULL, k integer NOT NULL, m integer); \
+    ALTER TABLE app.late ADD CONSTRAINT late_uq UNIQUE (id, k); \
+    ALTER TABLE app.late ADD CONSTRAINT late_pkey PRIMARY KEY (id, k); \
+    CREATE INDEX late_m ON app.late (m); \
+    INSERT INTO app.late VALUES (1, 1, 1)";
+
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16 and a Docker daemon; set PBPS_TEST_PG_DB, PBPS_TEST_PG_OLD_DB and their scratch images"]
+fn a_constraint_left_local_over_an_inherited_index_is_asked_about_again_and_dropped() {
+    engines(|server, image| {
+        let p = Project::new(server, "adopt-rounds-1671", TWO_ROUNDS);
+        p.attach("late", "");
+        p.select(Resolver::Docker(image));
+        let (plan, said) = p.plan("rounds", &[]);
+        let rounds = saved(&plan);
+        assert_eq!(kept(&rounds), map(&[]), "{said}");
+        assert_eq!(taken_off(&rounds), ["late_k_n_key", "late_u2"], "{said}");
+        succeeds(p.apply(&plan, &[]));
+        p.in_sync();
+
+        let p = Project::new(server, "adopt-second-key-1671", SECOND_KEY);
+        let held = p.oid("late_m");
+        p.attach("late", "");
+        p.select(Resolver::Docker(image));
+        let (plan, said) = p.plan("second", &[]);
+        let second = saved(&plan);
+        assert_eq!(kept(&second), map(&[("late_m", "ev_a")]), "{said}");
+        assert_eq!(taken_off(&second), ["late_pkey", "late_uq"], "{said}");
+        succeeds(p.apply(&plan, &[]));
+        assert_eq!(p.oid("late_m"), held, "late_m was rebuilt");
+        p.in_sync();
+    });
+}
+
+/// One unique constraint of the parent's holds one of the table's: a second
+/// equal one has nothing to be the copy of, so the attach is refused with a
+/// resolver as without one.
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16 and a Docker daemon; set PBPS_TEST_PG_DB, PBPS_TEST_PG_OLD_DB and their scratch images"]
+fn a_second_equal_constraint_of_the_tables_is_refused_with_or_without_a_resolver() {
+    engines(|server, image| {
+        let setup = TWO_ROUNDS.replace(
+            "ALTER TABLE app.ev ADD CONSTRAINT ev_u2 UNIQUE (k, n); ",
+            "",
+        );
+        assert_ne!(setup, TWO_ROUNDS);
+        let p = Project::new(server, "adopt-unmatched-1671", &setup);
+        p.attach("late", "");
+        for resolver in [Resolver::None, Resolver::Docker(image)] {
+            p.select(resolver);
+            let refused = p.d.run(&["plan"]);
+            assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+            assert!(
+                stderr(&refused).contains("unique constraint `late_u2` is not its parent's"),
+                "{}",
+                stderr(&refused)
+            );
+        }
+    });
+}
+
+/// PostgreSQL 16 gives a key of the table's to a unique constraint of the
+/// parent's made before the parent's key, and the other way round; 18 pairs each
+/// with its own kind. Only a pair of one kind is kept, and the plain index
+/// beside them is kept on both.
+const CROSSED: &str = "CREATE SCHEMA app; \
+    CREATE TABLE app.ev (id integer NOT NULL, k integer NOT NULL, m integer) \
+      PARTITION BY RANGE (k); \
+    ALTER TABLE app.ev ADD CONSTRAINT ev_uq UNIQUE (id, k); \
+    ALTER TABLE app.ev ADD CONSTRAINT ev_pkey PRIMARY KEY (id, k); \
+    CREATE UNIQUE INDEX ev_ui ON app.ev (id, k); \
+    CREATE INDEX ev_a ON app.ev (m); \
+    CREATE INDEX ev_b ON app.ev (m); \
+    CREATE TABLE app.late (id integer NOT NULL, k integer NOT NULL, m integer); \
+    ALTER TABLE app.late ADD CONSTRAINT late_pkey PRIMARY KEY (id, k); \
+    ALTER TABLE app.late ADD CONSTRAINT late_uq UNIQUE (id, k); \
+    CREATE INDEX late_m ON app.late (m); \
+    INSERT INTO app.late VALUES (1, 1, 1)";
+
+#[test]
+#[ignore = "needs PostgreSQL 18 and 16 and a Docker daemon; set PBPS_TEST_PG_DB, PBPS_TEST_PG_OLD_DB and their scratch images"]
+fn a_constraint_taken_by_one_of_another_kind_is_not_kept() {
+    engines(|server, image| {
+        let p = Project::new(server, "adopt-crossed-1671", CROSSED);
+        let old = text_of(server, "SHOW server_version_num").starts_with("16");
+        p.attach("late", "");
+        p.select(Resolver::Docker(image));
+        let (plan, said) = p.plan("crossed", &[]);
+        let saved = saved(&plan);
+        let plain = ("late_m", "ev_a");
+        let (expected, dropped): (_, &[&str]) = if old {
+            (map(&[plain]), &["late_pkey", "late_uq"])
+        } else {
+            let keys = [("late_pkey", "ev_pkey"), ("late_uq", "ev_uq")];
+            (map(&[plain, keys[0], keys[1]]), &[])
+        };
+        assert_eq!(kept(&saved), expected, "{said}");
+        assert_eq!(taken_off(&saved), dropped, "{said}");
+        succeeds(p.apply(&plan, &[]));
+        for (index, kind) in [("late_pkey", "p"), ("late_uq", "u")] {
+            if !old {
+                assert_eq!(p.constraint_on("late", index), format!("{kind} true"));
+            }
+        }
+        p.in_sync();
+    });
+}
+
+/// A retired exclusion the parent's takes stays, as the parent's copy under its
+/// own name. Without a resolver its retirement drops it ahead of the attach.
+#[test]
+#[ignore = "needs PostgreSQL 18 and a Docker daemon; set PBPS_TEST_PG_DB and its scratch image"]
+fn a_resolved_plan_keeps_a_retired_exclusion_the_parents_takes_on_18() {
+    let read = |variable| std::env::var(variable).expect(variable);
+    let p = Project::new(
+        &read("PBPS_TEST_PG_DB"),
+        "adopt-exclusion-1671",
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (k integer NOT NULL, v integer NOT NULL) PARTITION BY RANGE (k); \
+         ALTER TABLE app.ev ADD CONSTRAINT ev_x EXCLUDE USING btree (k WITH =, v WITH =); \
+         CREATE TABLE app.late (k integer NOT NULL, v integer NOT NULL); \
+         ALTER TABLE app.late ADD CONSTRAINT late_x EXCLUDE USING btree (k WITH =, v WITH =); \
+         INSERT INTO app.late VALUES (1, 1)",
+    );
+    let held = p.oid("late_x");
+    p.attach("late", "");
+    succeeds(p.d.run(&[
+        "drop-exclusion",
+        "app.late",
+        "late_x",
+        "--reason",
+        "the parent's holds it",
+    ]));
+    let (without, _) = p.plan("without", &[]);
+    assert_eq!(taken_off(&saved(&without)), ["late_x"]);
+    p.select(Resolver::Docker(&read("PBPS_TEST_PG_SCRATCH_IMAGE")));
+    let (plan, said) = p.plan("kept", &[]);
+    let saved = saved(&plan);
+    assert_eq!(kept(&saved), map(&[("late_x", "ev_x")]), "{said}");
+    assert_eq!(taken_off(&saved), Vec::<String>::new(), "{said}");
+    succeeds(p.apply(&plan, &[]));
+    assert_eq!(p.oid("late_x"), held, "late_x was rebuilt");
+    assert_eq!(p.parent_of("late_x"), "app.ev_x");
+    assert_eq!(p.constraint_on("late", "late_x"), "x true");
+    p.in_sync();
 }

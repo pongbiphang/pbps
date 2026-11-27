@@ -7,9 +7,12 @@
 //! otherwise drop.
 
 use super::super::constraints::may_adopt;
+use super::super::exclusions::may_adopt_exclusion;
 use super::super::*;
 use pbps_model::ObjectLocalName;
-use pbps_model::adoption::{AttachAnswer, AttachRehearsal, unsettles};
+use pbps_model::adoption::{
+    AttachAnswer, AttachRehearsal, IndexKind, RelationIndex, drops, unsettles,
+};
 
 /// One attach whose own indexes a rehearsal can be asked about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,12 +20,14 @@ pub struct Question {
     pub uid: Uid,
     pub table: TableName,
     pub parent: TableName,
-    /// The plain indexes the plan drops for want of an answer, each of which
-    /// may be left to the attach.
+    /// The indexes, keys and exclusions the plan drops for want of an answer,
+    /// each by the name of the index it stands on, and each of which may be
+    /// left to the attach.
     pub owns: BTreeSet<ObjectLocalName>,
-    /// Those it drops whatever the engine says, since the declarations give
-    /// the name to something. A rehearsal leaves them out, as they are gone
-    /// by the time of the attach.
+    /// Every other one it drops of the table's, whatever the engine says: the
+    /// declarations give its name to something, or no index or constraint of
+    /// the parent's might take it. A rehearsal leaves these out, as they are
+    /// gone by the time of the attach.
     pub dropped: BTreeSet<ObjectLocalName>,
 }
 
@@ -149,27 +154,69 @@ fn asked(
             if parent_shape_changes(theirs, declared.schema.tables.get(parent)?) {
                 return None;
             }
-            // Of the drops, those a parent's index might take: one the plan
-            // drops only because the declaration does not hold it is no
-            // question for an engine.
-            let might_take = |name: &ObjectLocalName| {
-                was.indexes.get(name).is_some_and(|own| {
-                    theirs
-                        .indexes
-                        .values()
-                        .any(|their| may_adopt(their, own, dialect))
-                })
-            };
-            let (dropped, owns): (BTreeSet<_>, BTreeSet<_>) = changes
-                .iter()
-                .filter_map(|p| {
-                    if let Change::Index(IndexChange::DropIndex { table: of, name }) = &p.change {
-                        (of == table && might_take(name)).then(|| name.clone())
+            let (mut owns, mut dropped) = (BTreeSet::new(), BTreeSet::new());
+            for planned in changes {
+                // What the change takes off the table, and whether a parent's
+                // might take it: one the plan drops only because the
+                // declaration does not hold it is no question for an engine.
+                let (name, might_take) =
+                    if let Change::Index(IndexChange::DropIndex { table: of, name }) =
+                        &planned.change
+                        && of == table
+                    {
+                        let might_take = was.indexes.get(name).is_some_and(|own| {
+                            theirs
+                                .indexes
+                                .values()
+                                .any(|their| may_adopt(their, own, dialect))
+                        });
+                        (name, might_take)
+                    } else if let Change::Constraint(ConstraintChange::SetExclusion {
+                        table: of,
+                        name,
+                        to: None,
+                        ..
+                    }) = &planned.change
+                        && of == table
+                    {
+                        // Dropped for a retirement the identities record, or for a
+                        // declaration that holds it, which keeps it out of `owns`.
+                        let might_take = was.exclude.get(name).is_some_and(|own| {
+                            theirs
+                                .exclude
+                                .values()
+                                .any(|their| may_adopt_exclusion(their, own, dialect))
+                        });
+                        (name, might_take)
+                    // An attach drops a key or a unique constraint only where an
+                    // index of the parent's might take it.
+                    } else if let Change::Constraint(ConstraintChange::DropUnique {
+                        table: of,
+                        name,
+                    }) = &planned.change
+                        && of == table
+                    {
+                        (name, true)
+                    } else if let Change::Constraint(ConstraintChange::SetPrimaryKey {
+                        table: of,
+                        from: Some(key),
+                        to: None,
+                        ..
+                    }) = &planned.change
+                        && of == table
+                    {
+                        // A rehearsal could not leave out a key it has no name
+                        // for. A read of the database names each.
+                        (key.name.as_ref()?, true)
                     } else {
-                        None
-                    }
-                })
-                .partition(|name| taken(declared.schema, table, name));
+                        continue;
+                    };
+                if might_take && !taken(declared.schema, table, name) {
+                    owns.insert(name.clone());
+                } else {
+                    dropped.insert(name.clone());
+                }
+            }
             (!owns.is_empty()).then(|| Question {
                 uid: uid.clone(),
                 table: table.clone(),
@@ -181,41 +228,65 @@ fn asked(
         .collect()
 }
 
+/// The kind of index the model holds under each name of `table`'s. A key it
+/// holds no name for is under none.
+fn held(table: &Table) -> BTreeMap<&ObjectLocalName, IndexKind> {
+    let key = table.primary_key.as_ref().and_then(|key| key.name.as_ref());
+    table
+        .indexes
+        .keys()
+        .map(|name| (name, IndexKind::Plain))
+        .chain(table.unique.keys().map(|name| (name, IndexKind::Unique)))
+        .chain(
+            table
+                .exclude
+                .keys()
+                .map(|name| (name, IndexKind::Exclusion)),
+        )
+        .chain(key.map(|name| (name, IndexKind::PrimaryKey)))
+        .collect()
+}
+
 /// The one answer for `question` that agrees with it. Anything else is no
 /// answer, so one made for another state of the two relations, or for another
 /// attach, is never read as this one.
 fn accepted<'a>(
     question: &Question,
     parent: &Table,
+    table: &Table,
     answers: &'a [AttachAnswer],
 ) -> Option<&'a AttachRehearsal> {
     let mut mine = answers.iter().filter(|a| a.uid == question.uid);
     let answer = mine.next()?;
     let rehearsal = &answer.rehearsal;
-    let plain = |list: &'a [pbps_model::adoption::RelationIndex]| {
+    let read = |list: &'a [RelationIndex]| {
         list.iter()
-            .filter(|i| i.constraint.is_none())
-            .map(|i| &i.name)
-            .collect::<BTreeSet<_>>()
+            .filter_map(|index| Some((&index.name, index.kind()?)))
+            .collect::<BTreeMap<_, _>>()
     };
-    let (theirs, mine_now) = (plain(&rehearsal.parent), plain(&rehearsal.table));
+    let (theirs, mine_now) = (read(&rehearsal.parent), read(&rehearsal.table));
+    let mine_held = held(table);
     let taken_by: BTreeSet<_> = rehearsal.kept.values().collect();
     (mine.next().is_none()
         && answer.parent == question.parent
-        && theirs.iter().copied().eq(parent.indexes.keys())
-        && question.owns.iter().all(|own| mine_now.contains(own))
+        && theirs.len() == rehearsal.parent.len()
+        && theirs == held(parent)
+        && question
+            .owns
+            .iter()
+            .all(|own| mine_now.contains_key(own) && mine_now.get(own) == mine_held.get(own))
         && !rehearsal.kept.is_empty()
         && taken_by.len() == rehearsal.kept.len()
         && rehearsal
             .kept
             .iter()
-            .all(|(own, by)| question.owns.contains(own) && theirs.contains(by)))
+            .all(|(own, by)| question.owns.contains(own) && rehearsal.pairs(own, by)))
     .then_some(rehearsal)
 }
 
 /// Leaves to each attach what an accepted answer says the engine takes: the
-/// index's drop goes, and the attach records the answer. With none, `changes`
-/// is left as it was.
+/// drop of that index, key or exclusion goes, and the attach records the
+/// answer. With none, `changes` is left as it was.
 #[allow(clippy::too_many_arguments)]
 pub(in super::super) fn leave_to_attach(
     base: Side<'_>,
@@ -234,17 +305,24 @@ pub(in super::super) fn leave_to_attach(
     for question in asked(
         base, declared, dialect, hints, also, rebinding, screen, read_back,
     ) {
-        let Some(answer) = base
-            .schema
-            .tables
-            .get(&question.parent)
-            .and_then(|parent| accepted(&question, parent, &hints.attach_rehearsals))
-        else {
+        let (Some(parent), Some(table)) = (
+            base.schema.tables.get(&question.parent),
+            base.schema.tables.get(&question.table),
+        ) else {
             continue;
         };
+        let Some(answer) = accepted(&question, parent, table, &hints.attach_rehearsals) else {
+            continue;
+        };
+        let kept: Vec<_> = answer
+            .table
+            .iter()
+            .filter(|index| answer.kept.contains_key(&index.name))
+            .collect();
         changes.retain(|change| {
-            !matches!(change, Change::Index(IndexChange::DropIndex { table, name })
-                if *table == question.table && answer.kept.contains_key(name))
+            !kept
+                .iter()
+                .any(|index| drops(change, &question.table, index))
         });
         for change in changes.iter_mut() {
             if let Change::Partition(PartitionChange::AttachPartition { uid, rehearsal, .. }) =

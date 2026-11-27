@@ -1,6 +1,6 @@
-//! Which of a table's indexes an attach takes as its parent's clones (#1671,
-//! DEC-1671.2): the two relations read from a database, rehearsed on a scratch,
-//! and held to that reading when the plan is applied.
+//! Which of a table's indexes, keys and exclusions an attach takes as its
+//! parent's clones (#1671, DEC-1671.2): the two relations read from a database,
+//! rehearsed on a scratch, and held to that reading when the plan is applied.
 //!
 //! The engine takes, for each index of the parent's in the order they were
 //! made, the first of the table's in that order which it holds equal and which
@@ -12,10 +12,10 @@ use pbps_db::transport::ExecuteConnection;
 use pbps_db::{Conn, DbError};
 use pbps_diff::attach::Question;
 use pbps_model::adoption::{
-    AttachRehearsal, HeldIndex, Relation, RelationIndex, Relations, difference, standing,
+    AttachRehearsal, HeldIndex, IndexKind, Relation, RelationIndex, Relations, difference, standing,
 };
 use pbps_model::{Change, ChangeSet, ObjectLocalName, PartitionChange, TableName};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One row for each relation of `wanted` that is a table: its columns as
 /// `CREATE TABLE` spells them, and its indexes in the order of their object
@@ -143,16 +143,35 @@ async fn read(conn: &mut Conn, wanted: &[&TableName]) -> Result<Relations, DbErr
     decode(wanted.iter().copied(), &payload)
 }
 
+/// The parent's index that took one of the table's.
+struct Taken {
+    by: ObjectLocalName,
+    /// A constraint on the table's index stayed the table's own.
+    mixed: bool,
+}
+
+/// The statement that makes `index` on the relation spelled `on`.
+fn made(on: &str, index: &RelationIndex) -> Result<String, pbps_dialect::DialectError> {
+    let Some(constraint) = &index.constraint else {
+        return Ok(index.index.raw().to_owned());
+    };
+    let name = quote(index.name.raw())?;
+    let mut add = format!("ALTER TABLE {on} ADD CONSTRAINT {name} ");
+    add.push_str(constraint.raw());
+    Ok(add)
+}
+
 /// The two empty relations, their indexes made in the order the first database
-/// made them, then `statement`: the parent's index that took each of the
-/// table's. `PR 3` gives another statement.
+/// made them but for those of the table's named in `out`, then `statement`: what
+/// took each of the table's that was taken. `PR 3` gives another statement.
 async fn replay(
     conn: &mut Conn,
     question: &Question,
     parent: &Relation,
     table: &Relation,
+    out: &BTreeSet<ObjectLocalName>,
     statement: &str,
-) -> Result<BTreeMap<ObjectLocalName, ObjectLocalName>, DbError> {
+) -> Result<BTreeMap<ObjectLocalName, Taken>, DbError> {
     let refused = |e: pbps_dialect::DialectError| DbError::Refused(e.to_string());
     conn.query(&catalog::canonical_path_of(conn)?).await?;
     let mut statements = Vec::new();
@@ -170,28 +189,14 @@ async fn replay(
     }
     let on = emit::qualified(&question.parent).map_err(refused)?;
     for held in &parent.indexes {
-        statements.push(match &held.index.constraint {
-            Some(constraint) => {
-                let name = quote(held.index.name.raw()).map_err(refused)?;
-                let mut add = format!("ALTER TABLE {on} ADD CONSTRAINT {name} ");
-                add.push_str(constraint.raw());
-                add
-            }
-            None => held.index.index.raw().to_owned(),
-        });
+        statements.push(made(&on, &held.index).map_err(refused)?);
     }
-    // None of the table's keys and exclusions: each one the attach could take
-    // is dropped ahead of it, and one it could not take changes no choice. The
-    // same holds for what the question names as dropped. So what is left is
-    // what the attach will find, and the answer is about that.
-    statements.extend(
-        table
-            .indexes
-            .iter()
-            .map(|held| &held.index)
-            .filter(|i| i.constraint.is_none() && !question.dropped.contains(&i.name))
-            .map(|i| i.index.raw().to_owned()),
-    );
+    let on = emit::qualified(&question.table).map_err(refused)?;
+    for held in &table.indexes {
+        if !out.contains(&held.index.name) {
+            statements.push(made(&on, &held.index).map_err(refused)?);
+        }
+    }
     statements.push(statement.to_owned());
     // The definitions are another database's text, so each goes to the engine
     // as one statement and no more (DEC-2354.3).
@@ -204,13 +209,17 @@ async fn replay(
     );
     let rows = conn
         .query(&format!(
-            "SELECT own.relname::pg_catalog.text AS own, theirs.relname::pg_catalog.text AS taken_by
+            "SELECT own.relname::pg_catalog.text AS own, theirs.relname::pg_catalog.text AS taken_by,
+                    k.oid IS NOT NULL AND k.conparentid = 0 AS mixed
                FROM pg_catalog.pg_index i
                JOIN pg_catalog.pg_class t ON t.oid = i.indrelid
                JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
                JOIN pg_catalog.pg_class own ON own.oid = i.indexrelid
                JOIN pg_catalog.pg_inherits h ON h.inhrelid = i.indexrelid
                JOIN pg_catalog.pg_class theirs ON theirs.oid = h.inhparent
+               LEFT JOIN pg_catalog.pg_constraint k
+                 ON k.conindid = i.indexrelid AND k.conrelid = i.indrelid
+                AND k.contype IN ('p', 'u', 'x')
               WHERE n.nspname = {schema} AND t.relname = {name}"
         ))
         .await?;
@@ -223,14 +232,25 @@ async fn replay(
                     .map(ObjectLocalName::from)
                     .ok_or_else(|| DbError::BadRow("an adopted index has no name".into()))
             };
-            Ok((name("own")?, name("taken_by")?))
+            let mixed = row
+                .try_get::<bool>("mixed")?
+                .ok_or_else(|| DbError::BadRow("an adopted index has no state".into()))?;
+            let by = name("taken_by")?;
+            Ok((name("own")?, Taken { by, mixed }))
         })
         .collect()
 }
 
 /// Asks the engine of `scratch`, a session that holds what the definitions call
-/// and neither relation, which of the question's indexes the attach takes.
-/// `None` leaves nothing to it.
+/// and neither relation, which of the question's indexes, keys and exclusions
+/// the attach takes. `None` leaves nothing to it.
+///
+/// One answer can be wrong: a unique index of the parent's takes the index under
+/// a key or unique constraint of the table's, which then stays the table's own,
+/// and once the plan has dropped that one the same index of the parent's takes
+/// another. PostgreSQL 16 also takes one for a parent's of another kind. So the
+/// question is asked again without each one that was taken so, until none is,
+/// and the answer is what the last round took.
 pub async fn rehearse(
     scratch: &mut Conn,
     question: &Question,
@@ -256,17 +276,48 @@ pub async fn rehearse(
         return Ok(None);
     };
     let attach = format!("ALTER TABLE {on} ATTACH PARTITION {of} DEFAULT");
-    scratch.execute("BEGIN").await?;
-    let taken = replay(scratch, question, parent, table, &attach).await;
-    scratch.execute("ROLLBACK").await?;
-    let mut kept = taken?;
-    kept.retain(|own, _| question.owns.contains(own));
     let recorded = |relation: &Relation| relation.indexes.iter().map(|i| i.index.clone()).collect();
-    Ok((!kept.is_empty()).then(|| AttachRehearsal {
+    let mut record = AttachRehearsal {
         parent: recorded(parent),
         table: recorded(table),
-        kept,
-    }))
+        kept: BTreeMap::new(),
+    };
+    // The table's primary key, where it may be left to the attach. Left local
+    // over an index a unique index of the parent's took, it has the engine give
+    // the table a second one and refuse the attach, so that state shows only as
+    // a refusal.
+    let key = record
+        .table
+        .iter()
+        .find(|i| i.kind() == Some(IndexKind::PrimaryKey) && question.owns.contains(&i.name))
+        .map(|i| i.name.clone());
+    // What the plan drops whatever the engine says is gone by the attach. Each
+    // further round leaves out at least one more, so the rounds end.
+    let mut out = question.dropped.clone();
+    loop {
+        scratch.execute("BEGIN").await?;
+        let taken = replay(scratch, question, parent, table, &out, &attach).await;
+        scratch.execute("ROLLBACK").await?;
+        let taken = match (taken, &key) {
+            (Ok(taken), _) => taken,
+            (Err(_), Some(key)) if !out.contains(key) => {
+                out.insert(key.clone());
+                continue;
+            }
+            (Err(error), _) => return Err(error),
+        };
+        // Only what this round made: the engine may give a copy it builds the
+        // name of one that was left out.
+        let (wrong, right): (Vec<_>, Vec<_>) = taken
+            .into_iter()
+            .filter(|(own, _)| question.owns.contains(own) && !out.contains(own))
+            .partition(|(own, taken)| taken.mixed || !record.pairs(own, &taken.by));
+        if wrong.is_empty() {
+            record.kept = right.into_iter().map(|(own, t)| (own, t.by)).collect();
+            return Ok((!record.kept.is_empty()).then_some(record));
+        }
+        out.extend(wrong.into_iter().map(|(own, _)| own));
+    }
 }
 
 /// Compares each relation with what the record says it holds.
