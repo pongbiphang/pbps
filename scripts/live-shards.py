@@ -150,11 +150,16 @@ class FixtureRun:
             self.handlers[sig] = signal.signal(sig, self.interrupt)
         return self
 
-    def run(self, command, **kwargs):
+    def start(self, command, **kwargs):
+        """Start a process group this run owns: stop() ends it before any removal."""
         with self.lock:
             require(not self.stopped, "fixture run interrupted")
             process = subprocess.Popen(command, start_new_session=True, **kwargs)
             self.processes.append(process)
+        return process
+
+    def run(self, command, **kwargs):
+        process = self.start(command, **kwargs)
         try:
             # Leave the leader waitable until draining starts: its PID still
             # anchors ownership of the group even when only descendants run.
@@ -615,14 +620,14 @@ def load_resume(previous, tree, inputs, suites, flakes, unregistered=None):
     return proven, failures, waived, manifest
 
 
-def run_tests(command, assigned, *, on_failure=None, env=None):
+def run_tests(command, assigned, *, on_failure=None, env=None, start=subprocess.Popen):
     reported, summaries, duplicates, headers = {}, [], [], []
     active = False
     started = last = time.monotonic()
     # The commutation harness writes directly to stderr during passing tests.
     # Merging it here splits libtest's partial "test name ... " stdout line.
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=None, env=env,
-                          text=True, bufsize=1) as process:
+    with start(command, stdout=subprocess.PIPE, stderr=None, env=env,
+               text=True, bufsize=1) as process:
         for line in process.stdout:
             header = re.fullmatch(r"running ([0-9]+) tests?\n?", line)
             if header:
@@ -1271,6 +1276,24 @@ def proof_environment(source):
     return env
 
 
+def run_with_resolver_fixtures(command, assigned, source):
+    """Run an isolated check as a SQL Server shard does: source the runner's
+    resolver fixtures, on containers this proof creates and removes (DEC-3088.1).
+
+    The connection variables and the image exist only in that child. The proof's
+    inputs digest stays the caller's environment, as the gate's does.
+    """
+    env = dict(source, PBPS_LIVE_PREFIX=source.get("PBPS_LIVE_PREFIX") or "pbps-proof")
+    # The runner sets NAME to its own primary before sourcing the script; an
+    # inherited one would start, or reuse, a container outside the owned names.
+    env.pop("NAME", None)
+    env = fixture_env("mssql", 0, env)
+    # `set -e` first: a script that cannot be sourced must not reach the test.
+    shell = ["bash", "-c", 'set -e; source scripts/resolver-mssql-fixtures.sh; exec "$@"', "resolver-proof"]
+    with FixtureRun((env["PBPS_TEST_MSSQL_NAME"], env["PBPS_TEST_MSSQL_SCRATCH_NAME"])) as fixtures:
+        return run_tests([*shell, *command], assigned, env=env, start=fixtures.start)
+
+
 def record_proof(argv):
     global ROOT
     parser = argparse.ArgumentParser(description="Record one isolated pass for rerun independence evidence")
@@ -1279,8 +1302,12 @@ def record_proof(argv):
     parser.add_argument("--python", help="whole Python check path, instead of a cargo test")
     parser.add_argument("--cargo-check", action="store_true", help="the whole canonical non-live Cargo step")
     parser.add_argument("--name", help="exact Rust test name")
+    parser.add_argument("--resolver-mssql-fixtures", action="store_true",
+                        help="start the SQL Server resolver fixtures for this one test, then remove them")
     parser.add_argument("cargo", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    require(not args.resolver_mssql_fixtures or not (args.python or args.cargo_check),
+            "--resolver-mssql-fixtures serves one exact Rust test, not a whole Python or Cargo check")
     args.output = args.output.resolve()
     if args.worktree is not None:
         ROOT = args.worktree.resolve(strict=True)
@@ -1308,9 +1335,14 @@ def record_proof(argv):
         require(args.name and args.cargo, "proof needs a cargo invocation and exact --name")
         cargo, flags, _ = libtest_args(args.cargo)
         name = args.name
-        results, code, _, valid, _ = run_tests(
-            ["cargo", *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
-             "--color=never", args.name], [args.name], env=proof_environment(env))
+        command = ["cargo", *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
+                   "--color=never", args.name]
+        child = proof_environment(env)
+        if args.resolver_mssql_fixtures:
+            ran = run_with_resolver_fixtures(command, [name], child)
+        else:
+            ran = run_tests(command, [name], env=child)
+        results, code, _, valid, _ = ran
     require(tree_identity(ROOT) == tree, "worktree changed during the isolated check")
     proof = {"version": 1, "commit": git_output(ROOT, "rev-parse", "HEAD").strip(),
              "tree": tree, "inputs": inputs, "cargo": cargo, "test": name,

@@ -16,6 +16,27 @@ For isolated live tests, `proof` supplies the three scratch/dev image defaults
 from the clean worktree's runner scripts only to the child, refuses an unreadable
 or unrecognized default, and keeps explicit caller overrides in the input digest.
 
+A test that needs the owned SQL Server resolver fixtures (`PBPS_TEST_DB`,
+`PBPS_TEST_MSSQL_SCRATCH_DB`, `PBPS_TEST_RESOLVER_MSSQL_IMAGE`) takes
+`--resolver-mssql-fixtures` on both proofs (DEC-3088.1). Do not start the
+fixtures yourself and **do not export those variables**: they would enter the
+proof's input digest, and the resume would refuse it. With the flag, `proof`
+sources the proved tree's `scripts/resolver-mssql-fixtures.sh`, as a SQL Server
+shard does, and only the test sees what it exports. It starts two SQL Servers
+and removes both when the proof ends, including a failed or interrupted one. It
+refuses a container that already has one of its names. The defaults are
+`pbps-proofs0-mssql` and `pbps-proofs0-mssql-scratch` on ports 26330 and 26332,
+which are also a default gate's first shard ports. While those are taken, set
+`PBPS_LIVE_PREFIX`, `PBPS_TEST_PORT` and `PBPS_TEST_MSSQL_SCRATCH_PORT`; none of
+these changes the digest. The flag does not start the Express fixture or any
+PostgreSQL fixture.
+
+```sh
+python3 /path/to/pr/scripts/live-shards.py proof --worktree /path/to/pr \
+  --resolver-mssql-fixtures --output /evidence/head.json --name module::property \
+  test --profile live-test -p pbps-cli --lib -- --ignored
+```
+
 For example:
 
 ```sh
@@ -99,7 +120,8 @@ repo-relative POSIX spellings from the tracked tree: no root `.`, dot or parent
 components, absolute paths, empty strings, trailing `/` or glob characters.
 Duplicate JSON fields are refused. The driver
 also protects a Rust file's same-named module directory (`mod.rs` protects its
-parent directory) and shared gate/build inputs. For an individual live test,
+parent directory) and shared gate/build inputs, the resolver fixtures script
+among them. For an individual live test,
 it checks the defining Rust function exists. Macro-generated names with no verifiable defining function
 are conservatively refused. The operator remains responsible for reviewing
 the complete external dependency scope; a file list alone cannot establish

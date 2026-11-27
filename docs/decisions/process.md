@@ -2255,3 +2255,36 @@ moves once per merged change and that every number has an archive.
 - **Not done.** No number moves, no published byte changes, and no freeze is run: #1159
   owns the reset to 1, the removal of `OLDEST_READABLE_VERSION`'s legacy path and the
   first freeze.
+
+<a id="dec-3088-1"></a>
+
+**DEC-3088.1. A proof of a fixture-backed SQL Server test starts the resolver
+fixtures itself, for the test process alone.** In a shard, `live-tests.sh`
+sources `scripts/resolver-mssql-fixtures.sh`, which exports `PBPS_TEST_DB`,
+`PBPS_TEST_MSSQL_SCRATCH_DB` and `PBPS_TEST_RESOLVER_MSSQL_IMAGE` inside the
+runner process. An isolated proof had none of them; an operator who started the
+fixtures and exported them changed the inputs digest, so `--resume` refused two
+passing proofs (#3088, seen on #3082). `proof --resolver-mssql-fixtures` records
+the caller's digest as before, then sources that script from the proved worktree
+and runs the one named test in the same shell, as DEC-2749.1 does for the image
+defaults. Ownership follows the driver's fixture rule: names and ports come from
+the shard-zero assignment with the prefix `pbps-proof`, an existing container
+refuses the proof, and both containers are removed after a pass, a failure, an
+interruption or a failed start. An inherited `NAME` is dropped, because the
+script would take it for the primary's name. A script that fails or is missing
+runs no test, and the proof records `FAILED`.
+
+*Why not leave the connection variables out of the digest.* A proof would then
+accept whatever server the caller pointed at, which no shard does: a shard
+overwrites all three. The image would also need a rule of its own, omitted when
+it equals the tree's pin and kept otherwise. The digest and the checks of
+`gate_rerun.proof` stay as they were: a caller who exports any of the three still
+gets a different digest, and the image is the one the proved tree pins. Because
+each proof now reads that script from its own tree, `--rerun-unregistered`
+counts it among the shared gate inputs: a PR that changes it cannot present a
+`master` pass from one server and a head pass from another.
+
+*Limits.* The flag covers the resolver fixtures, not the Express server that
+`live-tests.sh` starts on shard zero nor the PostgreSQL runner's fixtures. A
+proof does not repeat a runner's start-up retry (DEC-2875.1); a server that
+crashes while starting fails the proof, which can be recorded again.

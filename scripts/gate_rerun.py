@@ -167,9 +167,12 @@ def load(path, root, tree, inputs):
         # A Rust file is a module together with its same-named directory. A
         # mod.rs owns its directory; the operator adds every external fixture.
         module = source.parent if source.name == "mod.rs" else source.with_suffix("")
+        # `proof` sources the resolver fixtures from each proved tree, so a PR
+        # that edits them would compare two passes on two different servers.
         scope = [*paths, module, *(PurePosixPath(p) for p in (
                  "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo",
-                 ".github/workflows/ci.yml", "scripts/live-shards.py", "scripts/gate_rerun.py"))]
+                 ".github/workflows/ci.yml", "scripts/live-shards.py", "scripts/gate_rerun.py",
+                 "scripts/resolver-mssql-fixtures.sh"))]
         hits = [str(p) for p in changed if any(overlaps(p, s) for s in scope)]
         require(not hits, f"PR diff touches the test file, module, fixture or gate inputs: {hits}")
         evidence_dir = Path(path).resolve().parent
