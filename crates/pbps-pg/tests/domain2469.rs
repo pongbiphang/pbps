@@ -54,7 +54,8 @@ fn demanded_domain_facets_split_without_a_lexical_function_call() {
             };
             assert_eq!(changes[installed].risks, expected);
             for mode in [PlanMode::Transactional, PlanMode::Staged] {
-                let ordered = plan.clone().ordered(mode, &engine);
+                let ordered =
+                    pbps_diff::order::finish::finish_fixture(plan.clone()).ordered(mode, &engine);
                 let lowered = lower_all(
                     &ordered as &dyn pbps_diff::order::PlanView<Postgres>,
                     &engine,
@@ -77,7 +78,8 @@ fn reordered_domain_facets_preserve_complete_authored_and_emitted_definitions() 
     let mut declared = Declared::default();
     declared.advance(plan.changes());
     assert_eq!(declared.types, f.schema.types);
-    let ordered = plan.ordered(PlanMode::Transactional, &engine);
+    let ordered =
+        pbps_diff::order::finish::finish_fixture(plan).ordered(PlanMode::Transactional, &engine);
     let lowered = lower_all(
         &ordered as &dyn pbps_diff::order::PlanView<Postgres>,
         &engine,
@@ -162,8 +164,10 @@ fn empty_domain_demand_keeps_changes_proof_and_sql_bytes() {
         serde_json::to_vec(&(plain.changes(), plain.proof())).unwrap(),
         serde_json::to_vec(&(annotated.changes(), annotated.proof())).unwrap()
     );
-    let plain = plain.ordered(PlanMode::Transactional, &engine);
-    let annotated = annotated.ordered(PlanMode::Transactional, &engine);
+    let plain =
+        pbps_diff::order::finish::finish_fixture(plain).ordered(PlanMode::Transactional, &engine);
+    let annotated = pbps_diff::order::finish::finish_fixture(annotated)
+        .ordered(PlanMode::Transactional, &engine);
     let a = lower_all(&plain as &dyn pbps_diff::order::PlanView<Postgres>, &engine).unwrap();
     let b = lower_all(
         &annotated as &dyn pbps_diff::order::PlanView<Postgres>,
@@ -450,7 +454,8 @@ fn wire_round_trip_keeps_domain_statements_and_complete_definition_evidence() {
     let f = Fixture::multiple();
     let canonical = f.compile(&engine).unwrap();
     for mode in [PlanMode::Transactional, PlanMode::Staged] {
-        let ordered = canonical.clone().ordered(mode, &engine);
+        let ordered =
+            pbps_diff::order::finish::finish_fixture(canonical.clone()).ordered(mode, &engine);
         let original = lower_all(
             &ordered as &dyn pbps_diff::order::PlanView<Postgres>,
             &engine,

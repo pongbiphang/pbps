@@ -1,7 +1,7 @@
 //! `pbps` — declarative database schema version control.
 
 use crate::emission::Engine as _;
-use pbps_diff::order::PlanningPlan;
+use pbps_diff::order::{PlanningPlan, finish};
 mod adopt;
 mod artifact;
 mod baseline;
@@ -2471,15 +2471,46 @@ pub fn attach_policy_findings<S: Clone>(
     after: Side<'_>,
     baseline_revision: Option<&pbps_model::Text>,
 ) -> Vec<output::Finding> {
+    let (out, steps) = policy_findings(
+        cs,
+        project,
+        dialect,
+        connected,
+        before,
+        after,
+        baseline_revision,
+    );
+    if let Some(steps) = steps {
+        pbps_diff::order::writebacks::findings(cs, &steps);
+    }
+    out
+}
+
+/// Evaluate the same rules before either route writes findings to its plan.
+fn policy_findings(
+    cs: &pbps_model::ChangeSet,
+    project: &Project,
+    dialect: &dyn Dialect,
+    connected: bool,
+    before: Side<'_>,
+    after: Side<'_>,
+    baseline_revision: Option<&pbps_model::Text>,
+) -> (
+    Vec<output::Finding>,
+    Option<Vec<(usize, pbps_model::Finding)>>,
+) {
     let policies = project.config.policies();
     if !policies.check().is_empty() {
-        return vec![
-            output::Finding::error(
-                "policy.invalid",
-                "the `policies:` block in pbps.yml has problems; `pbps validate` lists them",
-            )
-            .at(project.config_file(), None),
-        ];
+        return (
+            vec![
+                output::Finding::error(
+                    "policy.invalid",
+                    "the `policies:` block in pbps.yml has problems; `pbps validate` lists them",
+                )
+                .at(project.config_file(), None),
+            ],
+            None,
+        );
     }
     let ctx = policy_context(project, dialect, connected);
     let mut out = Vec::new();
@@ -2499,13 +2530,16 @@ pub fn attach_policy_findings<S: Clone>(
         }) {
             Ok(bound) => bound,
             Err(errors) => {
-                return errors
-                    .into_iter()
-                    .map(|message| {
-                        output::Finding::error("consumer.invalid", message)
-                            .at(project.config_file(), None)
-                    })
-                    .collect();
+                return (
+                    errors
+                        .into_iter()
+                        .map(|message| {
+                            output::Finding::error("consumer.invalid", message)
+                                .at(project.config_file(), None)
+                        })
+                        .collect(),
+                    None,
+                );
             }
         };
     let mut findings = pbps_policy::plan(cs, &policies, &ctx);
@@ -2528,8 +2562,7 @@ pub fn attach_policy_findings<S: Clone>(
     for (_, finding) in &findings {
         out.push(policy_finding(finding));
     }
-    pbps_diff::order::writebacks::findings(cs, &findings);
-    out
+    (out, Some(findings))
 }
 
 #[cfg(test)]
@@ -5781,7 +5814,7 @@ fn cmd_plan(
             json,
             "plan.unorderable",
             dependents::schedule::schedule(
-                cs,
+                finish::standalone(cs),
                 &dependents::schedule::Declarations {
                     schema: &loaded.schema,
                     sources: dependents::Sources {
@@ -5828,6 +5861,29 @@ fn cmd_plan(
         );
         let refused = policy.iter().any(|f| f.severity == output::Severity::Error);
         findings.extend(policy);
+        let finished = output::or_unanswerable(
+            "plan",
+            json,
+            "plan.unorderable",
+            finish::offline(
+                cs,
+                finish::Inputs {
+                    before: Side {
+                        schema: &base_schema,
+                        ids: &base_ids,
+                    },
+                    after: Side {
+                        schema: &loaded.schema,
+                        ids: &res.ids,
+                    },
+                    modules: &hints.annotations.modules(&loaded.schema),
+                    captured: &Default::default(),
+                },
+                dialect.as_ref(),
+            )
+            .map_err(anyhow::Error::from),
+        )?;
+        let cs = finished.changes();
 
         // Now that the plan is known to be one this project allows. The identity
         // file is the artifact `plan` exists to maintain — it is what the MR
@@ -5857,7 +5913,7 @@ fn cmd_plan(
             print!(
                 "{}",
                 report::offline_plan(
-                    &cs,
+                    cs,
                     &pbps_model::plan_names::PlanNames::of(&cs.changes, &res.ids)?,
                     revision,
                     &base.description,
@@ -5916,9 +5972,8 @@ fn cmd_plan(
             .into());
         }
 
-        let ordered = cs
-            .clone()
-            .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref());
+        let ordered = finished.ordered(pbps_model::PlanMode::Transactional, dialect.as_ref());
+        let cs = ordered.changes();
 
         let dependencies = pbps_model::dependency::unexamined(&loaded.dependencies);
         if !json {
@@ -5940,7 +5995,7 @@ fn cmd_plan(
                     checksum: pbps_model::state_checksum(&base.schema, &base.ids),
                     database_collation: None,
                 },
-                cs.changes().clone(),
+                cs.clone(),
                 res.ids.clone(),
             );
             plan.object_deps = loaded
@@ -5972,7 +6027,7 @@ fn cmd_plan(
         // package's install script unvetted, so each refuses by name, and
         // `plan --db` plans it (DEC-2447.6).
         let unsealed = || -> anyhow::Result<()> {
-            match deploy::created_extensions(cs.changes()).next() {
+            match deploy::created_extensions(cs).next() {
                 Some(name) => bail!(
                     "{}",
                     pbps_diff::DiffError::ExtensionCreateNeedsDatabase { name: name.clone() }
@@ -6134,7 +6189,7 @@ fn cmd_plan(
                     connected_checks: Vec::new(),
                     type_routines: Vec::new(),
                     type_routine_approval: None,
-                    origins: report::origins(&cs),
+                    origins: report::origins(cs),
                     cost: None,
                     resolver_selection: None,
                     resolver_assessment: None,

@@ -17,7 +17,7 @@ async fn apply(db: &mut TestDb, f: &Fixture, pg: &Postgres, mode: PlanMode) {
     let plan = f.compile(pg).unwrap();
     let mut record = Declared::default();
     record.advance(plan.changes());
-    let ordered = plan.ordered(mode, pg);
+    let ordered = pbps_diff::order::finish::finish_fixture(plan).ordered(mode, pg);
     let mut wire = pbps_model::SavedPlan::new(
         pbps_model::PlanOrigin::Database,
         "postgres",

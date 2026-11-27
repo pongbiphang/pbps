@@ -4010,23 +4010,25 @@ mod tests {
             let ordered_check =
                 now(dialect.order_by_catalog(&mut state, &mut conn, &mut scheduled, frame))
                     .expect("order_by_catalog");
-            #[cfg(debug_assertions)]
-            if !ordered_check.verified {
-                pbps_diff::order::shadow::observe_scheduled(
-                    base_side,
-                    desired_side,
-                    &dialect,
-                    &hints.annotations.modules(&desired),
-                    &scheduled,
-                    pbps_diff::order::shadow::Stage::Final,
-                    ordered_check.facts.as_ref(),
-                    &Default::default(),
-                )
-                .expect("the scheduled plan is observed");
-            }
+            use pbps_diff::order::finish;
+            let finished = finish::connected(
+                scheduled,
+                finish::Inputs {
+                    before: base_side,
+                    after: desired_side,
+                    modules: &hints.annotations.modules(&desired),
+                    captured: &Default::default(),
+                },
+                &dialect,
+                finish::Catalog {
+                    slots: ordered_check.facts.as_ref(),
+                    verified: ordered_check.verified,
+                },
+            )
+            .expect("the scheduled plan is observed");
             assert_eq!(check.engine, "SQLite");
             assert_eq!(check.status, "passed");
-            let order: Vec<(&str, String)> = scheduled
+            let order: Vec<(&str, String)> = finished
                 .changes
                 .iter()
                 .map(|p| {
@@ -4051,7 +4053,7 @@ mod tests {
                 ]
             );
             // Lower through the real certified emitter and execute every statement on the file.
-            let certified = scheduled.ordered(pbps_model::PlanMode::Transactional, &dialect);
+            let certified = finished.ordered(pbps_model::PlanMode::Transactional, &dialect);
             let lowered = crate::emission::Engine::lower(&dialect, &certified).expect("lower");
             let c = sqlite_conn(&mut conn).expect("sqlite conn");
             for stmt in lowered.statements() {

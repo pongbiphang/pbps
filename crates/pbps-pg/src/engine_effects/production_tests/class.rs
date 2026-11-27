@@ -90,8 +90,7 @@ fn column_membership_classes_finish_or_name_the_retained_endpoint_limit() {
                         ),
                         "{label}"
                     );
-                    let ordered = done
-                        .changes
+                    let ordered = pbps_diff::order::finish::finish_fixture(done.changes)
                         .ordered(pbps_model::PlanMode::Transactional, &pg);
                     assert!(!ordered.changes().is_empty(), "{label}");
                     let operations = ordered.operations();

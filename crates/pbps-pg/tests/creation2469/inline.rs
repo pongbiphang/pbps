@@ -33,7 +33,8 @@ fn versioning_retains_its_independent_primary_key_and_period_in_create() {
         assert!(prefix.columns.contains_key("vf") && prefix.columns.contains_key("vt"));
         assert!(!prefix.columns.contains_key("x"));
         assert!(!plan.changes().changes.iter().any(|p|matches!(&p.change,Change::Constraint(ConstraintChange::SetPrimaryKey{table,..}) if table==&"app.t".parse().unwrap())));
-        let ordered = plan.ordered(PlanMode::Transactional, &engine);
+        let ordered = pbps_diff::order::finish::finish_fixture(plan)
+            .ordered(PlanMode::Transactional, &engine);
         lower_all(
             &ordered as &dyn pbps_diff::order::PlanView<pbps_mssql::Mssql>,
             &engine,

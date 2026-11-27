@@ -1,6 +1,7 @@
 //! Paired binding shares the unsealed code-goal lifecycle (DEC-2354.1).
 use super::{Provenance, Standard, domain};
 use pbps_db::Conn;
+use pbps_diff::order::finish;
 use pbps_model::{Hints, IdsFile, PlanMode, RetainedExpression, Schema};
 
 pub(super) struct Comparison<'a> {
@@ -48,8 +49,8 @@ impl Comparison<'_> {
         }) {
             return Ok(Vec::new());
         }
-        let ordered = pbps_diff::order::deployment::schedule::schedule(
-            changes,
+        let scheduled = pbps_diff::order::deployment::schedule::schedule(
+            finish::standalone(changes),
             &pbps_diff::order::deployment::schedule::Declarations {
                 schema: &new,
                 sources: pbps_diff::order::deployment::Sources {
@@ -61,8 +62,18 @@ impl Comparison<'_> {
             &Default::default(),
             &pg,
         )
+        .map_err(|e| e.to_string())?;
+        let ordered = finish::offline(
+            scheduled.changes,
+            finish::Inputs {
+                before,
+                after,
+                modules: &self.hints.annotations.modules(&new),
+                captured: &Default::default(),
+            },
+            &pg,
+        )
         .map_err(|e| e.to_string())?
-        .changes
         .ordered(PlanMode::Transactional, &pg);
         let lowered = pbps_dialect::lower::lower_all(
             &ordered as &dyn pbps_diff::order::PlanView<pbps_pg::Postgres>,

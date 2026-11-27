@@ -41,7 +41,8 @@ async fn checked_generation_edges_use_complete_catalog_collation_facts() {
                 .await
                 .is_err()
         );
-        let ordered = plan.ordered(pbps_model::PlanMode::Transactional, &engine);
+        let ordered = pbps_diff::order::finish::finish_fixture(plan)
+            .ordered(pbps_model::PlanMode::Transactional, &engine);
         let lowered = pbps_dialect::lower::lower_all(
             &ordered as &dyn order::PlanView<pbps_mssql::Mssql>,
             &engine,

@@ -7,7 +7,8 @@ use pbps_model::{PlanMode, object_ref::ObjectDeps};
 type Engine = Postgres;
 
 async fn execute(db: &mut TestDb, plan: pbps_diff::order::CanonicalPlan<Engine>, engine: &Engine) {
-    let ordered = plan.ordered(PlanMode::Transactional, engine);
+    let ordered =
+        pbps_diff::order::finish::finish_fixture(plan).ordered(PlanMode::Transactional, engine);
     let lowered = lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, engine).unwrap();
     for statement in &lowered {
         db.conn.execute(&statement.sql).await.unwrap();
@@ -414,7 +415,8 @@ async fn prefix_facets_precede_the_function_and_later_column_in_native_order() {
         let plan = f.compile(&engine).unwrap();
         let (part, function, column) = prefix_fixture::positions(plan.changes(), facet);
         assert!(part < function && function < column, "{facet}");
-        let ordered = plan.ordered(PlanMode::Transactional, &engine);
+        let ordered = pbps_diff::order::finish::finish_fixture(plan)
+            .ordered(PlanMode::Transactional, &engine);
         let lowered =
             lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, &engine).unwrap();
         for (at, group) in lowered.groups().iter().enumerate() {
@@ -526,7 +528,8 @@ async fn required_inline_groups_preserve_create_options_and_late_columns() {
             )
         })
         .unwrap();
-    let ordered = plan.ordered(PlanMode::Transactional, &engine);
+    let ordered =
+        pbps_diff::order::finish::finish_fixture(plan).ordered(PlanMode::Transactional, &engine);
     let lowered = lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, &engine).unwrap();
     for (at, group) in lowered.groups().iter().enumerate() {
         for statement in group.statements() {

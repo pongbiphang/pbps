@@ -140,8 +140,7 @@ fn dependent_meetings_keep_the_complete_canonical_changes_order_and_spellings() 
                     );
                     match done {
                         Ok(done) => {
-                            let ordered = done
-                                .changes
+                            let ordered = pbps_diff::order::finish::finish_fixture(done.changes)
                                 .ordered(pbps_model::PlanMode::Transactional, &pg);
                             let steps: Vec<String> = ordered
                                 .changes()

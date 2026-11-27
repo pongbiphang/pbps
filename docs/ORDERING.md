@@ -106,8 +106,8 @@ the existing settlements or change their order (DEC-1959.5, DEC-1959.6).
    points, without a constraint union. Only order applies their proposals.
    Compatibility chains preserve old peer order solely for byte-identical
    output (DEC-1959.1, DEC-1959.3, DEC-1959.4).
-5. **Lowering.** The completed canonical route produces `OrderedPlan<D>` for
-   its original engine. Lowering consumes certified input and returns an
+5. **Lowering.** Each route ends at `order::finish` before it can produce
+   `OrderedPlan<D>` for its original engine. Lowering consumes certified input and returns an
    immutable `LoweredPlan` branded by the concrete emitter. Each operation's
    statements form an indivisible group in emitter order, with source IDs and
    execution/name metadata. Scratch first settles its opaque SQL-free
@@ -128,8 +128,8 @@ The canonical declaration/catalog entry point is
 `order::deployment::schedule::schedule`.
 CLI adapters supply observed facts and preserve re-diff/probe timing. A fact
 not read is distinct from a fact read and empty: unavailable stages report
-their skip. Resolver, connected catalog continuations and the shared route
-finish inside order. Some historical helper names and scoped compatibility
+their skip. Resolver answers remain intermediate. Standalone plans finish
+after the shared schedule and connected plans finish after catalog ordering. Some historical helper names and scoped compatibility
 predicates remain; a name is not a separate list-reordering authority.
 Bounded namespace search still proposes `Search` edges, and the PostgreSQL
 engine-generated-name trial remains scratch reconstruction rather than a

@@ -165,10 +165,13 @@ impl PlanningInput {
 /// Arbitrary logical additions restart an unqualified draft through PlanningInput.
 /// Scope additions still need the shared stages; they cannot directly finalize.
 /// ```compile_fail
-/// fn skip_stages(plan: pbps_diff::order::CanonicalPlan<pbps_dialect::MinimalDialect>) {
+/// use pbps_diff::order::{CanonicalPlan, finish};
+/// use pbps_dialect::MinimalDialect;
+/// fn skip_stages(plan: CanonicalPlan<MinimalDialect>, inputs: finish::Inputs<'_>) {
 ///     let scope = pbps_diff::order::writebacks::ScopeInput::new(vec![]).unwrap();
 ///     let pending = scope.append_to(plan, &pbps_dialect::MinimalDialect);
-///     let _ = pending.ordered(pbps_model::PlanMode::Transactional, &pbps_dialect::MinimalDialect);
+///     let _ = finish::connected(pending, inputs, &MinimalDialect,
+///         finish::Catalog { slots: None, verified: false });
 /// }
 /// ```
 #[derive(Debug, Clone)]

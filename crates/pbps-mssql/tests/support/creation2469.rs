@@ -8,7 +8,8 @@ use pbps_model::{Change, PlanMode, object_ref::ObjectDeps};
 type Engine = Mssql;
 
 async fn execute(db: &mut TestDb, plan: pbps_diff::order::CanonicalPlan<Engine>, engine: &Engine) {
-    let ordered = plan.ordered(PlanMode::Transactional, engine);
+    let ordered =
+        pbps_diff::order::finish::finish_fixture(plan).ordered(PlanMode::Transactional, engine);
     let lowered = lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, engine).unwrap();
     for statement in &lowered {
         db.conn.execute(&statement.sql).await.unwrap();
@@ -31,7 +32,8 @@ async fn demanded_computed_columns_and_not_null_wait_for_the_function() {
             .iter()
             .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
             .unwrap();
-        let ordered = plan.ordered(PlanMode::Transactional, &engine);
+        let ordered = pbps_diff::order::finish::finish_fixture(plan)
+            .ordered(PlanMode::Transactional, &engine);
         let lowered =
             lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, &engine).unwrap();
         for (at, group) in lowered.groups().iter().enumerate() {
@@ -334,7 +336,8 @@ async fn prefix_facets_precede_the_function_and_later_column_in_native_order() {
         let plan = f.compile(&engine).unwrap();
         let (part, function, column) = prefix_fixture::positions(plan.changes(), facet);
         assert!(part < function && function < column, "{facet}");
-        let ordered = plan.ordered(PlanMode::Transactional, &engine);
+        let ordered = pbps_diff::order::finish::finish_fixture(plan)
+            .ordered(PlanMode::Transactional, &engine);
         let lowered =
             lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, &engine).unwrap();
         for (at, group) in lowered.groups().iter().enumerate() {
@@ -411,7 +414,8 @@ async fn required_inline_groups_preserve_create_options_and_late_columns() {
             .iter()
             .position(|p| matches!(p.change, Change::Module(ModuleChange::CreateModule { .. })))
             .unwrap();
-        let ordered = plan.ordered(PlanMode::Transactional, &engine);
+        let ordered = pbps_diff::order::finish::finish_fixture(plan)
+            .ordered(PlanMode::Transactional, &engine);
         let lowered =
             lower_all(&ordered as &dyn pbps_diff::order::PlanView<Engine>, &engine).unwrap();
         for (at, group) in lowered.groups().iter().enumerate() {
@@ -513,7 +517,8 @@ async fn native_nullability_blockers(engine: &Mssql) {
         db.conn.execute("CREATE SCHEMA app").await.unwrap();
         db.conn.execute("BEGIN TRANSACTION").await.unwrap();
         let changes = plan.changes().clone();
-        let ordered = plan.ordered(PlanMode::Transactional, engine);
+        let ordered =
+            pbps_diff::order::finish::finish_fixture(plan).ordered(PlanMode::Transactional, engine);
         let lowered =
             lower_all(&ordered as &dyn pbps_diff::order::PlanView<Mssql>, engine).unwrap();
         assert_eq!(changes.changes.len(), lowered.groups().len());
