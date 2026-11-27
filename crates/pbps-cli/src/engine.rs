@@ -3323,7 +3323,7 @@ mod tests {
         ));
         let rendered = ledger_safe_reason(&wrapped);
 
-        for driver in [Driver::Postgres, Driver::Mssql] {
+        for driver in [Driver::Postgres, Driver::Mssql, Driver::Sqlite] {
             let cut = truncate_reason(driver, &rendered);
             assert!(
                 cut.contains("22P02"),
@@ -3450,7 +3450,7 @@ mod tests {
                     1
                 );
                 assert!(!rendered.contains("undeclared-secret-488"), "{rendered}");
-                for driver in [Driver::Postgres, Driver::Mssql] {
+                for driver in [Driver::Postgres, Driver::Mssql, Driver::Sqlite] {
                     let cut = truncate_reason(driver, &rendered);
                     assert!(cut.contains(code.unwrap_or("no code")), "{cut}");
                     assert!(cut.contains("public.c"), "{cut}");

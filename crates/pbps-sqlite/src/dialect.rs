@@ -89,7 +89,26 @@ impl Dialect for Sqlite {
     /// layout may separate two bodies that compare equal (the shared scanner
     /// nests block comments, so it would read some of the text as one).
     fn normalize_definition(&self, definition: &str) -> String {
-        lexis::layout(definition)
+        // Of what SQLite keeps (`lexis::kept`): a body declared with its `;`
+        // is the body SQLite stores without it, for the differ as for the
+        // read-back below.
+        lexis::layout(lexis::kept(definition))
+    }
+
+    /// What the plan wrote against what is read back, in the comparison form
+    /// and not byte for byte: SQLite keeps the statement's text, which ends
+    /// where the statement does, so a body declared with a closing line
+    /// ending (`definition: |`) or its `;` reads back without it. Exact
+    /// equality refused every such view as changed by someone else.
+    fn module_matches_declaration(
+        &self,
+        wrote: &pbps_model::Module,
+        now: &pbps_model::Module,
+    ) -> bool {
+        wrote.kind == now.kind
+            && wrote.options == now.options
+            && self.normalize_definition(&wrote.definition)
+                == self.normalize_definition(&now.definition)
     }
 
     fn qualified_calls(&self, _text: &str) -> Vec<(String, String)> {
@@ -617,6 +636,44 @@ mod tests {
 
     /// The trait's two refusals the dialect crate must answer for itself: a
     /// role (the default would accept it) and every module kind but a view.
+    #[test]
+    fn a_view_read_back_matches_what_was_written_up_to_layout_only() {
+        let d = Sqlite::default();
+        let view = |definition: &str| Module {
+            kind: ModuleKind::View,
+            description: None,
+            options: ModuleOptions::default(),
+            definition: definition.into(),
+        };
+        // A block scalar's closing line ending is not kept by SQLite.
+        assert!(d.module_matches_declaration(
+            &view("SELECT id\n  FROM app\n"),
+            &view("SELECT id\n  FROM app")
+        ));
+        // Nor is the statement's terminator, or a comment after it.
+        assert!(d.module_matches_declaration(
+            &view("SELECT id FROM app;\n"),
+            &view("SELECT id FROM app")
+        ));
+        assert!(d.module_matches_declaration(
+            &view("SELECT id FROM app ; -- done\n"),
+            &view("SELECT id FROM app")
+        ));
+        assert_eq!(
+            d.normalize_definition("SELECT id FROM app;"),
+            d.normalize_definition("SELECT id FROM app")
+        );
+        // Negative: another body, or text inside a string, is not layout.
+        assert!(!d.module_matches_declaration(
+            &view("SELECT id FROM app\n"),
+            &view("SELECT name FROM app")
+        ));
+        assert!(!d.module_matches_declaration(
+            &view("SELECT 'a  b' FROM app"),
+            &view("SELECT 'a b' FROM app")
+        ));
+    }
+
     #[test]
     fn the_defaults_that_would_accept_are_overridden() {
         let d = Sqlite::default();

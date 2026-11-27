@@ -76,8 +76,8 @@ pub enum ConfigError {
     InvalidResolverName,
 
     #[error(
-        "environment `{name}` reads its connection string from ${var}, which is not set.\n\
-         Export it, or pass the connection string directly with --db."
+        "environment `{name}` reads its database target from ${var}, which is not set.\n\
+         Export it, or pass it directly with --db."
     )]
     MissingConnection { name: String, var: String },
 
@@ -124,13 +124,18 @@ pub enum ConfigError {
 pub enum DialectName {
     Mssql,
     Postgres,
+    Sqlite,
 }
 
 impl DialectName {
+    /// Every selectable dialect, in canonical order.
+    pub const ALL: &'static [Self] = &[Self::Mssql, Self::Postgres, Self::Sqlite];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             DialectName::Mssql => "mssql",
             DialectName::Postgres => "postgres",
+            DialectName::Sqlite => "sqlite",
         }
     }
 }
@@ -180,8 +185,8 @@ pub enum Unmanaged {
 )]
 #[serde(deny_unknown_fields)]
 pub struct Environment {
-    /// The name of the environment variable holding the ADO.NET connection
-    /// string, e.g. `PROD_CONN`.
+    /// The name of the environment variable holding the connection string
+    /// (SQL Server / PostgreSQL) or SQLite database file path, e.g. `PROD_CONN`.
     pub url_env: String,
 
     /// Shown by `pbps status`, for humans reading a list of environments.
@@ -1181,5 +1186,29 @@ mod type_routine_tests {
                 .pin_type_routines
         );
         assert!(parse("pin_type_routines: 7\n").is_err());
+    }
+
+    #[test]
+    fn dialect_name_all_matches_schema_enum_and_round_trips() {
+        let schema = serde_json::to_value(schemars::schema_for!(DialectName)).unwrap();
+        let schema_values: Vec<&str> = schema["enum"]
+            .as_array()
+            .expect("DialectName schema has an enum array")
+            .iter()
+            .map(|v| v.as_str().expect("dialect enum value is string"))
+            .collect();
+        let listed: Vec<&str> = DialectName::ALL.iter().map(|d| d.as_str()).collect();
+        assert_eq!(listed, schema_values);
+        for &dialect in DialectName::ALL {
+            let parsed = Config::parse(
+                &format!("dialect: {}\n", dialect.as_str()),
+                Path::new("pbps.yml"),
+            )
+            .unwrap();
+            assert_eq!(parsed.dialect, dialect);
+            assert_eq!(dialect.to_string(), dialect.as_str());
+        }
+        // Negative: an unknown dialect is refused.
+        assert!(Config::parse("dialect: oracle\n", Path::new("pbps.yml")).is_err());
     }
 }

@@ -3055,7 +3055,7 @@ mod consumer_contract_tests {
                     },
                 ];
                 let bound = Bindings::resolve(&consumers, &sides, &Clone::clone).unwrap();
-                for engine in [DialectName::Mssql, DialectName::Postgres] {
+                for &engine in DialectName::ALL {
                     let dialect = dialect_for(engine);
                     let compare = pbps_diff::schema_diff::restoration_comparison(
                         pbps_diff::Side {
@@ -3235,7 +3235,7 @@ mod consumer_contract_tests {
                 },
             ];
             let bound = Bindings::resolve(&consumers, &sides, &Clone::clone).unwrap();
-            for engine in [DialectName::Mssql, DialectName::Postgres] {
+            for &engine in DialectName::ALL {
                 let dialect = dialect_for(engine);
                 let compare = pbps_diff::schema_diff::restoration_comparison(
                     pbps_diff::Side {
@@ -3309,7 +3309,7 @@ mod consumer_contract_tests {
             only: None,
             deprecated_types: &[],
         };
-        for engine in [DialectName::Mssql, DialectName::Postgres] {
+        for &engine in DialectName::ALL {
             let dialect = dialect_for(engine);
             for (case, restored, compatible) in [
                 (
@@ -3428,6 +3428,9 @@ pub(crate) fn dialect_for(name: DialectName) -> emission::SelectedDialect {
     match name {
         DialectName::Mssql => emission::SelectedDialect::Mssql(pbps_mssql::Mssql),
         DialectName::Postgres => emission::SelectedDialect::Postgres(pbps_pg::Postgres::new()),
+        DialectName::Sqlite => {
+            emission::SelectedDialect::Sqlite(pbps_sqlite::dialect::Sqlite::default())
+        }
     }
 }
 
@@ -6807,7 +6810,7 @@ mod tests {
         )
         .unwrap();
         let config = stage.path().join("pbps.yml");
-        for engine in ["postgres", "mssql"] {
+        for engine in DialectName::ALL.iter().map(|d| d.as_str()) {
             std::fs::write(&config, format!("dialect: {engine}\n")).unwrap();
             let project = Project::load(&config).unwrap();
             let dialect = dialect(&project).unwrap();
@@ -7431,7 +7434,7 @@ mod tests {
             SavedPlan, Uid, UidKind,
         };
 
-        for name in [DialectName::Postgres, DialectName::Mssql] {
+        for &name in DialectName::ALL {
             let dialect = dialect_for(name);
             for default in [Some("zz.null\u{301}x()"), None, Some("NULL")] {
                 let mut column = Column::new("integer".parse().unwrap()).not_null();
@@ -7671,7 +7674,7 @@ mod tests {
         use pbps_model::{
             Change, ChangeSet, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, SavedPlan, Table,
         };
-        for engine in [DialectName::Postgres, DialectName::Mssql] {
+        for &engine in DialectName::ALL {
             let dialect = dialect_for(engine);
             for kind in 0..3 {
                 for security in 0..4 {

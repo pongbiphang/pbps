@@ -1,9 +1,9 @@
 # PongBiphang Schema (`pbps`) — design specification
 
-> Status: living specification; Phases 0-5 are built, supporting SQL Server and PostgreSQL
+> Status: living specification; Phases 0-5 are built, supporting SQL Server, PostgreSQL and SQLite
 > Language: Rust
 > Position: declarative database schema version control and deployment
-> Supported dialects: SQL Server and PostgreSQL (16 or later: the lowest release CI qualifies; an older server is refused by name when the connection opens, DEC-2151.1)
+> Supported dialects: SQL Server, PostgreSQL (16 or later: the lowest release CI qualifies; an older server is refused by name when the connection opens, DEC-2151.1) and SQLite (bundled library via `rusqlite`, fixed compatibility floor `3.35.0`, tables in `main` and views)
 > Partially delivered: engine-assisted planning — PostgreSQL planning with the resolver, its sealed evidence, its offline `explain` and its transactional apply (#616) are built, and SQL Server planning, sealing and apply (#2141–#2144); staged resolved apply and the cross-engine acceptance matrix (#621) are planned (§9.3.2; ADR-0016)
 > Partially delivered: resolver environment discovery — read-only `doctor` discovery, resolver selection, the Docker and server scratch runs and compatibility qualification are built; the remaining stages are planned (§9.3.3; [delivery tracking](RESOLVER-DELIVERY.md))
 
@@ -81,8 +81,8 @@ Identity remains the uid recorded in git; [ADR-0018](ADR-0018-catalog-identity-e
   is declarable through an explicit `data:` block, designed in
   [ADR-0004](ADR-0004-reference-data.md) and targeted at Phase 4.
 - **No cross-dialect abstract type system.** One schema is bound to one dialect.
-  "Supports multiple databases" means the tool can drive MSSQL and PostgreSQL, not
-  that one set of files deploys to both.
+  "Supports multiple databases" means the tool can drive SQL Server, PostgreSQL
+  and SQLite, not that one set of files deploys to more than one.
 - **History is not replayed.** A declarative tool has no migration history to
   re-run; DR and new-environment rebuilds go through `pbps bootstrap`, which
   generates the complete schema in one shot — faster and more reliable than
@@ -137,10 +137,20 @@ passing and no environment-mapping strategy.
 
 ```yaml
 # pbps.yml
-dialect: mssql
+dialect: mssql   # mssql | postgres | sqlite
 schema_dir: schema/
 ids_dir: .pbps/ids
 ```
+
+`dialect` selects the engine for the project (`mssql`, `postgres`, or `sqlite`).
+Each environment in `environments:` names its target through `url_env:`, the
+name of an environment variable holding a connection string (SQL Server and
+PostgreSQL) or a database file path (SQLite). There is no separate path key in
+`pbps.yml`. A relative SQLite path — whether from `--db` or from `url_env:` — is
+resolved relative to the process's current working directory. `pbps` opens an
+existing SQLite file only and refuses a missing path without creating one; only
+`pbps bootstrap --create` creates a new file. SQLite's compatibility floor is
+fixed (`3.35.0`, DEC-2950.4) with no configuration key.
 
 `schema_dir` is a subdirectory of the project, never the project root itself
 and never a directory above it. Every `.yml` beneath it is read as a
@@ -3019,7 +3029,7 @@ full state.
 | `pbps snapshot` | Query the database and write a new `__pbps_state` |
 | `pbps baseline --reason ...` | Reset the state baseline; operator provenance follows §8.1 |
 | `pbps test`, `pbps test --cleanup` | Test fixtures and a candidate in owned scratch on either engine, or reconcile owned leftovers (§9.9) |
-| `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments) |
+| `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments). On SQLite, `--create` creates the database file if it does not exist yet; every other command and `bootstrap` without `--create` open an existing file only, and server engines refuse `--create` by name |
 | `pbps state list` | This environment's history, newest first |
 | `pbps state record-data-work` | Record self-reported external work after a retained successful expand apply; never execute it |
 | `pbps state show <id>` | Read an entry's full schema snapshot and metadata; `--format json` uses the findings envelope |
@@ -3030,7 +3040,10 @@ full state.
 | `pbps resolver externals` | Draft a resolver's externals file from the target, for review: printed, or written to a new `--out` file; `--schema <name>` adds a schema's unmanaged objects (see 9.3.2, DEC-1778.1) |
 
 A target connection string names one endpoint (DECISIONS 229), and the
-connection must reach one database cluster for its whole life. A command spans
+connection must reach one database cluster for its whole life. For SQLite, the
+target passed to `--db` or read from `url_env:` is the database file's path
+(relative paths resolve against the current working directory; empty strings,
+`:memory:` and `file:` URIs are refused by name). A command spans
 several transactions on it, an apply included, even though an apply's
 statements and its ledger row share one. A proxy that hands those
 transactions to different clusters is unsupported, and ruling one out is the
@@ -3213,6 +3226,20 @@ It is on by default. `rehearse: false` under an environment and
 `plan --no-rehearse` turn it off, and the plan is sealed `off`, never as
 rehearsed. With no entry selected the plan carries no record. `apply` only
 displays the record and never acquires a scratch.
+
+#### The connected rehearsal (SQLite)
+
+On SQLite, `plan --db/--env` rehearses by default in process with no resolver
+entry to configure (DEC-2950.16, DEC-2950.20): it copies the target file's pages
+into an in-memory SQLite database (bounded in size), runs the plan's statements
+on the copy, compares the resulting schema with the declarations, and checks
+that views, column defaults, triggers and foreign keys still resolve. Because
+the copy holds the live pages, data-dependent constraint checks and guarded drop
+requirements are exercised during planning too. A passing run seals an
+in-process rehearsal record carrying the SQLite library version (shown by
+`explain --format json`); `rehearse: false` and `plan --no-rehearse` turn it off
+and seal `off`. Server-only planning options (`--resolve-with`, `resolve_with:`,
+`--dev`, `--assert`) are refused by name on SQLite.
 
 What it does not reproduce, stated rather than implied:
 
@@ -4934,6 +4961,8 @@ pbps/
                     dependency queries
     pbps-pg/        PostgreSQL: type normalization, SQL generation, introspection,
                     dependency queries, probes and cost estimates
+    pbps-sqlite/    SQLite: type normalization, SQL generation, introspection,
+                    state ledger, in-process rehearsal and preflight
     pbps-db/        Connection abstraction, __pbps_state access, locking
     pbps-docs/      Documentation and ERD rendering (9.4); pure, no dialect
     pbps-cli/       clap, interactive prompts, diagnostic output
@@ -4979,6 +5008,7 @@ database is work with clearly drawn boundaries.
 |---|---|---|
 | SQL Server | `tiberius` 0.13.0 | Rust-native with rustls and aws-lc-rs; **no database driver to install** — one static binary for air-gapped environments. See open question 10 |
 | PostgreSQL | `tokio-postgres` plus `tokio-postgres-rustls` | Pure Rust driver with rustls TLS; no PostgreSQL client library to install (ADR-0014) |
+| SQLite | `rusqlite` (`bundled`, default features off) | Statically linked SQLite C source pinned in the workspace; no system SQLite library required (DEC-2950.1) |
 | Async | `tokio` plus `tokio-util` (tiberius compat) | |
 | CLI | `clap` (derive) | |
 | Diagnostics | `miette` | Errors with source spans; the heart of the Phase 1 product experience |
@@ -4998,8 +5028,8 @@ layer — ODBC, ADBC — is a separate question with its own answer; see
 
 A single static binary. Windows runners use `x86_64-pc-windows-msvc`; Linux
 runners use `x86_64-unknown-linux-musl` for a fully static file. The same binary
-includes both SQL Server (`tiberius`) and PostgreSQL (`tokio-postgres`)
-support with rustls TLS. Neither engine requires an installed ODBC driver or
+includes SQL Server (`tiberius`), PostgreSQL (`tokio-postgres`) with rustls TLS,
+and bundled SQLite (`rusqlite`). No engine requires an installed ODBC driver or
 database client library on the target host; the distribution goal remains
 "copy one file and run it" on an air-gapped host.
 

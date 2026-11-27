@@ -247,6 +247,31 @@ pub fn is_one_expression(text: &str) -> bool {
     groups.is_empty()
 }
 
+/// The part of a view's body SQLite keeps in its schema table: the text up to
+/// the statement's `;`, without the white space and `;` it ends with. Measured
+/// on the library: `SELECT 1;`, `SELECT 1 ;` and `SELECT 1; -- note` are all
+/// kept as `SELECT 1`, a comment before the terminator is kept, and a `;`
+/// inside a string is not a terminator.
+#[must_use]
+pub fn kept(text: &str) -> &str {
+    let mut end = text.len();
+    let mut at = 0;
+    for piece in pieces(text) {
+        let run = match piece {
+            Piece::Code(run) => {
+                if let Some(semicolon) = run.find(';') {
+                    end = at + semicolon;
+                    break;
+                }
+                run
+            }
+            Piece::Quoted(run) | Piece::Comment(run) => run,
+        };
+        at += run.len();
+    }
+    text[..end].trim_end_matches(|c: char| is_space(c) || c == ';')
+}
+
 /// Whether anything but `;` and layout follows the first `;` in code, which
 /// is a second statement SQLite would run.
 #[must_use]
@@ -772,6 +797,24 @@ mod tests {
 
     /// A block comment ends at its first `*/`: the rest is code, whose layout
     /// is layout and whose strings are data.
+    #[test]
+    fn kept_is_the_body_without_its_terminator_and_what_follows_it() {
+        for (body, stored) in [
+            ("SELECT 1;", "SELECT 1"),
+            ("SELECT 1 ;\n", "SELECT 1"),
+            ("SELECT 1 -- note\n", "SELECT 1 -- note"),
+            ("SELECT 1; -- note\n", "SELECT 1"),
+            ("SELECT 1 /* c */ ;", "SELECT 1 /* c */"),
+            ("SELECT 1 -- a;\n", "SELECT 1 -- a"),
+            ("SELECT 1\n", "SELECT 1"),
+        ] {
+            assert_eq!(kept(body), stored, "{body:?}");
+        }
+        // Negative: a `;` in a string or a quoted name is not a terminator.
+        assert_eq!(kept("SELECT ';'"), "SELECT ';'");
+        assert_eq!(kept("SELECT \"a;b\" FROM t"), "SELECT \"a;b\" FROM t");
+    }
+
     #[test]
     fn layout_reads_block_comments_as_the_engine_does_which_is_not_nested() {
         let body = "SELECT 1 /* a /* b */   +   '  x  '";

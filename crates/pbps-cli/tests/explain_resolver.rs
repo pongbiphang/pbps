@@ -1862,6 +1862,7 @@ fn an_in_process_rehearsal_is_explained_in_text_and_json_and_empty_library_is_re
         serde_json::json!({
             "outcome": "converged",
             "scratch": "in-process",
+            "library": "SQLite 3.54.1",
         })
     );
 

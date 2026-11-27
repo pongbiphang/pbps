@@ -127,7 +127,7 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
         println!(
             "No environments are configured. Add them to pbps.yml:\n\n\
              environments:\n  prod:\n    url_env: PROD_CONN\n\n\
-             The variable name goes in the file, never the connection string."
+             The variable name goes in the file, never the connection string or database path."
         );
         return Ok(());
     }

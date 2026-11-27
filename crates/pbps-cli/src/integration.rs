@@ -1910,8 +1910,9 @@ mod tests {
     fn the_config_schema_knows_the_dialects_and_the_required_key() {
         let v = schema(SchemaKind::Config);
         let text = serde_json::to_string(&v).unwrap();
-        assert!(text.contains("mssql"), "{text}");
-        assert!(text.contains("postgres"), "{text}");
+        for dialect in pbps_config::DialectName::ALL {
+            assert!(text.contains(dialect.as_str()), "{dialect}: {text}");
+        }
         // `dialect` is the one key with no default; a schema that made it
         // optional would let an editor bless a file the loader rejects.
         assert_eq!(v["required"], serde_json::json!(["dialect"]), "{v}");

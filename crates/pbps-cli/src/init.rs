@@ -16,12 +16,48 @@ use pbps_model::{IdsFile, Schema};
 
 use crate::{context, db, paths::absolute};
 
+/// Parses `--dialect` from [`DialectName::ALL`] so adding a fourth engine
+/// cannot leave `init` accepting a stale hard-coded list.
+#[derive(Clone, Debug)]
+struct DialectParser;
+
+impl clap::builder::TypedValueParser for DialectParser {
+    type Value = DialectName;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        // clap refuses a name outside the list, with its own message; the
+        // lookup after it cannot miss, and says so without a panic if it does.
+        let raw = clap::builder::PossibleValuesParser::new(
+            DialectName::ALL.iter().map(|dialect| dialect.as_str()),
+        )
+        .parse_ref(cmd, arg, value)?;
+        DialectName::ALL
+            .iter()
+            .copied()
+            .find(|dialect| dialect.as_str() == raw)
+            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidValue).with_cmd(cmd))
+    }
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        Some(Box::new(DialectName::ALL.iter().map(|dialect| {
+            clap::builder::PossibleValue::new(dialect.as_str())
+        })))
+    }
+}
+
 /// Arguments for `pbps init`.
 #[derive(Debug, Args)]
 pub struct InitArgs {
     /// Database dialect for the new project
-    #[arg(long, default_value = "mssql", value_parser = ["mssql", "postgres"])]
-    dialect: String,
+    #[arg(long, default_value = DialectName::Mssql.as_str(), value_parser = DialectParser)]
+    dialect: DialectName,
 
     /// Add this named environment to pbps.yml
     #[arg(long, conflicts_with = "from")]
@@ -31,7 +67,7 @@ pub struct InitArgs {
     #[arg(long, value_name = "ENVIRONMENT")]
     from: Option<String>,
 
-    /// Environment variable holding the connection string (defaults to <ENV>_CONN)
+    /// Environment variable holding the connection string or SQLite database path (defaults to <ENV>_CONN)
     #[arg(long, value_name = "VARIABLE")]
     url_env: Option<String>,
 }
@@ -99,14 +135,7 @@ struct Prepared {
 /// Creates a project at `root` without requiring one to exist already.
 pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
     let root = absolute(root)?;
-    let dialect = match args.dialect.as_str() {
-        "mssql" => DialectName::Mssql,
-        "postgres" => DialectName::Postgres,
-        // clap's value parser prevents this, but keeping the match exhaustive
-        // at the boundary makes a future third value an intentional
-        // implementation.
-        other => bail!("unsupported dialect `{other}`"),
-    };
+    let dialect = args.dialect;
 
     let environment = args.from.as_ref().or(args.env.as_ref());
     if args.url_env.is_some() && environment.is_none() {
@@ -1145,5 +1174,26 @@ mod tests {
             "the refusal removes nothing"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn init_dialect_parser_tracks_every_dialect_name_and_refuses_unknown() {
+        use clap::Parser as _;
+        #[derive(Debug, clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            init: InitArgs,
+        }
+        for &dialect in DialectName::ALL {
+            let parsed = Wrap::try_parse_from(["pbps", "--dialect", dialect.as_str()]).unwrap();
+            assert_eq!(parsed.init.dialect, dialect);
+        }
+        // Negative: an unknown dialect is refused and every valid one is named.
+        let err = Wrap::try_parse_from(["pbps", "--dialect", "oracle"])
+            .unwrap_err()
+            .to_string();
+        for dialect in DialectName::ALL {
+            assert!(err.contains(dialect.as_str()), "{dialect}: {err}");
+        }
     }
 }

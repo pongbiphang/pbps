@@ -60,14 +60,20 @@ RLS partition trees and reference data beside RLS remain refused.
 
 Referenced PostgreSQL types use potential-path eligibility and opt-in reviewed routine source pins (DEC-2181.1–3).
 
-**Phases 0-5 complete** (0, 1, 2, 3, 3.1, 3.5, 4 and 5), with SQL Server
-and PostgreSQL supported through the CLI. SQL Server uses `tiberius` 0.13.0
+**Phases 0-5 complete** (0, 1, 2, 3, 3.1, 3.5, 4 and 5), with SQL Server,
+PostgreSQL and SQLite supported through the CLI. SQL Server uses `tiberius` 0.13.0
 with rustls and aws-lc-rs; PostgreSQL's rustls configuration selects the same
-provider. The test and clippy bar is in AGENTS.md's "Local checks"; counts
+provider; SQLite is statically linked through bundled `rusqlite` (DEC-2950.1).
+The test and clippy bar is in AGENTS.md's "Local checks"; counts
 change too often to record here. PostgreSQL is supported from 16, the lowest
 release CI qualifies; an older server is refused by name when the connection
-opens (#2151, DEC-2151.1), and 15 is #2152. The copy-pastable pipelines SPEC 14.1 lists
-as P1 are in [CI.md](CI.md).
+opens (#2151, DEC-2151.1), and 15 is #2152. SQLite (`dialect: sqlite`) manages
+tables in `main` and views, opens existing files only unless `bootstrap --create`
+is passed, resolves relative paths against the current working directory through
+`--db` or `url_env:`, rehearses connected plans in process by default (DEC-2950.16,
+DEC-2950.20), and refuses server-only commands, table-rebuild changes and unbuilt
+object kinds by name; its compatibility floor is fixed at `3.35.0` (DEC-2950.4).
+The copy-pastable pipelines SPEC 14.1 lists as P1 are in [CI.md](CI.md).
 
 First-run: `init` (`--env` / `--from` / `--url-env`), with staged validation
 and pbps.yml installed last so a failed onboarding run leaves no partial project.
@@ -224,11 +230,11 @@ still has it and says to run `pbps ids migrate`, and only history (`--since`,
 `pbps test` revisions) still reads it. The layout, its `ids.*` validator codes
 and the sync `plan` performs are DEC-2600.1 and DEC-2600.6 to DEC-2600.10.
 
-Connected (each takes `--db <connection string>` or `--env <name>`): `pull`
-(`--force` / `--data` / `--partitions-external`), `plan --db` (`--staged` / `--resolve-with` / `--assert`), `apply` (`--plan` /
+Connected (each takes `--db <connection string or SQLite path>` or `--env <name>`): `pull`
+(`--force` / `--data` / `--partitions-external`), `plan --db` (`--staged` / `--resolve-with` / `--assert` / `--no-rehearse`), `apply` (`--plan` /
 `--checksum` / `--allow` / `--staged` /
 `--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
-(`--reason`), `bootstrap` (`--sql`), `state list` (`--limit` / `--format json`),
+(`--reason`), `bootstrap` (`--sql` / `--create`), `state list` (`--limit` / `--format json`),
 `state show <id>`, `state diff <id> [<id>]`, `state export <id>` (`--force`),
 `state prune` (`--keep`), `unlock`, `status` (`--format json`). The historical
 read/export commands also take `--format json`. Export validates declarations
@@ -317,7 +323,9 @@ ordering between two new tables; `EXEC()` rejecting function calls in its
 argument; `sql_expression_dependencies` returning one row per referenced
 *column*; and check constraints arriving as dependencies of their own table.
 The module round-trip is in the same category: only a real `sys.sql_modules` can
-say whether what the emitter sent is what comes back.
+say whether what the emitter sent is what comes back. SQLite has no container to
+start, so its end-to-end CLI flow suite (`crates/pbps-cli/tests/flow_sqlite.rs`)
+runs unignored as part of ordinary `cargo test`.
 
 ## Open items
 
@@ -501,21 +509,21 @@ What a project can declare, by the leading key of the declaration file.
 `refused` means the engine's validation rejects the declaration.
 
 <!-- generated:declared -->
-| Declaration | PostgreSQL | SQL Server |
-|---|---|---|
-| `table:` | managed | managed |
-| `view:` | managed | managed |
-| `procedure:` | managed | managed |
-| `function:` | managed | managed |
-| `trigger:` | managed | managed |
-| `extension:` | partly held | refused |
-| `role:` | partly held | managed |
-| `enum:` | managed | refused |
-| `domain:` | managed | refused |
-| `text_search_config:` | partly held | refused |
-| `text_search_dictionary:` | partly held | refused |
-| `sequence:` | partly held | refused |
-| `dependency:` | refused | managed |
+| Declaration | PostgreSQL | SQL Server | SQLite |
+|---|---|---|---|
+| `table:` | managed | managed | managed |
+| `view:` | managed | managed | managed |
+| `procedure:` | managed | managed | refused |
+| `function:` | managed | managed | refused |
+| `trigger:` | managed | managed | refused |
+| `extension:` | partly held | refused | refused |
+| `role:` | partly held | managed | refused |
+| `enum:` | managed | refused | refused |
+| `domain:` | managed | refused | refused |
+| `text_search_config:` | partly held | refused | refused |
+| `text_search_dictionary:` | partly held | refused | refused |
+| `sequence:` | partly held | refused | refused |
+| `dependency:` | refused | managed | refused |
 <!-- /generated:declared -->
 
 On PostgreSQL a `role:` is `partly held` because a plan grants to the role and
@@ -697,6 +705,44 @@ catalog census.
 | Security policies | not read | [#2794](https://github.com/pongbiphang/pbps/issues/2794) |
 | Database-level DDL triggers | not read | [#2794](https://github.com/pongbiphang/pbps/issues/2794) |
 <!-- /generated:sqlserver -->
+
+## SQLite objects and properties pbps does not hold
+
+Measured against the bundled SQLite (`rusqlite`, DEC-2950.1). SQLite manages
+tables (in `main`) and views, with indexes, primary keys, unique constraints,
+checks and foreign keys.
+
+- **Named.** Pull warns by name and leaves the object out. `validate` refuses
+  declarations of triggers (not built yet) and of kinds SQLite does not have
+  (procedures, functions, roles, extensions, declared types, text search,
+  sequences, cross-database dependencies).
+
+<!-- generated:sqlite -->
+| Kind | Today | Tracking |
+|---|---|---|
+| Triggers | named | #2950 |
+| Virtual tables (including FTS and R-Tree) | named |  |
+| Views with a column list | named |  |
+| Objects in `temp` or attached databases | named |  |
+<!-- /generated:sqlite -->
+
+### Refused or not built yet on SQLite
+
+- **Not built yet (`validate` refuses by name):** triggers, declared rows (`data:`),
+  generated/computed columns, column or index collations, expression indexes.
+- **Deferred to table rebuild:** in-place changes SQLite's `ALTER TABLE` cannot
+  express (altering a column type, adding or changing a primary key, unique
+  constraint or foreign key on an existing table, changing an existing column's
+  default, or changing an unnamed constraint) are refused by name when planning.
+- **Named by pull as properties of held tables:** `STRICT`, `WITHOUT ROWID`,
+  `AUTOINCREMENT`, column collations, generated columns; constraints or indexes
+  with conflict clauses, key collations, key directions on constraints,
+  `DEFERRABLE`, `INITIALLY`, `MATCH`, or expression keys are left out by name.
+- **Server-only commands and flags (refused by name):** `--resolve-with` /
+  `resolve_with:`, `resolver externals`, `plan --dev` / `dev:`, `plan --assert`,
+  `pbps test` / `test fixtures repin`, `convert`, `rebuild-table`,
+  `partitions extend`, `pull --data` / `--partitions-external` / `--extension`,
+  and role/extension/search/exclusion/type/partition intent commands.
 
 ## Roadmap
 
