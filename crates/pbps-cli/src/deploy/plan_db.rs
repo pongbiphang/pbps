@@ -828,9 +828,14 @@ pub(super) async fn plan_db_selected(
         // The modules a rebuilt enum's columns carry, found in the planning
         // transaction and kept for every plan that follows it.
         let enum_dependents = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        // The unchanged modules the engine's recorded dependencies prove no
+        // arrival of this plan can rebind (DEC-2987.5), likewise kept for
+        // every plan that follows.
+        let rebinding_proven = std::cell::RefCell::new(std::collections::BTreeSet::new());
         let diff_here = |also: &std::collections::BTreeSet<pbps_model::ModuleId>| {
             let mut planning = hints.clone();
             planning.enum_dependents = enum_dependents.borrow().clone();
+            planning.rebinding_proven = rebinding_proven.borrow().clone();
             pbps_diff::diff_read_back(
                 pbps_diff::Side {
                     schema: &base,
@@ -852,7 +857,29 @@ pub(super) async fn plan_db_selected(
                 zero_sql.append_to(changes, dialect.as_ref())
             })
         };
-        let mut cs = diff_here(&std::collections::BTreeSet::new()).map_err(crate::Unexpressible)?;
+        let cs = diff_here(&std::collections::BTreeSet::new()).map_err(crate::Unexpressible)?;
+        // Boxed: the reads it awaits are rare, and its state should not sit
+        // in every planning future.
+        let (mut cs, unread) = Box::pin(rebinding::narrowed(
+            &dialect,
+            &mut conn,
+            pbps_diff::Side { schema: &base, ids: &recorded_ids },
+            pbps_diff::Side { schema: &declared, ids: &resolved.ids },
+            cs,
+            &rebinding_proven,
+            || diff_here(&std::collections::BTreeSet::new()),
+        ))
+        .await
+        .map_err(crate::Unexpressible)?;
+        if let Some(note) = unread {
+            if !json {
+                eprintln!("note: {}", note.message);
+            }
+            findings.push(note);
+            if json {
+                carried.clone_from(&findings);
+            }
+        }
         findings.extend(type_replacement_warnings(&recorded_ids, &resolved.ids, cs.changes(), json));
         findings.extend(domain_check_not_valid_warnings(&dialect, &mut conn, &base, json).await?);
 
@@ -882,9 +909,9 @@ pub(super) async fn plan_db_selected(
         // pass and check below, as an ordinary plan does, and is sealed in
         // the order they leave (#1516).
         let mut resolution = None;
-        // Connected dependency facts (DEC-2987.1): read once, only when a
-        // resolver is selected and the plan has kept surfaces that can be
-        // narrowed. A failed read is never a plan error: it yields no facts
+        // Connected dependency facts (DEC-2987.1) for the assessment: read
+        // only when a resolver is selected and the plan has kept surfaces
+        // that can be narrowed. A failed read is never a plan error: it yields no facts
         // (plan-level answers) and one printed note.
         let dependency_facts = if resolver_selection.is_some()
             && let Some(needed) = pbps_diff::resolver::needed_facts(

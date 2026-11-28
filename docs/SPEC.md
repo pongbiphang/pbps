@@ -3650,6 +3650,13 @@ DEC-1674.1).**
   Whatever that answer, a plan that moves names says in its report how many
   kept bodies were not checked, where the engine's dependency facts were
   read; what a body finds when it runs is left to the routine's own tests.
+- **A connected plan's candidate rebuilds are narrowed by the same proof.**
+  ADR-0013 rebuilds an unchanged module whose text mentions an arriving name.
+  Where the engine supplies its recorded dependencies, a connected plan leaves
+  out the rebuild of a module they prove unaffected, with or without a
+  resolver selected (DEC-2987.5). A routine whose body the engine did not
+  bind is never left out, nor is anything when the facts cannot be read; an
+  offline plan has only the text and keeps every candidate.
 - A **selected** resolver that the plan requires but that is unavailable,
   incompatible or inconclusive prevents writing either deployable plan or SQL
   output. Diagnostics name the object, uncertainty and remedy. With no

@@ -46,6 +46,7 @@ mod managed;
 mod names;
 mod pinned_movement;
 mod plan_db;
+mod rebinding;
 mod scopes;
 pub(crate) mod services;
 mod spelling;

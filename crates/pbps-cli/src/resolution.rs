@@ -117,6 +117,20 @@ pub fn unwrap_dependency_facts(
     }
 }
 
+/// The note of a connected plan whose dependency facts could not be read
+/// when its candidate rebuilds were narrowed (DEC-2987.5). Never a plan
+/// error: the plan keeps every rebuild its text asks for, which is the plan
+/// it had before the facts existed.
+pub fn rebuilds_kept_unread(error: &pbps_db::DbError) -> crate::output::Finding {
+    crate::output::Finding::note(
+        DEPENDENCY_FACTS_UNREAD_ID,
+        format!(
+            "Could not read catalog dependency facts; every unchanged module whose text \
+             mentions an arriving name is rebuilt, as without them: {error}"
+        ),
+    )
+}
+
 /// What the selected resolver was to this plan: not needed (case 2), or
 /// needed and answering, its plan published (case 3, #1516).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]

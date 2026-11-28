@@ -21,6 +21,7 @@ pub(crate) fn part_effects(
 
 pub use assess::{
     Answer, Assessment, FactsNeeded, UnaffectedReason, assess, assess_with_facts, needed_facts,
+    proven_by_dependency,
 };
 
 use crate::order::resolver_finish::settle;
