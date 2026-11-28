@@ -17,8 +17,56 @@ pub(super) fn cut_report(
     warnings.emit(permissions.into_iter().map(|message| {
         crate::output::Finding::warning("catalog.unexpressible-permission", message)
     }));
-    report_unmanaged(&scoped, unreadable, ids, modules, unmanaged.unmanaged)?;
+    // No sequence is judged here: no caller passes this read its list of
+    // sequences yet (#3124), and with none, calling every one of them
+    // unmanaged would refuse a valid apply (see `unmanaged_objects`).
+    report_unmanaged(&scoped, unreadable, ids, modules, None, unmanaged.unmanaged)?;
     Ok(scoped)
+}
+
+/// Definition projection must not manufacture absence: a relation the read
+/// left out (a PostgreSQL table with a rewrite rule, an unsupported temporal
+/// table) still holds its name, and outside the managed set it is unmanaged.
+/// Every cut of a read calls this, so that every command's inventory and
+/// policy count it (SPEC §7.6, §8.2).
+pub(crate) fn count_omitted_relations(
+    scoped: &mut pbps_diff::Scoped,
+    pulled: &pbps_db::catalog::Pulled,
+    ids: &IdsFile,
+    modules: &BTreeSet<ModuleId>,
+) {
+    scoped
+        .unmanaged
+        .extend(omitted_unmanaged_relations(pulled, ids, modules));
+    scoped.unmanaged.sort();
+    scoped.unmanaged.dedup();
+}
+
+/// The relations the read left out whole that nobody manages: their
+/// definitions are absent from the schema, their names are not.
+pub(super) fn omitted_unmanaged_relations(
+    pulled: &pbps_db::catalog::Pulled,
+    ids: &IdsFile,
+    modules: &BTreeSet<ModuleId>,
+) -> Vec<TableName> {
+    pulled
+        .limitations
+        .iter()
+        .filter_map(|limitation| match &limitation.target {
+            pbps_db::catalog::LimitationTarget::Relation(name)
+                if !ids.tables.values().any(|managed| managed == name)
+                    && !modules.contains(&ModuleId::Named(name.clone())) =>
+            {
+                Some(name.clone())
+            }
+            pbps_db::catalog::LimitationTarget::Relation(_)
+            | pbps_db::catalog::LimitationTarget::Type(_)
+            | pbps_db::catalog::LimitationTarget::SharedModule(_)
+            | pbps_db::catalog::LimitationTarget::Search(_)
+            | pbps_db::catalog::LimitationTarget::Module(_)
+            | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => None,
+        })
+        .collect()
 }
 
 /// One cut of a pulled catalog down to a managed set. Pure.
@@ -32,6 +80,7 @@ pub(super) fn cut<'a>(
     unmanaged: db::CatalogPolicy<'_>,
 ) -> (pbps_diff::Scoped, Vec<&'a str>) {
     let mut scoped = pbps_diff::scope(&pulled.schema, ids, modules, external);
+    count_omitted_relations(&mut scoped, pulled, ids, modules);
     // These exact roles belong to the verified owned run, not its declarations.
     // A similarly named role remains subject to the project's ordinary policy.
     scoped

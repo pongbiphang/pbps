@@ -234,12 +234,6 @@ pub(super) async fn managed_state_once(
     .await?;
     refuse_managed_limitations(&managed.limitations)?;
     let mut scoped = managed.scoped;
-    // Definition projection must not manufacture absence. Keep the same
-    // read's omitted relation names for final endpoint checks, without
-    // recording an unsupported definition in the schema (SPEC §7.6).
-    scoped.unmanaged.extend(managed.unmanaged_relations);
-    scoped.unmanaged.sort();
-    scoped.unmanaged.dedup();
     // The recorded form: a kind held by name only is kept only where `reference` names it
     // (the declarations, for a recording from them; what the plan creates, for an apply,
     // which carries the previous record forward instead). Done here, at the one read every recorder and
@@ -461,24 +455,7 @@ pub(super) async fn managed_state_full(
         .into_iter()
         .map(str::to_owned)
         .collect();
-    let unmanaged_relations = pulled
-        .limitations
-        .iter()
-        .filter_map(|limitation| match &limitation.target {
-            pbps_db::catalog::LimitationTarget::Relation(name)
-                if !ids.tables.values().any(|managed| managed == name)
-                    && !modules.contains(&ModuleId::Named(name.clone())) =>
-            {
-                Some(name.clone())
-            }
-            pbps_db::catalog::LimitationTarget::Relation(_)
-            | pbps_db::catalog::LimitationTarget::Type(_)
-            | pbps_db::catalog::LimitationTarget::SharedModule(_)
-            | pbps_db::catalog::LimitationTarget::Search(_)
-            | pbps_db::catalog::LimitationTarget::Module(_)
-            | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => None,
-        })
-        .collect();
+    let unmanaged_relations = omitted_unmanaged_relations(&pulled, ids, modules);
     let scoped = cut_report(
         &pulled,
         ids,

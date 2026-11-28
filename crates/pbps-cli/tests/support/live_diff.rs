@@ -287,9 +287,10 @@ pub fn what_was_not_compared_is_listed_and_is_no_difference(server: &str, pg: bo
     assert!(stdout(&out).contains("No differences."), "{}", stdout(&out));
     assert!(stderr(&out).contains(part), "{}", stderr(&out));
 
-    // A table the reader leaves out whole, outside the declarations, is
-    // still unmanaged: `unmanaged: error` refuses it like any other.
-    // `other` goes first, so that `ruled` alone is what is refused.
+    // A table the reader leaves out whole, a standalone sequence and a text
+    // search configuration, outside the declarations, are still unmanaged:
+    // `unmanaged: error` refuses them like any other (#3038).
+    // `other` goes first, so that these three alone are what is refused.
     if pg {
         on_server(own.connection(), "DROP TABLE app.other");
         on_server(own.connection(), "CREATE TABLE app.ruled (id int NOT NULL)");
@@ -297,12 +298,20 @@ pub fn what_was_not_compared_is_listed_and_is_no_difference(server: &str, pg: bo
             own.connection(),
             "CREATE RULE ruled_insert AS ON INSERT TO app.ruled DO INSTEAD NOTHING",
         );
+        on_server(own.connection(), "CREATE SEQUENCE app.loose_no");
+        on_server(
+            own.connection(),
+            "CREATE TEXT SEARCH CONFIGURATION app.loose_cfg (COPY = pg_catalog.simple)",
+        );
         let report = answer(&d, own.connection(), 0);
         let unmanaged = listed(&report, "unmanaged");
-        assert!(
-            unmanaged.len() == 1 && unmanaged[0].contains("ruled"),
-            "{report:#}"
-        );
+        assert_eq!(unmanaged.len(), 3, "{report:#}");
+        for name in ["ruled", "loose_no", "loose_cfg"] {
+            assert!(
+                unmanaged.iter().any(|listed| listed.contains(name)),
+                "{name}: {report:#}"
+            );
+        }
         std::fs::write(
             d.dir.join("pbps.yml"),
             format!("dialect: {dialect}\nunmanaged: error\n"),

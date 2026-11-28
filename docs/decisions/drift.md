@@ -224,8 +224,8 @@ direction. It never reads `__pbps_state`, takes no lock and writes nothing.
   create. An object the read holds is compared whatever part of it was left
   out. One rule for every kind of object the read can omit, not one per kind.
   An undeclared relation the read left out still exists, so it is listed as
-  unmanaged and `unmanaged: error` refuses it, as the plan's read
-  (`managed_state_once`) counts it.
+  unmanaged and `unmanaged: error` refuses it, as every command counts it
+  (DEC-3038.1).
 - **Declaration problems are exit 1.** Exit 2 means the database differs;
   declarations that do not load leave the question unanswered.
 - **Outside the comparison:** roles, grants, row security and declared rows.
@@ -235,3 +235,36 @@ direction. It never reads `__pbps_state`, takes no lock and writes nothing.
 It is not a plan: no option writes SQL or a plan file, and the changes carry
 no risk gate. The command lives in `pbps-cli` (`deploy/live_diff.rs`) over
 `pbps_diff::diff_partial` and touches no engine crate.
+
+<a id="dec-3038-1"></a>
+
+**DEC-3038.1. The unmanaged inventory names every kind the database holds outside the managed set, and a sequence is judged only where a caller says which are its own.**
+SPEC §8.2's policy is about the other objects in the same database, but three
+kinds escaped it in every command that applies it (#3038): a relation the read
+leaves out whole, a text search object and a standalone sequence. A table with
+a rewrite rule, a dictionary or a sequence nobody declared was neither listed
+nor refused under `unmanaged: error`.
+
+- **An omitted relation is counted in the cut.** Its definition is absent from
+  the read, its name is not. The cut every reader goes through
+  (`scopes::cut`, and the one `status` makes) adds the names outside the
+  managed set to `Scoped::unmanaged`, so every command's inventory and the
+  read's own policy count it. The two per-command copies (`managed_state_once`
+  and `pbps diff`) are gone.
+- **A text search object is judged by its identity.** The cut keeps every one
+  the database holds (DEC-2728.1); the inventory lists those no identity names,
+  as it does a table, and one the read could not express is carried with the
+  other unreadable objects, judged the same way. `plan --db` judges by the
+  recorded identities plus the declared ones the record does not hold yet,
+  which are the project's too. A recorded one being renamed keeps its recorded
+  name, the one the database still holds until the plan runs.
+- **A sequence is judged by the caller's list.** A standalone sequence has no
+  identity (DEC-2721.1), so which ones are the project's is only known to the
+  command: the record for `verify` and `status`, the declarations for `diff`,
+  both for `plan --db` (a recorded one the declarations dropped is one the plan
+  drops). The policy that runs inside the managed read (`snapshot`,
+  `baseline`, `bootstrap`, `apply`) is passed no list and judges no sequence:
+  passing none is safe, while an empty or wrong list would call every sequence
+  unmanaged and refuse a valid apply, whose closing read holds no declarations.
+  Giving those callers their lists is #3124. Rejected: giving sequences an
+  identity, which is a format change far larger than this gap.

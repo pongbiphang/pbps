@@ -402,7 +402,7 @@ pub(super) fn warn_unreleased(label: &str, released: &Result<bool, pbps_db::DbEr
 #[error("{0}")]
 pub struct UnmanagedPolicy(String);
 
-/// Converts unreadable modules and type limitations into the common identity
+/// Converts unreadable modules and type and text search limitations into the common identity
 /// and description form used by connected commands.
 pub(crate) fn unreadable_objects(
     pulled: &pbps_db::catalog::Pulled,
@@ -444,23 +444,72 @@ pub(crate) fn unreadable_objects(
                     )
                 }),
         )
+        // So does a text search object the read could not express: absent
+        // from the scoped read, so only this half can name it (#3038).
+        .chain(
+            pulled
+                .limitations
+                .iter()
+                .filter_map(|limitation| match &limitation.target {
+                    pbps_db::catalog::LimitationTarget::Search(name) => Some((
+                        limitation.target.clone(),
+                        format!("{} ({})", name.shown(), limitation.detail),
+                    )),
+                    pbps_db::catalog::LimitationTarget::Type(_)
+                    | pbps_db::catalog::LimitationTarget::Relation(_)
+                    | pbps_db::catalog::LimitationTarget::SharedModule(_)
+                    | pbps_db::catalog::LimitationTarget::Module(_)
+                    | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => None,
+                }),
+        )
         .collect()
 }
 
 /// Names every representable or unreadable catalog object outside the managed
 /// set — tables, types, modules and roles alike — for applying the `unmanaged:`
 /// policy of SPEC §8.2.
+///
+/// `sequences` names the standalone sequences the command manages. A sequence
+/// has no identity (DEC-2721.1), so only the caller knows which are its own:
+/// the record for `verify` and `status`, the declarations for `diff`, both for
+/// `plan --db`. `None` judges none of them, for the policy inside the managed
+/// read, which is passed no list yet (#3124).
 pub(crate) fn unmanaged_objects(
     scoped: &pbps_diff::Scoped,
     unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
     ids: &IdsFile,
     managed_modules: &std::collections::BTreeSet<ModuleId>,
+    sequences: Option<&std::collections::BTreeSet<&pbps_model::ObjectName>>,
 ) -> Vec<String> {
     let managed_tables = ids.tables.values().collect();
     scoped
         .unmanaged
         .iter()
         .map(|name| name.shown().to_string())
+        // The scope cut keeps every text search object and standalone
+        // sequence of the database, since a plan compares only the ones the
+        // declarations name (DEC-2728.1, DEC-2721.1). The rest are somebody
+        // else's, as an undeclared table is.
+        .chain(
+            scoped
+                .schema
+                .search
+                .keys()
+                .filter(|name| !ids.search.values().any(|held| held == *name))
+                .map(|name| name.shown().to_string()),
+        )
+        .chain(
+            sequences
+                .into_iter()
+                .flat_map(|managed| {
+                    scoped
+                        .schema
+                        .sequences
+                        .keys()
+                        .filter(move |name| !managed.contains(name))
+                })
+                .map(|name| format!("sequence {}", name.shown())),
+        )
         .chain(
             scoped
                 .unmanaged_types
@@ -512,6 +561,21 @@ pub(crate) fn unmanaged_objects(
         .collect()
 }
 
+/// The recorded identities with the declared text search objects the record
+/// does not hold yet, for judging which search objects are the project's.
+/// A recorded one keeps its recorded name even when the declarations rename
+/// it: the database still holds that name until the plan runs, and replacing
+/// it would call the object being renamed somebody else's.
+pub(super) fn with_declared_search(recorded: &IdsFile, declared: &IdsFile) -> IdsFile {
+    let mut ids = recorded.clone();
+    for (uid, name) in &declared.search {
+        ids.search
+            .entry(uid.clone())
+            .or_insert_with(|| name.clone());
+    }
+    ids
+}
+
 /// Applies the `unmanaged:` policy to both representable and unreadable
 /// catalog objects outside the managed set.
 pub(super) fn report_unmanaged(
@@ -519,9 +583,10 @@ pub(super) fn report_unmanaged(
     unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
     ids: &IdsFile,
     managed_modules: &std::collections::BTreeSet<ModuleId>,
+    sequences: Option<&std::collections::BTreeSet<&pbps_model::ObjectName>>,
     policy: pbps_config::Unmanaged,
 ) -> anyhow::Result<()> {
-    let names = unmanaged_objects(scoped, unreadable, ids, managed_modules);
+    let names = unmanaged_objects(scoped, unreadable, ids, managed_modules, sequences);
     apply_unmanaged_policy(&names, policy)
 }
 
