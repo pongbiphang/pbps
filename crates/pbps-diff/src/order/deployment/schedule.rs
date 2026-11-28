@@ -218,7 +218,7 @@ impl fmt::Display for Skipped {
 ///     annotations: &hints.annotations,
 /// }, &Facts::default(), &MinimalDialect).unwrap();
 /// let inputs = finish::Inputs {
-///     before: side, after: side, modules: &Default::default(), captured: &Default::default(),
+///     before: side, after: side, modules: &Default::default(),
 /// };
 /// let finished = finish::offline(scheduled.changes, inputs, &MinimalDialect).unwrap();
 /// let ordered = finished.ordered(PlanMode::Transactional, &MinimalDialect);

@@ -345,7 +345,7 @@ impl<S> PartialEq<PlanningPlan<S>> for ChangeSet {
 ///     });
 ///     use pbps_diff::order::finish;
 ///     let _ = finish::connected(draft, inputs, &pbps_dialect::MinimalDialect,
-///         finish::Catalog { slots: None, verified: false });
+///         finish::Catalog { slots: None, membership: None });
 /// }
 /// ```
 /// A model-owned root cannot impersonate a certified input:

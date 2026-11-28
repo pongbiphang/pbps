@@ -171,7 +171,7 @@ impl PlanningInput {
 ///     let scope = pbps_diff::order::writebacks::ScopeInput::new(vec![]).unwrap();
 ///     let pending = scope.append_to(plan, &pbps_dialect::MinimalDialect);
 ///     let _ = finish::connected(pending, inputs, &MinimalDialect,
-///         finish::Catalog { slots: None, verified: false });
+///         finish::Catalog { slots: None, membership: None });
 /// }
 /// ```
 #[derive(Debug, Clone)]

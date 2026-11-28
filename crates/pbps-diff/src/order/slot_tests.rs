@@ -273,6 +273,112 @@ impl Plan {
     }
 }
 
+fn finish_fixture<D: Dialect>(
+    plan: &Plan,
+    dialect: &D,
+) -> Result<super::finish::FinishedPlan<D>, super::finish::FinishError> {
+    use super::finish::{self, Inputs};
+    use crate::Side;
+    let changes = super::propose(pbps_model::ChangeSet {
+        changes: plan.logical.clone(),
+    });
+    finish::offline(
+        super::plan::state(changes),
+        Inputs {
+            before: Side {
+                schema: &plan.before,
+                ids: &plan.before_ids,
+            },
+            after: Side {
+                schema: &plan.after,
+                ids: &plan.after_ids,
+            },
+            modules: &ModuleDeps::new(),
+        },
+        dialect,
+    )
+}
+
+#[test]
+fn the_final_stage_refuses_a_broken_effect_owner() {
+    use super::finish::FinishError;
+    let plan = Plan::new(&[], &[], vec![drop_check_on_undeclared_table()]);
+    let error = finish_fixture(&plan, &MinimalDialect)
+        .err()
+        .expect("the check belongs to an unread table");
+    assert!(matches!(
+        error,
+        FinishError::EffectOwner {
+            cause: OwnerError::Unmanaged { .. },
+            ..
+        }
+    ));
+    assert!(
+        error.to_string().contains("step 0.0 (app.missing)"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_final_stage_refuses_a_vacant_slot_owner_and_reads_an_external_reference() {
+    use super::finish::FinishError;
+    use pbps_model::{ModuleId, ModuleKind};
+    let trigger = Change::Module(ModuleChange::DropModule {
+        id: ModuleId::Trigger {
+            on: name("app.t"),
+            name: "audit".into(),
+        },
+        kind: ModuleKind::Trigger,
+    });
+    let vacant = Plan::new(
+        &[("t", "app.t")],
+        &[],
+        vec![drop_table("t", "app.t"), trigger.clone()],
+    );
+    let error = finish_fixture(&vacant, &MinimalDialect)
+        .err()
+        .expect("the slot reader cannot find the trigger's former table");
+    assert!(matches!(
+        error,
+        FinishError::SlotOwner {
+            cause: OwnerError::Vacant { .. },
+            ..
+        }
+    ));
+    let message = error.to_string();
+    assert!(
+        message.contains("step 1.0") && message.contains("app.t"),
+        "{message}"
+    );
+
+    let external = Plan::new(&[], &[], vec![trigger]);
+    let finished = finish_fixture(&external, &MinimalDialect).unwrap();
+    assert_eq!(finished.changes().changes, external.logical);
+}
+
+#[test]
+fn the_final_stage_replays_the_intermediate_name_even_without_a_handover() {
+    use super::finish::FinishError;
+    let plan = Plan::new(
+        &[("t", "s1.t"), ("held", "s2.t")],
+        &[("t", "s2.u"), ("held", "s2.t")],
+        vec![rename_table("t", "s1.t", "s2.u")],
+    );
+    let slotted = Slotted { exact: true };
+    let (_, names) = slot_analysis(&plan, &slotted);
+    assert!(edges(&names, None, &[]).is_empty());
+    let error = finish_fixture(&plan, &slotted)
+        .err()
+        .expect("the intermediate name is still occupied");
+    assert!(matches!(error, FinishError::Replay(_)));
+    assert!(error.to_string().contains("passes through s2.t"), "{error}");
+
+    let (_, unavailable) = slot_analysis(&plan, &MinimalDialect);
+    assert_eq!(unavailable.effects_with_unread().1.unlowered.len(), 1);
+    let finished = finish_fixture(&plan, &MinimalDialect).unwrap();
+    assert_eq!(finished.changes().changes, plan.logical);
+}
+
 fn slot_analysis(plan: &Plan, dialect: &impl Dialect) -> (Operations, Slots) {
     let names = PlanNames::of(&plan.logical, &plan.after_ids).unwrap();
     let owners = PlanOwners::new(names, &plan.before_ids, &plan.after_ids);

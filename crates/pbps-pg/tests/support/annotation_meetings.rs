@@ -128,7 +128,7 @@ pub fn canonical(
     s: &Scene,
     version: i64,
     stored: Option<&MembershipCatalog>,
-) -> Result<pbps_model::ChangeSet, String> {
+) -> Result<pbps_diff::order::CanonicalPlan<Postgres>, String> {
     let pg = Postgres::new().with_server_version(version);
     let before = Side {
         schema: &s.before,
@@ -227,8 +227,68 @@ pub fn canonical(
         step.change,
         pbps_model::Change::Partition(pbps_model::PartitionChange::AttachPartition { .. })
     )));
-    let ordered = pbps_diff::order::finish::finish_fixture(done.changes)
-        .ordered(pbps_model::PlanMode::Transactional, &pg);
-    assert!(!ordered.changes().changes.is_empty());
-    Ok(ordered.changes().clone())
+    Ok(done.changes)
+}
+
+pub fn finish_with_read(
+    scene: &Scene,
+    plan: pbps_diff::order::CanonicalPlan<Postgres>,
+    engine: &Postgres,
+    catalog: &MembershipCatalog,
+) -> pbps_diff::order::finish::FinishedPlan<Postgres> {
+    use pbps_diff::order::finish;
+    let modules = Default::default();
+    let inputs = || finish::Inputs {
+        before: Side {
+            schema: &scene.before,
+            ids: &scene.base,
+        },
+        after: Side {
+            schema: &scene.after,
+            ids: &scene.ids,
+        },
+        modules: &modules,
+    };
+    let withheld = finish::connected(
+        plan.clone(),
+        inputs(),
+        engine,
+        finish::Catalog {
+            slots: None,
+            membership: None,
+        },
+    )
+    .err()
+    .expect("the final stage needs the actual stored default binding");
+    assert!(matches!(withheld, finish::FinishError::Symbolic { .. }));
+    let why = withheld.to_string();
+    assert!(
+        why.contains("step")
+            && (why.contains("app.p") || why.contains("app.a"))
+            && why.contains("was not read"),
+        "{why}"
+    );
+    let sequence = plan.changes().clone();
+    let finished = finish::connected(
+        plan,
+        inputs(),
+        engine,
+        finish::Catalog {
+            slots: None,
+            membership: Some(catalog),
+        },
+    )
+    .unwrap();
+    assert_eq!(finished.changes(), &sequence);
+    finished
+}
+
+#[test]
+fn the_final_meeting_needs_the_stored_default_binding() {
+    let scene = scene();
+    for version in [160_000, 180_000] {
+        let engine = Postgres::new().with_server_version(version);
+        let plan = canonical(&scene, version, Some(&scene.stored)).unwrap();
+        finish_with_read(&scene, plan, &engine, &scene.stored);
+    }
 }

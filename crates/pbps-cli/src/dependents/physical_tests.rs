@@ -254,7 +254,7 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
                 let sources = Sources { before: pbps_diff::Side { schema: &before, ids: &before_ids }, after: &after_ids };
                 assert!(crate::engine::check_module_dependents_fixture(&mut conn, &pbps_diff::order::propose(pbps_model::ChangeSet { changes: cs.changes.clone() }), &before, &after_ids, &before_ids).await.is_err());
                 let cs = pbps_diff::order::propose(cs);
-    let (cs, _) = crate::engine::account_for_module_dependents(&mut conn, cs, &after, sources,
+    let (cs, _, _) = crate::engine::account_for_module_dependents(&mut conn, cs, &after, sources,
                     &Default::default(), None, &pg, &|_| panic!("the plan already rebuilds its sole module"))
                     .await.unwrap();
                 assert_owner(&cs, transition.is_none() || if rebuild_first { detach } else { !detach });
@@ -285,7 +285,7 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
         conn.begin(&framing).await.unwrap();
         assert!(crate::engine::check_module_dependents_fixture(&mut conn, &pbps_diff::order::propose(pbps_model::ChangeSet { changes: cs.changes.clone() }), &before, &after_ids, &before_ids).await.is_err());
         let cs = pbps_diff::order::propose(cs);
-    let (cs, _) = crate::engine::account_for_module_dependents(&mut conn, cs, &after, sources,
+    let (cs, _, _) = crate::engine::account_for_module_dependents(&mut conn, cs, &after, sources,
             &Default::default(), None, &pg, &|_| panic!("the plan already drops its sole module"))
             .await.unwrap();
         assert_parent_release(&cs);
@@ -505,7 +505,7 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
     let framing = pg.transaction_framing(&pbps_model::SessionZone::utc());
     conn.begin(&framing).await.unwrap();
     let cs = pbps_diff::order::propose(cs);
-    let (cs, _) = crate::engine::account_for_module_dependents(
+    let (cs, _, _) = crate::engine::account_for_module_dependents(
         &mut conn,
         cs,
         &after,

@@ -736,7 +736,7 @@ async fn policy_owner_drop_releases_column(conn: &mut Conn) {
     .unwrap_err();
     assert!(wrong.to_string().contains("cross_table"));
     let changes = pbps_diff::order::propose(changes);
-    let (changes, _) = crate::engine::account_for_module_dependents(
+    let (changes, _, _) = crate::engine::account_for_module_dependents(
         conn,
         changes,
         &after,
@@ -922,7 +922,7 @@ async fn policy_owner_teardowns(conn: &mut Conn) {
         );
         let plan = pbps_diff::order::propose(plan);
         let result: anyhow::Result<()> = async {
-            let (plan, _) = crate::engine::account_for_module_dependents(
+            let (plan, _, _) = crate::engine::account_for_module_dependents(
                 conn,
                 plan,
                 &after,

@@ -1,4 +1,5 @@
 use super::*;
+use pbps_diff::order::{CanonicalPlan, Schedule, Source, finish};
 use pbps_model::IndexChange;
 use pbps_model::ModuleChange;
 use pbps_model::PartitionChange;
@@ -278,6 +279,85 @@ fn final_verification_keeps_every_part_and_the_expansions_completion_order() {
         }
     }
     assert!(verify_plan(&f.input(), &prepared, &edited, &pg).is_err());
+}
+
+fn expanded_plan(
+    input: &Input<'_>,
+    prepared: &Prepared,
+    pg: &pbps_pg::Postgres,
+) -> CanonicalPlan<pbps_pg::Postgres> {
+    let root = pbps_diff::diff(input.before, input.desired, pg, input.hints).unwrap();
+    continue_plan(root, input, prepared.clone(), pg).unwrap()
+}
+
+#[test]
+fn a_rebuild_finishes_only_with_its_prepared_catalog() {
+    let mut f = Fixture::new();
+    let pg = pbps_pg::Postgres::new();
+    let prepared = f.prepare().unwrap();
+    let plan = expanded_plan(&f.input(), &prepared, &pg);
+    let finished = finish::rebuild(plan.clone(), &f.input(), &prepared, &pg).unwrap();
+    assert_eq!(finished.changes(), plan.changes());
+
+    // A second catalog read reserves an address the original sequence uses.
+    let occupied = &prepared.addresses()[0].address;
+    let Fact::Present(names) = &mut f.naming else {
+        unreachable!()
+    };
+    names
+        .get_mut(&occupied.schema)
+        .unwrap()
+        .types
+        .insert(occupied.name.clone().into(), obj(90));
+    let other_prepared = f.prepare().unwrap();
+    let other_input = f.input();
+    assert_ne!(prepared.addresses(), other_prepared.addresses());
+    let reason = verify_plan(&other_input, &other_prepared, plan.changes(), &pg).unwrap_err();
+    let Err(error) = finish::rebuild(plan, &other_input, &other_prepared, &pg) else {
+        panic!("the rebuild finished in a different catalog context");
+    };
+    assert!(matches!(
+        &error,
+        finish::FinishError::Rebuild(detail) if detail == &reason
+    ));
+    assert_eq!(error.to_string(), reason);
+}
+
+#[test]
+fn rebuild_finish_refuses_a_changed_sequence_in_its_prepared_catalog() {
+    use pbps_model::resolver::OrderReason;
+    let f = Fixture::new();
+    let pg = pbps_pg::Postgres::new();
+    let input = f.input();
+    let prepared = f.prepare().unwrap();
+    let plan = expanded_plan(&input, &prepared, &pg);
+    let steps = &plan.changes().changes;
+    let own = steps
+        .iter()
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Index(IndexChange::BuildPartitionedIndex(_))
+            )
+        })
+        .unwrap();
+    let analyze = steps
+        .iter()
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Partition(PartitionChange::AnalyzeTableTree(_))
+            )
+        })
+        .unwrap();
+    let mut schedule = Schedule::new(steps.len());
+    schedule.edge(analyze, own, Source::Effect, OrderReason::Structural);
+    let reordered = schedule.settle(plan).unwrap().into_planning();
+    let reason = verify_plan(&input, &prepared, reordered.changes(), &pg).unwrap_err();
+    let Err(error) = finish::rebuild(reordered, &input, &prepared, &pg) else {
+        panic!("the reordered rebuild finished");
+    };
+    assert_eq!(error.to_string(), reason);
 }
 
 #[test]

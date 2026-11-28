@@ -69,11 +69,10 @@ impl Comparison<'_> {
                 before,
                 after,
                 modules: &self.hints.annotations.modules(&new),
-                captured: &Default::default(),
             },
             &pg,
         )
-        .map_err(|e| e.to_string())?
+        .map_err(final_order_reason)?
         .ordered(PlanMode::Transactional, &pg);
         let lowered = pbps_dialect::lower::lower_all(
             &ordered as &dyn pbps_diff::order::PlanView<pbps_pg::Postgres>,
@@ -156,4 +155,22 @@ pub async fn compare(
     )
     .await
     .map(|answers| answers.retained)
+}
+
+fn final_order_reason(error: pbps_diff::order::finish::FinishError) -> String {
+    error.to_string()
+}
+
+#[cfg(test)]
+mod final_order_tests {
+    use super::*;
+
+    #[test]
+    fn retained_label_final_order_preserves_the_named_reason() {
+        let why = final_order_reason(crate::final_order_refusal());
+        assert!(
+            why.contains("app.first") && why.contains("app.second"),
+            "{why}"
+        );
+    }
 }

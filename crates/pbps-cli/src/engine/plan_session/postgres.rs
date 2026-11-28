@@ -24,6 +24,7 @@ pub(crate) struct PlanState {
     /// schedule may undo by planning the revision afresh: ordered and checked
     /// again over the same reads once it has run (#1767).
     name_facts: Option<NameFacts>,
+    membership: Option<MembershipRead>,
     /// The verifier of a table rebuild the schedule expanded, run once every
     /// pass that orders the plan has (#1954).
     rebuild_verification: Option<RebuildVerification>,
@@ -514,11 +515,12 @@ pub(crate) async fn account_for_module_dependents<
     role_members: Option<&crate::dependents::schedule::RoleMembers>,
     dialect: &D,
     rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
-) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck)> {
+) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck, MembershipRead)> {
     let (declarations, read) = defaults::scheduled_inputs(declared, sources, deps, role_members);
     // Version is observed once, before the pure expansion. Ordinary CLI
     // planning has no extra write-path schemas (DEC-1503.1).
-    let pg = dialect.with_planning_version(pbps_pg::roles::server_version_num(conn).await?);
+    let version = pbps_pg::roles::server_version_num(conn).await?;
+    let pg = dialect.with_planning_version(version);
     let dialect = &pg;
     let mut found = module_dependents(conn, &changes).await?;
     let untouched = crate::dependents::untouched_module_dependents(&changes, &found, declared);
@@ -531,8 +533,8 @@ pub(crate) async fn account_for_module_dependents<
     // passes that read nothing.
     let policies = policy_dependents(conn, &changes, sources.after, sources.before.schema).await?;
     // Only a plan that moves a partition while changing its parent's columns
-    // reads stored column facts. The read stays in this transaction and call,
-    // beside the dependents it is consulted with (DEC-2296.2).
+    // reads stored column facts. The final stage needs the same read
+    // while the planning transaction is still open (DEC-2296.2).
     let tables = pbps_diff::order::boundary_catalog_tables(
         &changes,
         sources.before,
@@ -619,7 +621,14 @@ pub(crate) async fn account_for_module_dependents<
             found.len()
         ),
     };
-    Ok((changes, check))
+    Ok((
+        changes,
+        check,
+        MembershipRead {
+            version,
+            catalog: stored,
+        },
+    ))
 }
 
 /// [`order_after_releases`], with the live edges of every table the plan
@@ -1833,7 +1842,7 @@ impl PlanSession for pbps_pg::Postgres {
             state.rebuild_verification = Some(verification);
             Ok((changes, check))
         } else {
-            account_for_module_dependents(
+            let (changes, check, membership) = account_for_module_dependents(
                 conn,
                 changes,
                 frame.written.schema,
@@ -1846,7 +1855,9 @@ impl PlanSession for pbps_pg::Postgres {
                 self,
                 again,
             )
-            .await
+            .await?;
+            state.membership = Some(membership);
+            Ok((changes, check))
         }
     }
 
@@ -1884,20 +1895,10 @@ impl PlanSession for pbps_pg::Postgres {
             };
             facts.order_and_refuse(changes, frame.label, planned)?;
         }
-        // Every pass that orders the plan has run: the verifier checks the
-        // order that is saved and applied, in tests and debug builds
-        // (#1954, DEC-1954.6).
-        let verified = if let Some(verification) = &state.rebuild_verification {
-            verification
-                .verify(frame.base, frame.declared, frame.hints, changes, self)
-                .map_err(|why| anyhow::anyhow!("{why}"))?;
-            true
-        } else {
-            false
-        };
         Ok(Ordered {
-            verified,
             facts: state.name_facts.as_ref().map(NameFacts::slots),
+            membership: state.membership.take(),
+            rebuild: state.rebuild_verification.take(),
         })
     }
 

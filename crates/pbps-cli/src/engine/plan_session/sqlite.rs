@@ -605,10 +605,7 @@ impl PlanSession for Sqlite {
     ) -> anyhow::Result<Ordered> {
         let inv = ensure_inventory(state, conn, changes, frame)?.clone();
         let facts = order_and_check_names(self, &inv, changes, frame)?;
-        Ok(Ordered {
-            verified: false,
-            facts: Some(facts),
-        })
+        Ok(Ordered::ordinary(Some(facts)))
     }
 
     /// Runs SQLite's four post-ordering checks inside the planning transaction:
@@ -1906,7 +1903,7 @@ mod tests {
         now(dialect.check_names_against_catalog(&mut state, conn, plan, frame, false))?;
         let ordered = now(dialect.order_by_catalog(&mut state, conn, plan, frame))?;
         #[cfg(debug_assertions)]
-        if !ordered.verified {
+        {
             pbps_diff::order::shadow::observe_scheduled(
                 base_side,
                 desired_side,
@@ -1990,7 +1987,6 @@ mod tests {
             &[],
         )
         .expect("clean file passes all three methods and observe_scheduled");
-        assert!(!ordered.verified);
         assert!(ordered.facts.is_some());
         assert!(state.inventory.is_some());
     }
@@ -2996,10 +2992,10 @@ mod tests {
                 &rediff,
             ))
             .map_err(|e| ("schedule", e.to_string()))?;
-            let ordered = now(dialect.order_by_catalog(&mut state, &mut conn, &mut plan, frame))
+            let _ordered = now(dialect.order_by_catalog(&mut state, &mut conn, &mut plan, frame))
                 .map_err(|e| ("order_by_catalog", e.to_string()))?;
             #[cfg(debug_assertions)]
-            if !ordered.verified {
+            {
                 pbps_diff::order::shadow::observe_scheduled(
                     base_side,
                     desired_side,
@@ -3007,7 +3003,7 @@ mod tests {
                     &hints.annotations.modules(desired),
                     &plan,
                     pbps_diff::order::shadow::Stage::Final,
-                    ordered.facts.as_ref(),
+                    _ordered.facts.as_ref(),
                     &Default::default(),
                 )
                 .map_err(|e| ("observe_scheduled", e.to_string()))?;
@@ -3874,9 +3870,9 @@ mod tests {
             let plan = pbps_diff::order::propose(change_set(changes));
             let (mut scheduled, check) =
                 now(dialect.schedule(&mut state, conn, plan, frame, None, &rediff))?;
-            let ordered = now(dialect.order_by_catalog(&mut state, conn, &mut scheduled, frame))?;
+            let _ordered = now(dialect.order_by_catalog(&mut state, conn, &mut scheduled, frame))?;
             #[cfg(debug_assertions)]
-            if !ordered.verified {
+            {
                 pbps_diff::order::shadow::observe_scheduled(
                     base_side,
                     desired_side,
@@ -3884,7 +3880,7 @@ mod tests {
                     &hints.annotations.modules(desired),
                     &scheduled,
                     pbps_diff::order::shadow::Stage::Final,
-                    ordered.facts.as_ref(),
+                    _ordered.facts.as_ref(),
                     &Default::default(),
                 )?;
             }
@@ -4005,22 +4001,9 @@ mod tests {
             let ordered_check =
                 now(dialect.order_by_catalog(&mut state, &mut conn, &mut scheduled, frame))
                     .expect("order_by_catalog");
-            use pbps_diff::order::finish;
-            let finished = finish::connected(
-                scheduled,
-                finish::Inputs {
-                    before: base_side,
-                    after: desired_side,
-                    modules: &hints.annotations.modules(&desired),
-                    captured: &Default::default(),
-                },
-                &dialect,
-                finish::Catalog {
-                    slots: ordered_check.facts.as_ref(),
-                    verified: ordered_check.verified,
-                },
-            )
-            .expect("the scheduled plan is observed");
+            let finished = ordered_check
+                .finish(scheduled, frame, &dialect)
+                .expect("the scheduled plan passes the final check");
             assert_eq!(check.engine, "SQLite");
             assert_eq!(check.status, "passed");
             let order: Vec<(&str, String)> = finished

@@ -43,7 +43,9 @@ A successful differ result retains its preceding sort/rename provenance;
 raw proposals remain non-executable even after all shared stages. Existing
 connected continuations take only immutable typed results and order applies
 their proposals. The resolver's complete route and final ordinal remap retain
-its original expansion IDs and exact proof. No stage unions its constraints.
+its original expansion IDs and exact proof. The final check reads the captured
+bindings carried by the plan. Resolver proof remapping still follows the
+connected checks.
 
 New artifacts require `order::seal(OrderedPlan, metadata)`; loaded wire DTOs
 require checked `order::admit` and retain their reviewed order as-is.
@@ -59,8 +61,8 @@ CLI lowering retains concrete PostgreSQL/SQL Server variants and immutable
 operation groups through scripts, bootstrap, dev rehearsal, transactional,
 staged and resume execution. No public raw emit/render entry, mutable plan or
 statement-vector conversion grants execution authority. Compiler-negative
-doctests cover these boundaries and run explicitly in CI. The release
-verifier remains off (DEC-1959.5).
+doctests cover these boundaries and run explicitly in CI. The fresh plan's
+final check runs in every build.
 
 The canonical deployment route also consumes RLS policy-dependent facts before
 certification. The final policy/flag setup and catalog-owner release settlement
@@ -117,12 +119,16 @@ the existing settlements or change their order (DEC-1959.5, DEC-1959.6).
    order-issued trial cursor inside fixed ranges (DEC-2465.1, DEC-2143.9).
 6. **Verification and sealing.** Operation replay checks requirements against
    the baseline after settlement; statement-level name checks use the emitter's
-   intermediate-name metadata. These independent checks run in tests/debug
-   builds; the release verifier remains off. They cannot discover an effect
-   nobody declared: live commutation tests and mutation audits measure that
-   gap. Sealing accepts the certified result; admission is the separate checked
-   route for a reviewed saved artifact and preserves its order. Neither adds
-   proof/origins to checksum bytes (DEC-1959.5).
+   intermediate-name metadata. The final check reads stated effect and
+   annotation legs, membership obligations and name handovers. It replays the
+   requirements and names against the baseline. It returns the same sequence
+   or refuses by name. Standalone plans omit the computed-column releases that
+   need connected ordering. Finishing a PostgreSQL rebuild runs the exact
+   verifier on that sequence and its prepared catalog context. Early debug
+   observations and live commutation checks still exercise the earlier passes
+   and expose missing effects.
+   Admission preserves the reviewed order of a saved artifact. Sealing and
+   admission leave proof and origins out of checksum bytes (DEC-1959.5).
 
 The canonical declaration/catalog entry point is
 `order::deployment::schedule::schedule`.
@@ -447,15 +453,15 @@ only the engine's lexer or catalog knows (DEC-1954.3). From those,
 requirement before the removal, a removal before what needs it gone, a
 rewrite before its readers, and two writes of one resource in their base
 order), replays the operations from the baseline and refuses an order they
-contradict (DEC-1954.6). It runs beside ordering in tests and debug
-builds. `order::schedule::Schedule::settle` applies the constraints supplied
+contradict (DEC-1954.6). Early observations run beside ordering in tests and
+debug builds. `order::schedule::Schedule::settle` applies the constraints supplied
 by the existing canonical stages. It uses Kahn's algorithm, the lowest
 position first among the changes that are
 ready, so a change an edge holds back sinks to right after what it waits for
 and nothing else moves (DEC-1956.2). Each edge carries one `OrderReason`
-(DEC-1956.1). The verifier settles the effect graph over every order it
-observes and requires the order back, so an edge the order reverses is
-named there (DEC-1956.3). The resolver's whole plan is settled over the
+(DEC-1956.1). The early verifier compares the observed order with
+settlement (DEC-1956.3). The final check scans stated edges for reversals
+and replays the given order without settling it. The resolver's whole plan is settled over the
 effects, the name slots' handovers, the annotations and what only its
 evidence states: a surface's bindings and the grants its binding steps need
 (DEC-1968.1, DEC-1968.2). The last column of the table
@@ -1055,7 +1061,7 @@ positions from the certified collection (DEC-1959.5, DEC-2181.1).
 The shadow verifier uses the same type resources, final-incarnation requirements,
 slot claims and releases; pending Types handovers join the existing
 `after_the_rebuilds` slot settlement, which also carries their dependents.
-The release verifier remains unchanged.
+The final check also replays the readable Types claims and releases in every build.
 
 ## Demanded portable creation facets
 

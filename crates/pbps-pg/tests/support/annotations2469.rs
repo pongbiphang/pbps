@@ -359,6 +359,7 @@ async fn an_annotated_partition_column_meeting_keeps_its_edge_and_values() {
     );
     let plan = meetings::canonical(&scene, version, Some(&catalog)).unwrap();
     let engine = Postgres::new().with_server_version(version);
+    let plan = meetings::finish_with_read(&scene, plan, &engine, &catalog);
     for step in &plan.changes {
         for statement in engine.fixture_emit(&step.change, step.strategy).unwrap() {
             db.conn.execute(&statement.sql).await.unwrap();

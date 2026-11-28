@@ -1142,10 +1142,7 @@ impl PlanSession for pbps_mssql::Mssql {
             },
         )
         .await?;
-        Ok(Ordered {
-            verified: false,
-            facts: Some(facts),
-        })
+        Ok(Ordered::ordinary(Some(facts)))
     }
 
     async fn check_final_order(

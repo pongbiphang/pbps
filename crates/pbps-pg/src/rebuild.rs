@@ -6,7 +6,12 @@ use crate::{
 use pbps_db::Conn;
 use pbps_diff::{
     Side,
-    order::{catalog::graph::Root, rebuild::*},
+    order::{
+        CanonicalPlan,
+        catalog::graph::Root,
+        finish::{self, FinishError, FinishedPlan},
+        rebuild::*,
+    },
 };
 use pbps_model::*;
 
@@ -25,8 +30,8 @@ impl From<String> for Error {
     }
 }
 
-/// Retained only in memory: the final observer needs the same explicit
-/// addresses and catalog occupancy as the expansion it is checking.
+/// Finishing needs the explicit addresses and catalog occupancy used by expansion.
+#[derive(Debug)]
 pub struct Verification {
     root: RebuildPartitionedTable,
     prepared: Prepared,
@@ -34,14 +39,14 @@ pub struct Verification {
     naming: pbps_diff::order::catalog::graph::Naming,
 }
 impl Verification {
-    pub fn verify(
+    pub fn finish<D: pbps_dialect::Dialect>(
         &self,
         before: Side<'_>,
         desired: Side<'_>,
         hints: &Hints,
-        changes: &ChangeSet,
-        dialect: &dyn pbps_dialect::Dialect,
-    ) -> Result<(), String> {
+        plan: CanonicalPlan<D>,
+        dialect: &D,
+    ) -> Result<FinishedPlan<D>, FinishError> {
         let input = Input {
             root: &self.root,
             before,
@@ -51,7 +56,7 @@ impl Verification {
             naming: &self.naming,
             mode: PlanMode::Transactional,
         };
-        verify_plan(&input, &self.prepared, changes, dialect)
+        finish::rebuild(plan, &input, &self.prepared, dialect)
     }
 }
 

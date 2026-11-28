@@ -62,6 +62,23 @@ pub struct Obligation {
     pub refusal: String,
 }
 
+pub(super) fn symbolic_obligation(
+    issue: &super::membership::Problem,
+    operations: &[Operation],
+) -> Obligation {
+    let operation = operations
+        .iter()
+        .position(|op| op.id() == issue.operation)
+        .expect("a symbolic issue belongs to this operation collection");
+    Obligation {
+        operation,
+        refusal: format!(
+            "{}: {issue}",
+            pbps_model::Text::from(operations[operation].change().subject()).shown()
+        ),
+    }
+}
+
 /// Why a schedule has no order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
@@ -261,17 +278,8 @@ impl Schedule {
             }
         }
         for issue in &graph.symbolic_unmet {
-            let at = operations
-                .iter()
-                .position(|op| op.id() == issue.operation)
-                .expect("a symbolic issue belongs to this operation collection");
-            schedule.obligation(
-                at,
-                format!(
-                    "{}: {issue}",
-                    pbps_model::Text::from(operations[at].change().subject()).shown()
-                ),
-            );
+            let obligation = symbolic_obligation(issue, operations);
+            schedule.obligation(obligation.operation, obligation.refusal);
         }
         schedule
     }

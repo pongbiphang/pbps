@@ -293,16 +293,15 @@ pub fn lower_between<D: crate::emission::Engine>(
         dialect,
     )?
     .changes;
-    let ordered = finish::offline(
+    let ordered = rehearsal_final_order(finish::offline(
         build,
         finish::Inputs {
             before,
             after,
             modules: &hints.annotations.modules(after.schema),
-            captured: &Default::default(),
         },
         dialect,
-    )?
+    ))?
     .ordered(pbps_model::PlanMode::Transactional, dialect);
     let lowered = crate::statements(&ordered, selected)?;
     Ok((lowered, pbps_dialect::PlanPayload::operations(&ordered)))
@@ -1518,5 +1517,23 @@ mod tests {
         ] {
             assert!(!is_authorization(&change), "{change:?}");
         }
+    }
+}
+
+fn rehearsal_final_order<T>(
+    order: Result<T, pbps_diff::order::finish::FinishError>,
+) -> anyhow::Result<T> {
+    order.map_err(Into::into)
+}
+
+#[cfg(test)]
+mod final_order_tests {
+    use super::*;
+
+    #[test]
+    fn rehearsal_final_order_keeps_the_named_base_build_error() {
+        let error = rehearsal_final_order::<()>(Err(crate::final_order_refusal())).unwrap_err();
+        assert!(error.is::<pbps_diff::order::finish::FinishError>());
+        assert!(error.to_string().contains("app.first"), "{error}");
     }
 }

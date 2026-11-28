@@ -2,15 +2,13 @@
 
 use pbps_dialect::Dialect;
 use pbps_model::ModuleDeps;
-#[cfg(any(test, debug_assertions))]
 use pbps_model::operation::Requirement;
 use pbps_model::operation::{
     Effects, Operation, OperationId, Operations, OwnerError, Owners, Snapshot, effects,
 };
 
-#[cfg(any(test, debug_assertions))]
-use super::edges::Because;
 use super::edges::{Baseline, Checks, Graph, graph};
+use super::edges::{Because, Edge};
 use super::verify::{Violation, verify_with};
 
 /// Everything the effects say about one ordered plan.
@@ -367,7 +365,6 @@ impl Shadowed {
 }
 
 /// Why a finding that would fail the order check is set aside.
-#[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Waiver {
     /// No order can provide the missing prerequisite (DEC-1954.6).
@@ -385,7 +382,6 @@ pub(super) enum Waiver {
 /// What the order check does with a finding. It is decided where the finding
 /// is produced, from the typed condition there; the printed line only renders
 /// it, so a spelling can never change whether the run fails (DEC-2993.6).
-#[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Verdict {
     /// The order could be wrong: the run fails.
@@ -397,14 +393,12 @@ pub(super) enum Verdict {
 }
 
 /// One finding of the order check: its verdict and the line that shows it.
-#[cfg(any(test, debug_assertions))]
 #[derive(Debug)]
 pub(super) struct Finding {
     pub(super) verdict: Verdict,
     pub(super) line: String,
 }
 
-#[cfg(any(test, debug_assertions))]
 impl Finding {
     fn fail(line: String) -> Self {
         let verdict = Verdict::Fail;
@@ -430,12 +424,18 @@ impl Finding {
     }
 }
 
-#[cfg(any(test, debug_assertions))]
 #[derive(Debug)]
 pub(super) struct Findings(pub(super) Vec<Finding>);
 
-#[cfg(any(test, debug_assertions))]
 impl Findings {
+    pub(super) fn first_failure(self) -> Option<String> {
+        self.0
+            .into_iter()
+            .find(|finding| finding.verdict == Verdict::Fail)
+            .map(|finding| finding.line)
+    }
+
+    #[cfg(any(test, debug_assertions))]
     pub(super) fn fails(&self) -> bool {
         self.0.iter().any(|finding| match finding.verdict {
             Verdict::Fail => true,
@@ -490,7 +490,6 @@ pub(crate) fn observe_plan(
 /// the order that runs on a connected SQL Server plan: `computed_order` moves
 /// a function's change after the computed column that reads it from the
 /// catalog's edges (DEC-1431.1), so the pair is recorded and not failed there.
-#[cfg(any(test, debug_assertions))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// The class order, before the shared schedule releases constraint slots
@@ -501,6 +500,8 @@ pub enum Stage {
     Differ,
     /// The order that runs: every pass has finished (S3, #1954).
     Final,
+    /// The standalone route has no catalog pass for computed releases.
+    Offline,
 }
 
 /// The verifier on the order a caller outside this crate holds, in tests and
@@ -687,24 +688,37 @@ pub(crate) fn clip(text: &mut String, max: usize) {
 
 /// The effect verifier's findings and their verdicts.
 #[cfg(any(test, debug_assertions))]
+fn debug_name(ops: &[Operation], id: OperationId) -> String {
+    ops.iter().find(|op| op.id() == id).map_or_else(
+        || id.to_string(),
+        |op| {
+            let mut text = format!("{id} {:?}", op.change());
+            clip(&mut text, 160);
+            text
+        },
+    )
+}
+
+#[cfg(any(test, debug_assertions))]
 pub(super) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> Findings {
-    let find = |id: OperationId| ops.iter().find(|o| o.id() == id);
-    let name = |id: OperationId| {
-        find(id).map_or_else(
-            || id.to_string(),
-            |o| {
-                let mut text = format!("{id} {:?}", o.change());
-                clip(&mut text, 160);
-                text
-            },
-        )
-    };
+    judge_effects(ops, &report.graph, &report.violations, stage, |id| {
+        debug_name(ops, id)
+    })
+}
+
+pub(super) fn judge_effects(
+    ops: &[Operation],
+    graph: &Graph,
+    violations: &[Violation],
+    stage: Stage,
+    name: impl Fn(OperationId) -> String,
+) -> Findings {
     // An obligation that nothing in the plan provides and the baseline lacks
     // cannot be met by any order: the input disagrees with itself (for example
     // an identity file naming a column the base declarations lack). It is
     // recorded, but only an order that could be wrong fails the run.
     let unprovided = |operation: OperationId, requirement: &Requirement| {
-        report.graph.unmet.iter().any(|u| {
+        graph.unmet.iter().any(|u| {
             ops.get(u.operation).is_some_and(|o| o.id() == operation)
                 && (&u.requirement == requirement
                     || matches!((&u.requirement, requirement),
@@ -718,7 +732,7 @@ pub(super) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> Finding
     // runs on the order that runs.
     let module_op = |id: OperationId| {
         stage != Stage::Final
-            && find(id).is_some_and(|o| {
+            && ops.iter().find(|op| op.id() == id).is_some_and(|o| {
                 matches!(
                     o.change(),
                     pbps_model::Change::Module(pbps_model::ModuleChange::AlterModule { .. })
@@ -735,16 +749,23 @@ pub(super) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> Finding
             }
         )
     };
-    let pending_release = if stage == Stage::Final {
-        vec![false; ops.len()]
-    } else {
-        super::release_inputs::pending_consumers(&report.graph, ops)
+    let pending_release = match stage {
+        Stage::BeforeSchedule | Stage::Differ => {
+            super::release_inputs::pending_consumers(graph, ops)
+        }
+        Stage::Final | Stage::Offline => vec![false; ops.len()],
     };
-    let findings = report
-        .violations
+    let findings = violations
         .iter()
         .map(|v| match v {
-            Violation::Symbolic(problem) => Finding::fail(format!("symbolic {problem}")),
+            Violation::Symbolic(problem) => {
+                let scope = if matches!(stage, Stage::Final | Stage::Offline) {
+                    format!("{}: ", name(problem.operation))
+                } else {
+                    String::new()
+                };
+                Finding::fail(format!("symbolic {scope}{problem}"))
+            }
             Violation::Unmet {
                 operation,
                 requirement,
@@ -786,7 +807,7 @@ pub(super) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> Finding
                     name(*after),
                     edge.because
                 );
-                if (stage != Stage::Final && super::edges::connected_module_release(edge, ops))
+                if catalog_release_waits(ops, edge, stage)
                     || pending_release[edge.before]
                     || pending_release[edge.after]
                 {
@@ -810,6 +831,10 @@ pub(super) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> Finding
     Findings(findings)
 }
 
+pub(super) fn catalog_release_waits(ops: &[Operation], edge: &Edge, stage: Stage) -> bool {
+    stage != Stage::Final && super::edges::connected_module_release(edge, ops)
+}
+
 /// The name slots' findings and their verdicts
 /// (#1964, DEC-1964.2). A claim on a held name and a broken handover fail it;
 /// a comparison no fact answers is recorded as skipped, with the engine and
@@ -823,19 +848,31 @@ pub(super) fn judge_slots(
     facts: Option<&pbps_dialect::slots::CatalogFacts>,
     stage: Stage,
 ) -> Findings {
-    use super::slots::{SlotViolation, analyse, verify};
-    let slots = analyse(ops, owners, before, dialect);
-    // A name the models cannot read fails the run with its own text: the
-    // judge has no other way to refuse.
-    let (violations, skipped) = match verify(ops, &slots, dialect, facts, owners, before) {
-        Ok(found) => found,
-        Err(why) => return Findings(vec![Finding::fail(format!("slot replay: {why}"))]),
-    };
+    let slots = super::slots::analyse(ops, owners, before, dialect);
+    judge_slot_rows(ops, &slots, owners, before, dialect, facts, stage, |id| {
+        debug_name(ops, id)
+    })
+    .unwrap_or_else(|why| Findings(vec![Finding::fail(format!("slot replay: {why}"))]))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn judge_slot_rows(
+    ops: &[Operation],
+    slots: &super::slots::Slots,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    facts: Option<&pbps_dialect::slots::CatalogFacts>,
+    stage: Stage,
+    name: impl Fn(OperationId) -> String,
+) -> Result<Findings, OwnerError> {
+    use super::slots::SlotViolation;
+    let (violations, skipped) = super::slots::verify(ops, slots, dialect, facts, owners, before)?;
     // The class order has not visited after_the_rebuilds yet. Type and
     // constraint-trigger handovers join that existing slot settlement;
     // every subsequent replay must satisfy them (DEC-1635.3, DEC-2100.1).
     let pending: Vec<_> = if stage == Stage::BeforeSchedule {
-        super::slots::edges(&slots, None, &[])
+        super::slots::edges(slots, None, &[])
             .into_iter()
             .filter(|e| {
                 matches!(e.slot.namespace, pbps_dialect::slots::Namespace::Types(_))
@@ -888,16 +925,6 @@ pub(super) fn judge_slots(
             stage == Stage::BeforeSchedule
                 && matches!(slot.namespace, pbps_dialect::slots::Namespace::Types(_))
         }
-    };
-    let name = |id: OperationId| {
-        ops.iter().find(|o| o.id() == id).map_or_else(
-            || id.to_string(),
-            |o| {
-                let mut text = format!("{id} {:?}", o.change());
-                clip(&mut text, 160);
-                text
-            },
-        )
     };
     let mode = if facts.is_some() {
         "connected"
@@ -989,7 +1016,7 @@ pub(super) fn judge_slots(
             dialect.name()
         )));
     }
-    Findings(findings)
+    Ok(Findings(findings))
 }
 
 /// Appends `text` to the report file, creating it.

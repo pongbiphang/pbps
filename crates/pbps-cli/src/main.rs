@@ -1508,13 +1508,7 @@ fn run() -> anyhow::Result<()> {
                     errors.print_human();
                 }
                 // With what the plan had gathered beside the failure (#1703).
-                return output::or_unanswerable_beside(
-                    "plan",
-                    json,
-                    "plan.failed",
-                    planned,
-                    carried,
-                );
+                return connected_plan_outcome(json, planned, carried);
             }
             if !assertions.is_empty() {
                 refuse(
@@ -5890,10 +5884,8 @@ fn cmd_plan(
         );
         let refused = policy.iter().any(|f| f.severity == output::Severity::Error);
         findings.extend(policy);
-        let finished = output::or_unanswerable(
-            "plan",
+        let finished = offline_order_outcome(
             json,
-            "plan.unorderable",
             finish::offline(
                 cs,
                 finish::Inputs {
@@ -5906,11 +5898,9 @@ fn cmd_plan(
                         ids: &res.ids,
                     },
                     modules: &hints.annotations.modules(&loaded.schema),
-                    captured: &Default::default(),
                 },
                 dialect.as_ref(),
-            )
-            .map_err(anyhow::Error::from),
+            ),
         )?;
         let cs = finished.changes();
 
@@ -8032,5 +8022,97 @@ mod command_stack_tests {
             bytes <= 16 * size_of::<usize>(),
             "StateCommand grew to {bytes} bytes; box large command arguments"
         );
+    }
+}
+
+fn offline_order_outcome<T>(
+    json: bool,
+    order: Result<T, pbps_diff::order::finish::FinishError>,
+) -> anyhow::Result<T> {
+    output::or_unanswerable("plan", json, "plan.unorderable", order.map_err(Into::into))
+}
+
+fn connected_plan_outcome(
+    json: bool,
+    planned: anyhow::Result<()>,
+    carried: Vec<output::Finding>,
+) -> anyhow::Result<()> {
+    output::or_unanswerable_beside("plan", json, "plan.failed", planned, carried)
+}
+
+#[cfg(test)]
+mod final_order_test;
+#[cfg(test)]
+use final_order_test::final_order_refusal;
+
+#[cfg(test)]
+mod final_order_envelope_tests {
+    use super::*;
+    use pbps_diff::order::finish::FinishError;
+
+    fn json_from_child(
+        test: &str,
+        map: impl FnOnce() -> anyhow::Error,
+    ) -> Option<serde_json::Value> {
+        let child_marker = "PBPS_TEST_FINAL_ORDER_ENVELOPE_CHILD";
+        if std::env::var_os(child_marker).is_some() {
+            let error = map();
+            assert!(error.is::<FinishError>(), "{error:#}");
+            return None;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(child_marker, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{stdout} {:?}", output.stderr);
+        let start = stdout.find('{').expect("the command emitted a JSON object");
+        let end = stdout.rfind('}').unwrap();
+        Some(serde_json::from_str(&stdout[start..=end]).unwrap())
+    }
+
+    #[test]
+    fn offline_final_order_reports_plan_unorderable() {
+        if let Some(report) = json_from_child(
+            "final_order_envelope_tests::offline_final_order_reports_plan_unorderable",
+            || offline_order_outcome::<()>(true, Err(final_order_refusal())).unwrap_err(),
+        ) {
+            let finding = &report["findings"][0];
+            assert_eq!(finding["id"], "plan.unorderable");
+            let message = finding["message"].as_str().unwrap();
+            assert!(
+                message.contains("app.first") && message.contains("app.second"),
+                "{message}"
+            );
+        }
+        let error = offline_order_outcome::<()>(false, Err(final_order_refusal())).unwrap_err();
+        assert!(error.is::<FinishError>());
+    }
+
+    #[test]
+    fn connected_final_order_reports_plan_failed_and_preserves_warnings() {
+        if let Some(report) = json_from_child(
+            "final_order_envelope_tests::connected_final_order_reports_plan_failed_and_preserves_warnings",
+            || {
+                connected_plan_outcome(
+                    true,
+                    Err(final_order_refusal().into()),
+                    vec![output::Finding::warning(
+                        "fixture.warning",
+                        "earlier warning",
+                    )],
+                )
+                .unwrap_err()
+            },
+        ) {
+            assert_eq!(report["findings"][0]["id"], "plan.failed");
+            assert_eq!(report["findings"][1]["id"], "fixture.warning");
+            let message = report["findings"][0]["message"].as_str().unwrap();
+            assert!(
+                message.contains("app.first") && message.contains("app.second"),
+                "{message}"
+            );
+        }
     }
 }

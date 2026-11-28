@@ -54,6 +54,13 @@ pub struct PartStep {
 /// ```compile_fail
 /// fn upgrade(p: pbps_diff::order::rebuild::Prepared) -> pbps_diff::order::PlanningPlan { p }
 /// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::rebuild::Prepared;
+/// fn replace_inventory(prepared: Prepared) -> Prepared {
+///     Prepared { parts: Vec::new(), ..prepared }
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct Prepared {
     logical: Vec<PlannedChange>,
