@@ -1950,7 +1950,9 @@ mod tests {
 
     #[test]
     fn a_snapshot_records_its_dialect_and_round_trips() {
-        for dialect in ["mssql", "postgres"] {
+        // `pbps-model` is dialect-agnostic and cannot depend on `pbps-config`;
+        // these are representative wire spellings rather than an engine registry.
+        for dialect in ["mssql", "postgres", "sqlite"] {
             let snapshot = StateSnapshot::new(
                 StateKind::Apply,
                 dialect,

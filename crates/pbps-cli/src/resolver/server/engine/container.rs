@@ -170,7 +170,7 @@ static MSSQL: ContainerSupport = ContainerSupport {
 /// Every engine that has support. [`by_label`] reads it, and [`support`] must
 /// agree with it (pinned by a test), so that a run's driver and a leftover's
 /// label reach the same entry.
-static TABLE: [&ContainerSupport; 2] = [&POSTGRES, &MSSQL];
+pub(crate) static TABLE: [&ContainerSupport; 2] = [&POSTGRES, &MSSQL];
 
 /// The support of the engine `driver` names, or `None` where it has none.
 ///
@@ -296,12 +296,14 @@ fn mssql_read_keeper<'a>(
 mod tests {
     use super::*;
 
-    const DRIVERS: [Driver; 2] = [Driver::Mssql, Driver::Postgres];
+    /// Engines that run owned Docker scratch containers; in-process engines
+    /// (such as SQLite) have no container support and return `None`.
+    const CONTAINER_SCRATCH_DRIVERS: [Driver; 2] = [Driver::Mssql, Driver::Postgres];
     const ENTROPY: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
     fn the_table_and_the_selection_reach_the_same_entry_for_each_engine() {
-        for driver in DRIVERS {
+        for driver in CONTAINER_SCRATCH_DRIVERS {
             let selected = support(driver).expect("both engines have support");
             assert_eq!(selected.driver, driver);
             assert!(std::ptr::eq(
@@ -314,7 +316,7 @@ mod tests {
         for entry in TABLE {
             assert!(std::ptr::eq(support(entry.driver).unwrap(), entry));
         }
-        assert_eq!(TABLE.len(), DRIVERS.len());
+        assert_eq!(TABLE.len(), CONTAINER_SCRATCH_DRIVERS.len());
         assert_ne!(TABLE[0].label, TABLE[1].label);
     }
 
@@ -346,7 +348,7 @@ mod tests {
     fn a_support_is_admitted_as_it_is() {
         let admitted = require("PostgreSQL", Some(&POSTGRES)).unwrap();
         assert!(std::ptr::eq(admitted, &POSTGRES));
-        for driver in DRIVERS {
+        for driver in CONTAINER_SCRATCH_DRIVERS {
             assert!(std::ptr::eq(
                 select(driver).unwrap(),
                 support(driver).unwrap()

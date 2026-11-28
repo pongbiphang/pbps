@@ -103,6 +103,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
 
 #[test]
 fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
+    // Only dialects supporting stored routines (SQLite has no procedures or functions).
     for dialect in [
         &pbps_pg::Postgres::new() as &dyn FixtureEmission,
         &pbps_mssql::Mssql,

@@ -82,9 +82,13 @@ fn refused_command(d: &Demo, args: &[&str], location: Option<&Path>, command: &m
     );
 }
 
+/// Server dialects used by these fixture tests (`dbo.t`, `role:`, fingerprint
+/// keys and server connection strings do not apply to SQLite).
+const SERVER_DIALECTS: [&str; 2] = ["mssql", "postgres"];
+
 #[test]
 fn equivalent_artifact_destinations_refuse_before_any_identity_or_artifact_write() {
-    for dialect in ["mssql", "postgres"] {
+    for dialect in SERVER_DIALECTS {
         let d = project("equivalent", dialect, true);
         std::fs::create_dir(d.dir.join("nested")).unwrap();
         std::fs::write(d.dir.join("both.out"), "already reviewed artifact\n").unwrap();
@@ -107,7 +111,7 @@ fn equivalent_artifact_destinations_refuse_before_any_identity_or_artifact_write
 
 #[test]
 fn project_inputs_are_never_plan_or_sql_destinations() {
-    for dialect in ["mssql", "postgres"] {
+    for dialect in SERVER_DIALECTS {
         let d = project("inputs", dialect, true);
         std::fs::rename(d.dir.join("schema"), d.dir.join("declarations")).unwrap();
         std::fs::rename(crate::idtree::dir(&d.dir), d.dir.join("identities")).unwrap();
@@ -144,7 +148,7 @@ fn project_inputs_are_never_plan_or_sql_destinations() {
 
 #[test]
 fn an_absent_identity_file_cannot_be_replaced_by_an_artifact() {
-    for dialect in ["mssql", "postgres"] {
+    for dialect in SERVER_DIALECTS {
         let d = project("absent-ids", dialect, false);
         for flag in ["--out", "--sql"] {
             refused(
@@ -166,7 +170,7 @@ fn an_absent_identity_file_cannot_be_replaced_by_an_artifact() {
 
 #[test]
 fn configured_fingerprint_keys_are_inputs_even_without_selecting_their_environment() {
-    for dialect in ["mssql", "postgres"] {
+    for dialect in SERVER_DIALECTS {
         let d = project("fingerprint-keys", dialect, true);
         let absolute = d.dir.join("spare.key");
         for path in [d.dir.join("target.key"), absolute.clone()] {
@@ -222,6 +226,7 @@ fn configured_fingerprint_keys_are_inputs_even_without_selecting_their_environme
 
 #[test]
 fn connected_planning_refuses_output_aliases_before_contacting_the_target() {
+    // Server connection strings only; SQLite targets are file paths.
     for (dialect, target) in [
         (
             "mssql",
@@ -454,7 +459,7 @@ fn assertion_aliases_follow_the_reader_when_the_working_directory_differs_from_t
 
 #[test]
 fn snapshot_baselines_and_resolver_externals_files_are_protected_inputs() {
-    for dialect in ["mssql", "postgres"] {
+    for dialect in SERVER_DIALECTS {
         let d = project("baselines", dialect, true);
         let ids: serde_json::Value = serde_json::to_value(crate::idtree::model(&d.dir)).unwrap();
         let baseline = serde_json::json!({
@@ -548,7 +553,7 @@ fn symlink_and_hardlink_aliases_protect_inputs_and_artifacts() {
 
 #[test]
 fn distinct_outputs_keep_overwrite_behavior_and_explain_reads_the_preview() {
-    for dialect in ["mssql", "postgres"] {
+    for dialect in SERVER_DIALECTS {
         let d = project("distinct", dialect, true);
         for file in ["reviewed.json", "reviewed.sql"] {
             std::fs::write(d.dir.join(file), "same old artifact bytes\n").unwrap();

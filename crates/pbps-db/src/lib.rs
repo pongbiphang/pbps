@@ -653,6 +653,15 @@ pub enum Driver {
     Sqlite,
 }
 
+impl Driver {
+    /// Every driver this crate can open, in canonical order.
+    ///
+    /// Tied to `pbps_config::DialectName::ALL` by a bijection test in
+    /// `pbps-cli` (which sees both crates; `pbps-db` does not depend on
+    /// `pbps-config`).
+    pub const ALL: &'static [Self] = &[Self::Mssql, Self::Postgres, Self::Sqlite];
+}
+
 /// An open connection.
 ///
 /// An enum rather than a trait object or a type parameter, decided with both

@@ -297,7 +297,7 @@ fn an_engine_without_a_resolver_omits_the_no_fingerprint_key_note() {
         "expected no fingerprint-key note for an engine without a resolver: {sqlite_findings:?}"
     );
     // Negative: server engines (PostgreSQL, SQL Server) still emit the note.
-    for driver in [pbps_db::Driver::Postgres, pbps_db::Driver::Mssql] {
+    for driver in crate::engine::server_drivers() {
         let server_findings = for_request(&project, None, driver);
         assert_eq!(server_findings.len(), 3, "{driver:?}: {server_findings:?}");
         assert!(

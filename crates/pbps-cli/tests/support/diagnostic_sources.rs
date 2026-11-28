@@ -1,8 +1,12 @@
 use super::Project;
 
+/// Dialects supporting `identity: [1, 1]` and managed `data:` rows on `app.t`
+/// (SQLite supports neither).
+const IDENTITY_AND_DATA_DIALECTS: [&str; 2] = ["postgres", "mssql"];
+
 #[test]
 fn conflicting_default_and_identity_do_not_invent_an_omitted_value_error() {
-    for dialect in ["postgres", "mssql"] {
+    for dialect in IDENTITY_AND_DATA_DIALECTS {
         for mode in ["exact", "ensure"] {
             let p = Project::new();
             p.write("pbps.yml", &format!("dialect: {dialect}\n"));
@@ -108,7 +112,7 @@ fn messages(p: &Project) -> Vec<String> {
 
 #[test]
 fn supplied_sources_survive_row_diagnostics_without_hiding_independent_errors() {
-    for dialect in ["postgres", "mssql"] {
+    for dialect in IDENTITY_AND_DATA_DIALECTS {
         for mode in ["exact", "ensure"] {
             for mask in 0..8 {
                 for body in ["", ", v: null", ", v: 9"] {
@@ -152,7 +156,7 @@ fn supplied_sources_survive_row_diagnostics_without_hiding_independent_errors() 
 
 #[test]
 fn supplied_sources_survive_key_diagnostics_and_empty_scope_controls() {
-    for dialect in ["postgres", "mssql"] {
+    for dialect in IDENTITY_AND_DATA_DIALECTS {
         for mode in ["exact", "ensure"] {
             for mask in 0..8 {
                 for rows in ["{}", "{'1': {}}"] {

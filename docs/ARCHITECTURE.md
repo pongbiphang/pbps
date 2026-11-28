@@ -64,8 +64,11 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 - Two places in `pbps-cli` name an engine to *choose* it: `dialect_for` (the
   pure `Dialect`) and `db::driver_for` (the driver). `engine` names both to
   *route*, by what the connection turned out to be, and nothing else in the
-  crate names either. A third engine is a compile error in every `engine`
-  function until it has an answer for each.
+  crate names either. A new engine is a compile error in every `engine`
+  function until it has an answer for each; see
+  [ADDING-AN-ENGINE.md](ADDING-AN-ENGINE.md) for the full checklist, the
+  cross-crate consistency tests, and `scripts/check-engine-lists.py`
+  (DEC-2798.18).
 - `plan --db` reaches the engine's steps (the reads before the resolver, the
   ones inside the planning transaction, the site vetting, the support rows, the
   seals and the proofs after it) through `engine::plan_session::PlanSession`,

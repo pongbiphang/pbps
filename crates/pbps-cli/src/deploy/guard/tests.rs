@@ -2145,10 +2145,8 @@ fn a_rename_into_a_retired_name_carries_untouched_references() {
         tables: [(a, parent), (child.clone(), referencing)].into(),
         ..Default::default()
     };
-    for dialect in [
-        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
-        &pbps_mssql::Mssql,
-    ] {
+    for selected in multi_schema_dialects() {
+        let dialect = selected.as_ref();
         refuse_unplanned_movement(dialect, &changes, &before, &after, "test", Settled::Closing)
             .expect("the plan explains the baseline's occupied destination; the child's reference follows only the surviving parent");
         let mut wrong = after.clone();
@@ -2213,10 +2211,8 @@ fn a_refilled_rename_source_keeps_the_moved_tables_incoming_reference() {
         .into(),
         ..Default::default()
     };
-    for dialect in [
-        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
-        &pbps_mssql::Mssql,
-    ] {
+    for selected in multi_schema_dialects() {
+        let dialect = selected.as_ref();
         refuse_unplanned_movement(dialect, &changes, &before, &after, "test", Settled::Closing)
             .expect("b's source is occupied by a's table, but b's original table and incoming reference have moved to c");
         let mut wrong = after.clone();
@@ -2276,10 +2272,8 @@ fn closing_reads_keep_untouched_references_after_the_parent_has_moved() {
         to,
         defaults: vec![],
     })]);
-    for dialect in [
-        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
-        &pbps_mssql::Mssql,
-    ] {
+    for selected in multi_schema_dialects() {
+        let dialect = selected.as_ref();
         super::super::staged_comparison(
             dialect,
             &changes,
@@ -2348,10 +2342,8 @@ fn incoming_references_follow_column_identity_through_a_name_swap() {
         tables: [(name, parent), (child.clone(), referencing)].into(),
         ..Default::default()
     };
-    for dialect in [
-        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
-        &pbps_mssql::Mssql,
-    ] {
+    for selected in multi_schema_dialects() {
+        let dialect = selected.as_ref();
         refuse_unplanned_movement(dialect, &changes, &before, &after, "test", Settled::Closing)
             .expect("the untouched child still references the original primary-key column");
         let mut wrong = after.clone();
@@ -2517,6 +2509,14 @@ fn computed_builds_require_persistence_and_declared_not_null() {
     }
 }
 
+/// Multi-schema server dialects (`app.` schema tables); SQLite allows only `main`.
+fn multi_schema_dialects() -> Vec<crate::emission::SelectedDialect> {
+    crate::engine::server_drivers()
+        .into_iter()
+        .map(crate::engine::apply_session::selected)
+        .collect()
+}
+
 #[test]
 fn a_completed_drop_requires_the_table_to_be_absent() {
     let changes = plan(vec![Change::Table(TableChange::DropTable {
@@ -2525,10 +2525,8 @@ fn a_completed_drop_requires_the_table_to_be_absent() {
         detach_from: None,
     })]);
     let before = schema(table());
-    for dialect in [
-        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
-        &pbps_mssql::Mssql,
-    ] {
+    for selected in multi_schema_dialects() {
+        let dialect = selected.as_ref();
         for read in [Settled::Whole, Settled::Closing] {
             refuse_unplanned_movement(dialect, &changes, &before, &Schema::default(), "test", read)
                 .expect("the promised drop has removed its table");

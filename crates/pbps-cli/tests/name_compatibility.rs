@@ -202,6 +202,7 @@ fn explain_shows_hostile_names_exactly_once_and_keeps_master_json() {
 
 #[test]
 fn a_dialect_refusal_escapes_a_table_name_exactly_once() {
+    // Multi-schema server dialects (`app.` schema tables; SQLite allows only `main`).
     for dialect in [
         &pbps_pg::Postgres::new() as &dyn FixtureEmission,
         &pbps_mssql::Mssql,

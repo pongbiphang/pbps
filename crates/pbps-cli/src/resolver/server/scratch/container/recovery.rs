@@ -774,8 +774,9 @@ mod tests {
             valid["Config"]["Labels"][ENGINE] = label;
             state_from_json(&valid.to_string(), T).unwrap()
         };
-        for driver in [pbps_db::Driver::Postgres, pbps_db::Driver::Mssql] {
-            let expected = engine::container::owned(driver);
+        // Derived from the container support table so every engine that owns
+        // Docker scratch containers is checked for label recovery.
+        for expected in engine::container::TABLE {
             let state = with(expected.label.into());
             assert!(std::ptr::eq(state.support.unwrap(), expected));
         }

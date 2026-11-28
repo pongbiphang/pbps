@@ -124,10 +124,13 @@ fn steps(plan: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// Multi-schema server dialects (`app.a`/`app.b` views; SQLite allows only `main`).
+const MULTI_SCHEMA_DIALECTS: [&str; 2] = ["postgres", "mssql"];
+
 #[test]
 fn a_removed_modules_recorded_edge_orders_drops_like_the_git_baseline() {
     let mut orders = Vec::new();
-    for dialect in ["postgres", "mssql"] {
+    for dialect in MULTI_SCHEMA_DIALECTS {
         let p = Project::new(dialect, true);
         let state = p.state(&p.snapshot());
         p.remove_views();
@@ -144,7 +147,7 @@ fn a_removed_modules_recorded_edge_orders_drops_like_the_git_baseline() {
 
 #[test]
 fn a_state_without_edges_keeps_the_unannotated_drop_order() {
-    for dialect in ["postgres", "mssql"] {
+    for dialect in MULTI_SCHEMA_DIALECTS {
         let p = Project::new(dialect, false);
         let row = p.snapshot();
         assert_eq!(row["object_deps"], serde_json::json!([]));
@@ -167,7 +170,7 @@ fn a_state_without_edges_keeps_the_unannotated_drop_order() {
 
 #[test]
 fn a_kept_modules_declared_edge_replaces_its_recorded_edge() {
-    for dialect in ["postgres", "mssql"] {
+    for dialect in MULTI_SCHEMA_DIALECTS {
         let p = Project::new(dialect, true);
         let mut row = p.snapshot();
         let state = p.state(&row);
@@ -193,7 +196,7 @@ fn a_kept_modules_declared_edge_replaces_its_recorded_edge() {
 
 #[test]
 fn a_legacy_states_migrated_edges_order_removed_modules() {
-    for dialect in ["postgres", "mssql"] {
+    for dialect in MULTI_SCHEMA_DIALECTS {
         let p = Project::new(dialect, true);
         let mut row = p.snapshot();
         row["version"] = (pbps_model::state::OBJECT_DEPS_VERSION - 1).into();

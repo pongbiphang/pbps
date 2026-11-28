@@ -452,6 +452,7 @@ fn type_refusals_escape_once_at_whole_and_individual_boundaries() {
     );
     let unknown = ColumnType::new("unknown", vec![TypeArg::Ident(NAME.into())]);
     let unknown_shown = r#"unknown(type\nline\r"'\u{1b}[31m\u{9b}\\\u{202e}名前)"#;
+    // Server dialects with fixed built-in type catalogs (SQLite accepts declared type names by affinity).
     for dialect in [
         &pbps_pg::Postgres::new() as &dyn Dialect,
         &pbps_mssql::Mssql,

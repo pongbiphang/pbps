@@ -299,10 +299,11 @@ mod tests {
     use super::*;
 
     /// The one thing this function exists to prevent: a password reaching a log.
+    /// Network-server drivers only; SQLite paths carry no secrets and are tested below.
     #[test]
     fn redaction_never_leaks_the_password() {
         let s = "Server=db.internal,1433;Database=app;User Id=deploy;Password=hunter2;TrustServerCertificate=true";
-        for driver in [pbps_db::Driver::Mssql, pbps_db::Driver::Postgres] {
+        for driver in crate::engine::server_drivers() {
             let label = redact(driver, s);
             assert_eq!(label, "db.internal,1433/app");
             assert!(!label.contains("hunter2"));
@@ -312,7 +313,7 @@ mod tests {
 
     #[test]
     fn redaction_accepts_the_other_spellings() {
-        for driver in [pbps_db::Driver::Mssql, pbps_db::Driver::Postgres] {
+        for driver in crate::engine::server_drivers() {
             assert_eq!(
                 redact(driver, "Data Source=srv;Initial Catalog=db;Password=x"),
                 "srv/db"
@@ -325,7 +326,7 @@ mod tests {
     /// "I did not recognize it" is not a reason to assume it is harmless.
     #[test]
     fn an_unrecognized_string_is_not_echoed() {
-        for driver in [pbps_db::Driver::Mssql, pbps_db::Driver::Postgres] {
+        for driver in crate::engine::server_drivers() {
             let label = redact(driver, "this-is-not-a-connection-string-Password=hunter2");
             assert!(!label.contains("hunter2"), "{label}");
         }

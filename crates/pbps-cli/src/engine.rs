@@ -84,24 +84,59 @@ pub(crate) fn owned_test_of(driver: Driver) -> &'static OwnedTest {
     require_owned_test(driver).expect("both engines own a test scratch")
 }
 
+/// Every engine's driver, derived from [`pbps_config::DialectName::ALL`] so
+/// tests over all engines cannot miss a fourth dialect.
+#[cfg(test)]
+pub(crate) fn all_drivers() -> Vec<Driver> {
+    pbps_config::DialectName::ALL
+        .iter()
+        .copied()
+        .map(crate::db::driver_for)
+        .collect()
+}
+
+/// Network-server engines (not in-process file databases such as SQLite),
+/// derived from [`pbps_config::DialectName::ALL`] through each engine's
+/// [`profile::Profile::connection_is_path`] fact.
+#[cfg(test)]
+pub(crate) fn server_drivers() -> Vec<Driver> {
+    let drivers: Vec<Driver> = all_drivers()
+        .into_iter()
+        .filter(|&driver| !connection_is_path(driver))
+        .collect();
+    assert!(!drivers.is_empty(), "at least one server driver must exist");
+    drivers
+}
+
+/// Engines that support an owned scratch container for `pbps test`, derived
+/// from [`pbps_config::DialectName::ALL`] through each engine's profile.
+#[cfg(test)]
+pub(crate) fn owned_test_drivers() -> Vec<Driver> {
+    let drivers: Vec<Driver> = all_drivers()
+        .into_iter()
+        .filter(|&driver| profile::profile(driver).owned_test.is_some())
+        .collect();
+    assert!(
+        !drivers.is_empty(),
+        "at least one engine must support owned test scratch"
+    );
+    drivers
+}
+
 #[cfg(test)]
 mod of_tests {
     use super::*;
 
     #[test]
     fn of_answers_with_the_engine_of_the_driver_asked_for() {
-        for driver in [Driver::Mssql, Driver::Postgres, Driver::Sqlite] {
+        for driver in all_drivers() {
             assert_eq!(of(driver).driver(), driver);
         }
     }
 
     #[test]
     fn the_engines_are_told_apart_by_name() {
-        let names = [
-            of(Driver::Mssql).name(),
-            of(Driver::Postgres).name(),
-            of(Driver::Sqlite).name(),
-        ];
+        let names: Vec<&str> = all_drivers().into_iter().map(|d| of(d).name()).collect();
         assert_eq!(
             names.iter().copied().collect::<BTreeSet<_>>().len(),
             names.len(),
@@ -111,23 +146,15 @@ mod of_tests {
 
     #[test]
     fn engine_dialect_matches_each_dialects_wire_spelling() {
-        use pbps_dialect::Dialect as _;
-        assert_eq!(of(Driver::Mssql).dialect(), pbps_mssql::Mssql.name());
-        assert_eq!(
-            of(Driver::Postgres).dialect(),
-            pbps_pg::Postgres::default().name()
-        );
-        assert_eq!(
-            of(Driver::Sqlite).dialect(),
-            pbps_sqlite::dialect::Sqlite::default().name()
-        );
+        for &dialect in pbps_config::DialectName::ALL {
+            let driver = crate::db::driver_for(dialect);
+            assert_eq!(of(driver).dialect(), dialect.as_str());
+            assert_eq!(crate::dialect_for(dialect).name(), dialect.as_str());
+        }
         // Negative: no two engines share a name, or the check could not tell them apart.
-        let names = [Driver::Mssql, Driver::Postgres, Driver::Sqlite].map(|d| of(d).dialect());
+        let names: Vec<&str> = all_drivers().into_iter().map(|d| of(d).dialect()).collect();
         assert_eq!(
-            names
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
+            names.iter().copied().collect::<BTreeSet<_>>().len(),
             names.len()
         );
     }
@@ -2080,12 +2107,22 @@ pub fn validate_plan_analysis(plan: &pbps_model::SavedPlan) -> anyhow::Result<()
             .qualification()
             .runtime
             .validate_dependencies(&plan.dialect, plan.dependencies.keys())?;
-        match plan.dialect.as_str() {
-            "postgres" => pbps_pg::resolver::validate_evidence(evidence)?,
-            "mssql" => pbps_mssql::resolver::validate_evidence(evidence)?,
-            engine => anyhow::bail!(
+        // Parse through `DialectName::ALL` so adding a fourth engine is a
+        // compile error here rather than falling through to a string wildcard.
+        match pbps_config::DialectName::ALL
+            .iter()
+            .copied()
+            .find(|d| d.as_str() == plan.dialect)
+        {
+            Some(pbps_config::DialectName::Postgres) => {
+                pbps_pg::resolver::validate_evidence(evidence)?
+            }
+            Some(pbps_config::DialectName::Mssql) => {
+                pbps_mssql::resolver::validate_evidence(evidence)?
+            }
+            Some(pbps_config::DialectName::Sqlite) | None => anyhow::bail!(
                 "this build cannot enforce resolver evidence for {}",
-                pbps_model::escape::Escaped(engine)
+                pbps_model::escape::Escaped(&plan.dialect)
             ),
         }
     }
@@ -2304,6 +2341,8 @@ mod tests {
     #[test]
     fn a_lock_question_that_cannot_be_asked_names_no_grant() {
         use pbps_db::doctor::LockReadGap;
+        // Network-server engines only: SQLite has no network server or database
+        // grants, so its lock remedy never names a GRANT statement.
         for (driver, connection) in [
             (
                 Driver::Postgres,
@@ -3342,7 +3381,7 @@ mod tests {
         ));
         let rendered = ledger_safe_reason(&wrapped);
 
-        for driver in [Driver::Postgres, Driver::Mssql, Driver::Sqlite] {
+        for driver in all_drivers() {
             let cut = truncate_reason(driver, &rendered);
             assert!(
                 cut.contains("22P02"),
@@ -3469,7 +3508,7 @@ mod tests {
                     1
                 );
                 assert!(!rendered.contains("undeclared-secret-488"), "{rendered}");
-                for driver in [Driver::Postgres, Driver::Mssql, Driver::Sqlite] {
+                for driver in all_drivers() {
                     let cut = truncate_reason(driver, &rendered);
                     assert!(cut.contains(code.unwrap_or("no code")), "{cut}");
                     assert!(cut.contains("public.c"), "{cut}");
@@ -4285,18 +4324,22 @@ mod resolver_name_tests {
 
     /// The library spells an engine in its refusals from a constant, because
     /// `engine::of` is the binary's. The two must not drift.
-    fn named<D: PlanningDialect>() -> (&'static str, &'static str) {
+    fn named_for<D: PlanningDialect>(_: &D) -> (&'static str, &'static str) {
         (D::NAME, super::of(D::DRIVER).name())
     }
 
     #[test]
     fn a_refusal_names_the_engine_as_the_engine_names_itself() {
-        let all = [
-            named::<pbps_pg::Postgres>(),
-            named::<pbps_mssql::Mssql>(),
-            named::<pbps_sqlite::dialect::Sqlite>(),
-        ];
-        for (refusal, engine) in all {
+        let all: Vec<_> = pbps_config::DialectName::ALL
+            .iter()
+            .copied()
+            .map(|d| {
+                pbps_cli::with_plan_dialect!(crate::dialect_for(d), |dialect| {
+                    named_for(&dialect)
+                })
+            })
+            .collect();
+        for &(refusal, engine) in &all {
             assert_eq!(refusal, engine);
         }
         assert_eq!(
@@ -4306,6 +4349,168 @@ mod resolver_name_tests {
                 .len(),
             all.len(),
             "two engines must not share a name"
+        );
+    }
+}
+
+/// Cross-crate engine list agreement against `pbps_config::DialectName::ALL`
+/// (DEC-2798.18). `pbps-cli` is the one crate that sees `DialectName`,
+/// `pbps_db::Driver`, `pbps_dialect::support::Engine`, and the concrete
+/// dialects together.
+#[cfg(test)]
+mod engine_list_tests {
+    use pbps_config::DialectName;
+    use pbps_db::Driver;
+    use pbps_dialect::support::{self, Engine as SupportEngine};
+
+    /// Verifies that `listed` is in exact one-to-one bijection with
+    /// `DialectName::ALL` under `(from_dialect, to_dialect)`.
+    fn check_bijection<T: Copy + Eq + std::fmt::Debug>(
+        list_name: &str,
+        listed: &[T],
+        from_dialect: impl Fn(DialectName) -> T,
+        to_dialect: impl Fn(T) -> DialectName,
+    ) -> Result<(), String> {
+        let mut seen = Vec::new();
+        for &item in listed {
+            if seen.contains(&item) {
+                return Err(format!("{list_name} lists `{item:?}` more than once"));
+            }
+            seen.push(item);
+            let back = to_dialect(item);
+            if !DialectName::ALL.contains(&back) {
+                return Err(format!(
+                    "{list_name} entry `{item:?}` maps to `{back:?}`, which is not in DialectName::ALL"
+                ));
+            }
+            if from_dialect(back) != item {
+                return Err(format!(
+                    "{list_name} entry `{item:?}` does not round-trip through `{back:?}`"
+                ));
+            }
+        }
+        for &dialect in DialectName::ALL {
+            let expected = from_dialect(dialect);
+            if !seen.contains(&expected) {
+                return Err(format!(
+                    "{list_name} is missing `{expected:?}` for dialect `{}`",
+                    dialect.as_str()
+                ));
+            }
+            if to_dialect(expected) != dialect {
+                return Err(format!(
+                    "dialect `{}` mapped to `{expected:?}`, which maps back to `{}`",
+                    dialect.as_str(),
+                    to_dialect(expected).as_str()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    const fn driver_to_dialect(driver: Driver) -> DialectName {
+        match driver {
+            Driver::Mssql => DialectName::Mssql,
+            Driver::Postgres => DialectName::Postgres,
+            Driver::Sqlite => DialectName::Sqlite,
+        }
+    }
+
+    const fn dialect_to_support_engine(dialect: DialectName) -> SupportEngine {
+        match dialect {
+            DialectName::Mssql => SupportEngine::SqlServer,
+            DialectName::Postgres => SupportEngine::Postgres,
+            DialectName::Sqlite => SupportEngine::Sqlite,
+        }
+    }
+
+    const fn support_engine_to_dialect(engine: SupportEngine) -> DialectName {
+        match engine {
+            SupportEngine::SqlServer => DialectName::Mssql,
+            SupportEngine::Postgres => DialectName::Postgres,
+            SupportEngine::Sqlite => DialectName::Sqlite,
+        }
+    }
+
+    #[test]
+    fn every_cross_crate_engine_list_matches_dialect_name_all() {
+        assert_eq!(
+            check_bijection(
+                "pbps_db::Driver::ALL",
+                Driver::ALL,
+                crate::db::driver_for,
+                driver_to_dialect,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_bijection(
+                "pbps_dialect::support::Engine::ALL",
+                SupportEngine::ALL,
+                dialect_to_support_engine,
+                support_engine_to_dialect,
+            ),
+            Ok(())
+        );
+        // Every engine in the support table must have at least one declared
+        // record and appear in the generated `declared` status table.
+        let declared_table = support::status_tables()
+            .into_iter()
+            .find_map(|(name, body)| (name == "declared").then_some(body))
+            .expect("support::status_tables() has a `declared` table");
+        let header = declared_table.lines().next().expect("table has a header");
+        for &engine in SupportEngine::ALL {
+            assert!(
+                support::records(engine).any(|r| !r.declared_as.is_empty()),
+                "pbps_dialect::support::RECORDS has no declared record for `{engine:?}`"
+            );
+            assert!(
+                header.contains(engine.heading()),
+                "support declared table header lacks `{}`: {header}",
+                engine.heading()
+            );
+        }
+    }
+
+    /// Negative: omitting an engine, duplicating one, or breaking the inverse
+    /// mapping all fail with a diagnostic naming the disagreement.
+    #[test]
+    fn engine_list_bijection_reports_missing_duplicate_and_mismatched_entries() {
+        let missing = check_bijection(
+            "Driver::ALL",
+            &[Driver::Mssql, Driver::Postgres],
+            crate::db::driver_for,
+            driver_to_dialect,
+        )
+        .unwrap_err();
+        assert!(
+            missing.contains("Sqlite") && missing.contains("sqlite"),
+            "{missing}"
+        );
+
+        let duplicate = check_bijection(
+            "Driver::ALL",
+            &[Driver::Mssql, Driver::Mssql, Driver::Sqlite],
+            crate::db::driver_for,
+            driver_to_dialect,
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("more than once"), "{duplicate}");
+
+        let mismatched = check_bijection(
+            "SupportEngine::ALL",
+            SupportEngine::ALL,
+            |d| match d {
+                DialectName::Mssql => SupportEngine::SqlServer,
+                DialectName::Postgres => SupportEngine::Postgres,
+                DialectName::Sqlite => SupportEngine::Postgres,
+            },
+            support_engine_to_dialect,
+        )
+        .unwrap_err();
+        assert!(
+            mismatched.contains("Sqlite") && mismatched.contains("round-trip"),
+            "{mismatched}"
         );
     }
 }

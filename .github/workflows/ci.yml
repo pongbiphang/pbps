@@ -139,6 +139,11 @@ jobs:
       # person reads (#2084); the compiler cannot see that last step.
       - run: python3 scripts/check_raw_in_messages_test.py
       - run: python3 scripts/check-raw-in-messages.py
+      # Every engine in DialectName must either have server CI/runner/registry
+      # wiring or an explicit in-process marker in scripts/engine-ci.json
+      # (DEC-2798.18).
+      - run: python3 scripts/check_engine_lists_test.py
+      - run: python3 scripts/check-engine-lists.py
       # Existence and ownership do not infer ADR coverage or test execution.
       - run: python3 scripts/check_resolver_acceptance_test.py
       - run: python3 scripts/check_resolver_acceptance.py

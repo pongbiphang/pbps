@@ -468,8 +468,6 @@ mod tests {
     use super::*;
     use pbps_db::doctor::LockReadGap;
 
-    const DRIVERS: [Driver; 2] = [Driver::Mssql, Driver::Postgres];
-
     #[test]
     fn the_two_profiles_differ_on_the_facts_that_are_meant_to_differ() {
         let (ms, pg) = (profile(Driver::Mssql), profile(Driver::Postgres));
@@ -491,7 +489,8 @@ mod tests {
 
     #[test]
     fn each_reader_returns_what_its_profile_field_says_for_both_drivers() {
-        for driver in DRIVERS {
+        // Network-server engines only; SQLite's in-process profile is pinned below.
+        for driver in crate::engine::server_drivers() {
             let facts = profile(driver);
             assert_eq!(
                 scratch_compiles_base_namespace(driver),
@@ -546,14 +545,16 @@ mod tests {
 
     #[test]
     fn a_read_outside_the_plans_own_transaction_is_never_revalidated() {
-        for driver in DRIVERS {
+        for driver in crate::engine::all_drivers() {
             assert!(!needs_readback_revalidation(driver, Read::Snapshot));
         }
     }
 
     #[test]
     fn a_lock_remedy_names_its_engines_principal_and_grants_only_what_was_seen() {
-        for driver in DRIVERS {
+        // Network-server engines emit GRANT statements; SQLite has no database grants
+        // and is pinned in `sqlite_profile_readers_return_its_own_facts_and_never_fabricate_a_grant`.
+        for driver in crate::engine::server_drivers() {
             let facts = profile(driver);
             let seen = lock_remedy(driver, Some(LockReadGap::TableSelect));
             assert!(

@@ -1741,3 +1741,48 @@ Pinned by `crates/pbps-cli/tests/flow_sqlite.rs`, which runs the binary on real
 files with no container: each server-only command and flag refuses by name, a
 mistyped path never creates a file, and
 `a_view_declared_with_a_terminator_and_a_closing_line_ending_applies_and_verifies_clean`.
+
+
+<a id="dec-2798-18"></a>
+
+**DEC-2798.18. `DialectName::ALL` is the one list of engines: derive every
+other list where possible, pin cross-crate enums by bijection test, name
+intentional subsets, and check CI rather than generating it (#2798).** Wiring
+SQLite showed that the Rust compiler catches exhaustive matches on an enum,
+while hand-kept engine arrays, cross-crate mirror enums (`pbps_db::Driver`,
+`pbps_dialect::support::Engine`), string matches with wildcards, doc tables,
+and CI/runner registries drift silently without failing a build.
+
+- **One authoritative list, derived wherever the crate can see it.**
+  `pbps_config::DialectName::ALL` is already pinned against the JSON schema in
+  `pbps-config`. Any list inside a crate that depends on `pbps-config` (such as
+  `init --dialect`, `engine::validate_plan_analysis`, and all-engine test loops)
+  derives from `DialectName::ALL` or matches exhaustively on `DialectName`
+  rather than repeating engine literals.
+- **Cross-crate enums stay separate and are pinned by bijection tests.**
+  `pbps-db` and `pbps-dialect` intentionally do not depend on `pbps-config`.
+  Each exposes its own `ALL` slice (`Driver::ALL`, `support::Engine::ALL`, with
+  `support::declared_table()` derived from `Engine::ALL`), and `pbps-cli`—the
+  crate that sees all three—verifies exact one-to-one bijection against
+  `DialectName::ALL` through one shared helper, so adding or omitting an engine
+  in any of them fails `cargo test`.
+- **Intentional subsets are named and explain why.** A test loop over two
+  engines because a feature does not apply to SQLite (network server
+  connections, database roles, managed data, owned Docker scratch containers,
+  multi-schema layouts) either derives from `DialectName::ALL` through a profile
+  predicate (`engine::server_drivers()`, `engine::owned_test_drivers()`) or uses
+  a named constant/comment stating the property, distinguishing "does not apply"
+  from "forgotten when a new engine arrived".
+- **CI is checked, not generated.** `.github/workflows/ci.yml` holds
+  engine-specific operational detail (pinned digests, non-durable fixture
+  reloads, shard splits, Windows LocalDB and native PostgreSQL installers,
+  errorlog diagnostics) that cannot be templated cleanly across engines with
+  different lifecycles, and generating workflows hides review diffs behind a
+  code generator. Instead, `scripts/check-engine-lists.py` (standard library
+  only, run in `lint`) parses `DialectName` directly from
+  `crates/pbps-config/src/lib.rs` and verifies that every engine either has its
+  live CI job, compatibility cell, live runner, shard entry, and ignored-test
+  owner/rules or carries an explicit `in-process` marker with a reason in
+  `scripts/engine-ci.json`, and appears in `docs/SPEC.md` §11.3 and
+  `docs/ARCHITECTURE.md`. What no mechanical check can catch is documented in
+  `docs/ADDING-AN-ENGINE.md`.
