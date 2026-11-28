@@ -10664,35 +10664,46 @@ Pinned by the tests of `schema_diff/partitions/rehearsal.rs` and
 16 and 18 by `support/adoption1671.rs` (apply's hold on a record) and
 `support/rehearsal1671.rs` (the rehearsal, and the apply of what it keeps).
 
-*Amended by [DEC-1671.3](#dec-1671-3): every question put to a resolver gets an
-answer, one that keeps nothing where the scratch keeps or answers nothing, which
-the differ does not use and by which the plan offers no resolver. The statement
-pin and apply's two hooks serve a parent's addition's record as well.*
+*Amended by [DEC-1671.3](#dec-1671-3): every attach with something to ask gets an
+answer, a record that may keep nothing or the reason there is none, which the
+report says and by which the plan offers no resolver. The statement pin, the
+scratch run and apply's two hooks serve a parent's addition as well.*
 
 <a id="dec-1671-3"></a>
 
-**DEC-1671.3. The plan says why an own is dropped for a parent's to take, and
-apply holds each partition to what a plan records of it under a parent's new
-index or exclusion (#1671; amends DEC-1671.1 and DEC-1671.2).**
+**DEC-1671.3. With a resolver selected, a parent's new index or exclusion leaves
+standing each own it does not take, apply holds each partition to what was read,
+and the plan says why an own is dropped for a parent's to take (#1671; amends
+DEC-1671.1 and DEC-1671.2).**
 
 **Context.** A parent's new index or exclusion takes a standing partition's own
 as its copy where the engine holds the two equal, so DEC-1671.1 drops every own
-one it might take. The third part of #1671 asks a resolver's engine about those,
-as DEC-1671.2 does at an attach. The maintainer decided its design on
-2026-11-28 and it lands in two parts. This is the first: the record a plan will
-hold, its admission, apply's hold on it, and the reasons in the plan. The second
-adds the question, the rehearsal and the differ's use of the answer. **Until it
-does, no plan carries a record on a parent's addition**, and every such plan is
-DEC-1671.1's.
+one it might take, and adds back what is declared. An own the engine would have
+left alone is then built again. The third part of #1671 asks a resolver's engine
+about those, as DEC-1671.2 does at an attach. Without a resolver, and wherever
+the rehearsal gives no answer, the plan is DEC-1671.1's, change for change.
 
-The maintainer's answers that the record rests on: a declared own the addition
-does not take may stay standing **beside** the copy, and an own the declarations
-no longer hold may be **adopted** as it (Q5 of DEC-1671.2 then reads "no own
-becomes a copy under a declared name"); and a column the plan adds to the parent
-does not stop a rehearsal, while any other change to one does. A plan should be
-predictable, say why, and not rebuild what the user did not change. The refusals
-of a created partition's own index and of an own exclusion the same plan adds
-stay, with or without a resolver; lifting them for every user is #3108.
+The maintainer decided its design on 2026-11-28: a plan should be predictable,
+say why, and not rebuild what the user did not change.
+
+- **A1.** A declared own the addition does not take stays standing **beside** the
+  copy, and an own the declarations no longer hold that it takes is **adopted**
+  as the copy. Q5 of DEC-1671.2 then reads "no own becomes a copy under a
+  declared name".
+- **B2.** A column the plan adds to the parent does not stop a rehearsal: an
+  unrelated column should not change how the indexes are handled. Any other
+  change to a parent column does, since it changes what the definitions print.
+- **C1.** The refusals of a created partition's own index and of an own exclusion
+  the same plan adds stay, resolver or not: a rehearsal alone cannot fix their
+  order, and a plan accepted only with a resolver would make the same
+  declarations pass or fail by it. Lifting them for every user is #3108.
+- **D1.** An own that an unmanaged table's foreign key references may be left
+  standing with a resolver. Without one the plan rebuilds it, which the key
+  refuses (DEC-1671.1, "Open"). Nothing is dropped and the key stays where it
+  was, so here a resolver changes whether the change can be made, and only in
+  the permissive direction.
+- **E.** The report says why each loose drop happens, and why a rehearsal with
+  something to save did not answer.
 
 **The reasons.** Each index, key or exclusion dropped because a parent's might
 take it says so on its step, and on the add after it where the declarations keep
@@ -10707,17 +10718,98 @@ says nothing, nor does any drop of an own no parent's may take. The words travel
 sealed, as a step's provenance is not (DEC-1958.3): a plan read back from its
 file has none, and `--format json` does not carry them.
 
-`(a resolver can keep it)` is added only where it is true: under an attach, for a
-name the declarations give to nothing, in a plan the attach's question is asked
-of, and where none was asked. Every question put gets an answer for that reason.
-A parent's new index offers no resolver until the second part.
+`(a resolver can keep it)` is added only where it is true: in a plan the question
+is asked of, and where none was asked about that table. Under an attach it is for
+a name the declarations give to nothing. Under a parent's new index or exclusion
+it is for a declared own the plan rebuilds, which a resolver keeps by leaving it
+beside the copy. One the declarations no longer hold carries no reason there,
+as its drop is theirs, although a resolver may leave it to the addition.
 
-**The record** is a field of the parent's `AddIndex` or exclusion add: for each
-partition, its own indexes as planning read them, a parent's clones left out, and
-the names this addition adopts and leaves beside it. A field of the change rather
-than of the planned change, so that no pass that rebuilds a planned change can
-keep an own and lose the record. The plan format changes with the field, which
-the format fingerprint catches; no version number moves (DEC-2412.3).
+**The question** comes from the plan made without an answer, one for each
+standing partition under a parent that gains an index or exclusion:
+
+- its **declared** own: those the plan drops and adds back, as the passes that
+  rebuild them mark them;
+- its **retiring** own: those the plan drops because the declarations no longer
+  hold them, that one of the additions might take, under a name the declarations
+  give to nothing (as DEC-1671.2), and that no foreign key of the base's or the
+  declarations' may be bound to, since a kept referenced own would leave the key
+  on the copy;
+- every other drop of the partition's, which the rehearsal leaves out.
+
+An attach is asked as DEC-1671.2 says.
+
+**No answer, and why.** Nothing is asked of a refused plan. Where there is
+something an answer could save, these give none, and the report says which, in one
+line under the attach or under the parent's first addition,
+`not rehearsed on <partitions>: <reason>`:
+
+- the plan alters a column of the parent's other than by adding one (for an
+  attach, the pending parent shape of DEC-2296.12);
+- the plan holds a change `adoption::unsettles` names: a definition can print or
+  bind otherwise by the time of the statement. What calls a function is also
+  taken down around its change, an own left standing among it;
+- the plan changes a storage parameter of one of the partition's own exclusions,
+  the one kind of own whose parameters can change on a standing partition: a
+  plan that changes an own index's there is refused. That change runs ahead of
+  the parent's addition and prints the definition otherwise, so apply would
+  refuse a valid plan. On an own the plan rebuilds no change of its own says so,
+  so the two declarations are compared. An attach runs ahead of it and has no
+  such rule;
+- an index the rehearsal would read is invalid: the addition takes an invalid own
+  and marks the parent's index invalid, which a copy made on an empty table does
+  not show;
+- the scratch could not run it: it cannot be had, it does not hold what a
+  definition calls (a function the plan creates), or the engine took an own the
+  plan could not drop, one left for a foreign key. A cleanup the scratch cannot
+  confirm fails the plan instead.
+
+The reasons travel as the drops' do, so no saved plan holds one.
+
+**The read** fetches, besides an attach's relations, each parent whose indexes or
+exclusions the plan could state anew, with each partition standing under it, and
+whether each index is a parent's clone. Only own indexes take part.
+
+**The rehearsal** is one per partition, since the engine chooses from that
+partition's own list. In one rolled-back transaction the scratch makes both
+relations empty, attaches the partition as the `DEFAULT` one with no index on
+either, makes the partition's own in the order they were made less the dropped
+ones, then runs each added column and each new index or exclusion as apply emits
+it, under apply's path, each command one extended-protocol statement
+(DEC-2354.3). The parent's standing indexes and their clones take part in no
+choice, so none is made. It reads which own each addition took.
+
+**The loop.** A declared own that is taken would become the parent's copy, so the
+plan rebuilds it around the addition, and the addition may then take another. The
+rehearsal repeats without each declared own that was taken, until none is. Each
+round leaves out at least one more, so the rounds end. The last one is the
+answer: a declared own not taken stands beside the copy, and a retiring own taken
+is adopted.
+
+**The answer** reaches the differ in `Hints` and is used only where it agrees with
+the question the differ asks itself: one answer for the partition, the same
+parent and the same additions, the partition's own exactly the base's by name and
+kind, each adopted one retiring and taken by an addition of its kind, no two by
+one, and each one left beside declared. An adopted own loses its drop; one left
+beside is skipped by the passes that rebuild it. A declared own exclusion the
+engine would take for the parent's stays refused as the parent's again, with or
+without a resolver (DEC-2448.7), so one left beside differs from it in shape.
+
+**The record** is a field of the parent's `AddIndex` or exclusion add, only where
+it decides something: for each partition, its own indexes as planning read them,
+a parent's clones left out, and the names this addition adopts and leaves beside
+it. A field of the change rather than of the planned change, so that no pass that
+rebuilds a planned change can keep an own and lose the record. The plan format
+changes with the field, which the format fingerprint catches; no version number
+moves (DEC-2412.3).
+
+**What the addition changes.** An own it adopts is the partition's no longer from
+its statement on, with no change of the plan on the partition. So that partition
+is one the addition changes. Apply's check that nothing else moved expects the
+adopted own gone and every other part of the partition as it was, and the
+resolver's transitions count the partition's tree as the statement's, as an
+attach's counts the attached table's: the engine's rows tying the own to the
+parent's index arrive under it (DEC-1274.1).
 
 **Admission** refuses a record on another engine; on a change that adds nothing;
 with no partition, a partition twice, or the changed table among them; with a
@@ -10752,8 +10844,26 @@ is one statement, so no checkpoint stands ahead of it: a staged apply refused
 there is started again, and makes both comparisons again. An engine other than
 PostgreSQL refuses a plan that holds a record.
 
+**Measured** on 16.15 and 18.6 (`~/gate1671/pr3/`):
+
+- `facts.sql`: the oldest equal own is taken, a rename does not move it, and the
+  clone of an index the parent already had is no candidate; an invalid own is
+  taken and marks the parent's index invalid; a parent's `UNIQUE` or
+  `PRIMARY KEY` takes no plain unique own, and a plain index takes no
+  exclusion's; an unqualified call binds on the parent statement's path.
+- `loop.sql`: every list of one to three own kinds against every list of one or
+  two additions, with and without an index the parent already had, answered as the
+  target did (6,200 cases on 16, 15,480 on 18, no mismatch), and every declared
+  and retiring assignment of the same lists (11,680 and 33,300 cases) ended with
+  each retiring own the plan left taken as in the last round and every declared
+  own the partition's own.
+
 Pinned by the record tests of `pbps-model/src/adoption.rs`, the compare and lock
 tests of `pbps-pg/src/adoption.rs`, `schema_diff/partitions/adoption/tests.rs`,
-the report tests of `report.rs`,
+`schema_diff/partitions/rehearsal/addition_tests.rs`, the report tests of
+`report.rs`,
+`an_own_a_parents_addition_takes_leaves_its_partition_and_no_other`,
 `a_plan_holding_a_parents_addition_record_is_refused_on_sqlite_and_sql_server`,
-and on 16 and 18 by `support/adds1671.rs`.
+and on 16 and 18 by `support/adds1671.rs` (apply's hold on a record, and the
+reasons) and `support/resolved_adds1671.rs` (the rehearsal, and the apply of what
+it keeps).

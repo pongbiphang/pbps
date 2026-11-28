@@ -1,9 +1,10 @@
 //! A parent's new index over standing partitions (#1671, DEC-1671.3): apply
 //! holds each partition a record names to it, and the plan says why each own the
-//! loose rule drops is dropped, for such an addition and for an attach. No plan
-//! carries a record yet, so each test writes one by hand onto a parent's
-//! addition that drops none of the owns it names. The definitions are written out
-//! here as the catalog prints them. Each case runs on both pinned engines.
+//! loose rule drops is dropped, for such an addition and for an attach. Apply's
+//! cases need no resolver: each writes a record by hand onto a parent's addition
+//! that drops none of the owns it names, with the definitions as the catalog
+//! prints them. `resolved_adds1671.rs` has the records a rehearsal makes. Each
+//! case runs on both pinned engines.
 use super::{
     Demo, OwnDatabase, approved_apply, code, generate_key, key_line, on_server, scalar, stderr,
     stdout, succeeds, text_of,
@@ -488,8 +489,9 @@ fn listed(entries: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 /// The loose plan of DEC-1671.1, change for change, with each drop's reason on
-/// its line: a parent's new index offers no resolver yet; an attach offers one
-/// only for an own it could keep, and none where one was asked.
+/// its line: a parent's new index offers a resolver for a declared own it
+/// rebuilds; an attach offers one only for an own it could keep, and none where
+/// one was asked.
 #[test]
 #[ignore = "needs PostgreSQL 18 and 16 and a Docker daemon; set PBPS_TEST_PG_DB, PBPS_TEST_PG_OLD_DB and their scratch images"]
 fn each_loose_drop_says_why_and_the_plan_is_the_loose_one() {
@@ -517,11 +519,11 @@ fn each_loose_drop_says_why_and_the_plan_is_the_loose_one() {
             ]),
             "{said}"
         );
-        let reason = "ev_1_m, built again: the parent's new index ev_m may take it";
+        let reason = "ev_1_m, built again: the parent's new index ev_m may take it (a resolver \
+                      can keep it)";
         for line in [format!("- index {reason}"), format!("+ index {reason}")] {
             assert!(said.contains(&line), "{line}: {said}");
         }
-        assert!(!said.contains("a resolver can keep it"), "{said}");
         assert!(!said.contains("+ index ev_m,"), "{said}");
         succeeds(p.apply(&plan, &[]));
         p.in_sync();

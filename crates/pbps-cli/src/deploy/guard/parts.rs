@@ -307,6 +307,30 @@ impl<'a> PartChanges<'a> {
                 );
                 parts.layout.push((slot, part.after));
             }
+            // What a parent's addition takes of its partitions' own is theirs no
+            // longer from its statement on (DEC-1671.3).
+            let exclusion = matches!(change.change, Change::Constraint(_));
+            for of in pbps_model::adoption::adopts(&change.change) {
+                let Some(table) = final_table(names, &of.table, At::Before(i)) else {
+                    continue;
+                };
+                let effects = &mut tables.entry(table).or_default().effects;
+                for name in &of.adopted {
+                    let (slot, part) = if exclusion {
+                        (Slot::Exclusion(name.raw()), Part::Exclusion)
+                    } else {
+                        (Slot::Index(name.raw()), Part::Index)
+                    };
+                    let after = Some(PartAfter::Gone(part));
+                    effects.insert(
+                        slot,
+                        Effect {
+                            after,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
             if let Change::Index(IndexChange::SetIndexStorageParameters {
                 table,
                 target,

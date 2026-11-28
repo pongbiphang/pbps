@@ -2,7 +2,7 @@
 use super::*;
 use crate::identity::Context;
 use crate::schema_diff::tests::Postgres;
-use pbps_model::adoption::{AttachAnswer, AttachRehearsal};
+use pbps_model::adoption::{AttachAnswer, AttachRehearsal, AttachedAnswer, Skipped};
 use pbps_model::{Column, IndexColumn, Intent, PartitionBound, PartitionBy, PartitionOf};
 
 fn plain(column: &str) -> Index {
@@ -237,7 +237,7 @@ fn loose(by: &str, exclusions: bool, new: bool, again: bool, hint: bool) -> Vec<
 fn a_parents_new_index_marks_each_own_it_rebuilds_and_nothing_else() {
     let planned = World::standing().planned(&[], Vec::new());
     let found = said(&planned);
-    let rebuilt = loose("p_n", false, true, true, false);
+    let rebuilt = loose("p_n", false, true, true, true);
     assert_eq!(found["-c_a"], rebuilt, "{found:?}");
     assert_eq!(found["+c_a"], rebuilt, "{found:?}");
     // The declarations' own removal is not the parent's to explain.
@@ -266,12 +266,12 @@ fn a_parents_new_exclusion_marks_its_rebuild_as_an_exclusions() {
         .exclude
         .insert("p_x".into(), excluding("n"));
     let found = said(&World::of(base, declared).planned(&[], Vec::new()));
-    let rebuilt = loose("p_x", true, true, true, false);
+    let rebuilt = loose("p_x", true, true, true, true);
     assert_eq!(found["-c_x"], rebuilt, "{found:?}");
     assert_eq!(found["+c_x"], rebuilt, "{found:?}");
 }
 
-/// A declared name is never a parent's copy, so no resolver is offered for it;
+/// A declared name is never an attach's copy, so no resolver is offered for it;
 /// one dropped for good could be kept by one. A declaration that differs makes
 /// the drop its own.
 #[test]
@@ -348,7 +348,7 @@ fn no_resolver_is_offered_where_one_was_asked_or_would_not_be() {
     let world = World::attaching();
     assert!(offered(&said(&world.planned(&[], Vec::new()))));
     // An answer that keeps nothing: the question was put.
-    let asked = AttachAnswer {
+    let asked = AttachAnswer::Attach(AttachedAnswer {
         uid: world.ids.table_uid(&name("c")).unwrap().clone(),
         parent: name("p"),
         rehearsal: AttachRehearsal {
@@ -356,7 +356,7 @@ fn no_resolver_is_offered_where_one_was_asked_or_would_not_be() {
             table: Vec::new(),
             kept: Default::default(),
         },
-    };
+    });
     assert!(!offered(&said(&world.planned(&[], vec![asked]))));
 
     // A column renamed on another table.
@@ -437,4 +437,66 @@ fn no_resolver_is_offered_where_one_was_asked_or_would_not_be() {
         "{found:?}"
     );
     assert!(!offered(&found));
+}
+
+/// A parent's new index may leave a declared own standing, so a resolver is
+/// offered for it until one has said anything of the partition, and not where
+/// the plan is one no rehearsal answers.
+#[test]
+fn a_resolver_is_offered_under_a_parents_new_index_only_where_it_would_be_asked() {
+    let offered = |world: &World, answers| {
+        let found = said(&world.planned(&[], answers));
+        assert!(
+            found.contains_key("-c_a"),
+            "the own is dropped either way: {found:?}"
+        );
+        found["-c_a"] == loose("p_n", false, true, true, true)
+    };
+    let world = World::standing();
+    assert!(offered(&world, Vec::new()));
+    let partition = world.ids.table_uid(&name("c")).unwrap().clone();
+    let skipped = |table| {
+        vec![AttachAnswer::Skipped {
+            table,
+            why: Skipped::Scratch,
+        }]
+    };
+    assert!(!offered(&world, skipped(partition)));
+    // What is said of another table is not said of this one.
+    let other = world.ids.table_uid(&name("other")).unwrap().clone();
+    assert!(offered(&world, skipped(other)));
+
+    let mut reshaped = World::standing();
+    let parent = reshaped.declared.tables.get_mut(&name("p")).unwrap();
+    parent.columns.get_mut("m").unwrap().nullable = true;
+    assert!(!offered(&reshaped, Vec::new()));
+
+    // A storage parameter the plan changes on the own it would leave standing,
+    // which only an exclusion's can be on a partition.
+    let mut base = World::partitioned();
+    let mut partition = under_p();
+    partition.exclude.insert("c_x".into(), excluding("n"));
+    base.tables.insert(name("c"), partition);
+    let mut declared = base.clone();
+    declared
+        .tables
+        .get_mut(&name("p"))
+        .unwrap()
+        .exclude
+        .insert("p_x".into(), excluding("n"));
+    let hinted = |declared: Schema| {
+        let found = said(&World::of(base.clone(), declared).planned(&[], Vec::new()));
+        found["-c_x"] == loose("p_x", true, true, true, true)
+    };
+    assert!(hinted(declared.clone()));
+    declared
+        .tables
+        .get_mut(&name("c"))
+        .unwrap()
+        .exclude
+        .get_mut("c_x")
+        .unwrap()
+        .storage_parameters
+        .insert("fillfactor".into(), "70".into());
+    assert!(!hinted(declared));
 }

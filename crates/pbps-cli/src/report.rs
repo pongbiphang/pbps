@@ -1388,8 +1388,11 @@ fn changes_with_remedy(cs: &ChangeSet, remedy: Option<&str>) -> String {
         };
         // Why the loose rule drops an own index, on its step's line
         // (DEC-1671.3).
-        let loose: String = p.remarks.iter().map(loose_clause).collect();
+        let loose: String = p.remarks.iter().filter_map(loose_clause).collect();
         out.push_str(&format!("    {}{loose}{}\n", describe(&p.change), risks));
+        for line in p.remarks.iter().filter_map(unrehearsed_line) {
+            out.push_str(&format!("      {line}\n"));
+        }
         if let Some(guard) = &p.drop_guard {
             for line in required_rows(guard) {
                 out.push_str(&format!("      {line}\n"));
@@ -1423,15 +1426,18 @@ fn changes_with_remedy(cs: &ChangeSet, remedy: Option<&str>) -> String {
 
 /// What the plan says after a step that drops, or adds again, an index one of a
 /// parent's may take.
-fn loose_clause(remark: &Remark) -> String {
+fn loose_clause(remark: &Remark) -> Option<String> {
     let Remark::Loose {
         by,
         exclusions,
         new,
         again,
         resolver_could_keep,
-    } = remark;
-    format!(
+    } = remark
+    else {
+        return None;
+    };
+    Some(format!(
         ", {lead} the parent's {new}{kind} {by} may take it{hint}",
         lead = if *again { "built again:" } else { "since" },
         new = if *new { "new " } else { "" },
@@ -1450,7 +1456,21 @@ fn loose_clause(remark: &Remark) -> String {
         } else {
             ""
         },
-    )
+    ))
+}
+
+/// The line under a step whose resolver rehearsal gave no answer.
+fn unrehearsed_line(remark: &Remark) -> Option<String> {
+    let Remark::NotRehearsed { partitions, why } = remark else {
+        return None;
+    };
+    let names: Vec<_> = partitions.iter().map(|t| t.shown().to_string()).collect();
+    let on = if names.is_empty() {
+        String::new()
+    } else {
+        format!(" on {}", names.join(", "))
+    };
+    Some(format!("not rehearsed{on}: {}", why.why()))
 }
 
 /// What a parent's new index or exclusion keeps standing of its partitions' own
@@ -3211,6 +3231,54 @@ mod tests {
             let text = said(vec![remark]);
             assert!(text.contains(&format!("{line}\n")), "{line}: {text}");
         }
+    }
+
+    #[test]
+    fn a_skipped_rehearsal_is_said_in_one_line_under_the_step() {
+        use pbps_model::adoption::{Remark, Skipped};
+        let said = |remarks: Vec<Remark>| {
+            let mut planned = pbps_model::PlannedChange::new(addition_of(None));
+            planned.remarks = remarks;
+            super::changes(&ChangeSet {
+                changes: vec![planned],
+            })
+        };
+        let skipped = |partitions: &[&str], why| Remark::NotRehearsed {
+            partitions: partitions.iter().map(|t| t.parse().unwrap()).collect(),
+            why,
+        };
+        let on = said(vec![skipped(&["app.c1", "app.c2"], Skipped::ParentColumns)]);
+        assert!(
+            on.contains(
+                "\n      not rehearsed on app.c1, app.c2: this plan also changes the parent's \
+                 columns\n"
+            ),
+            "{on}"
+        );
+        let attach = said(vec![skipped(&[], Skipped::Scratch)]);
+        assert!(
+            attach.contains("\n      not rehearsed: the resolver's scratch could not run it\n"),
+            "{attach}"
+        );
+        // Each reason has its own words, on one line.
+        let reasons = [
+            Skipped::ParentColumns,
+            Skipped::Unsettles,
+            Skipped::InvalidIndex,
+            Skipped::OwnParameters,
+            Skipped::Scratch,
+        ];
+        let words: std::collections::BTreeSet<_> = reasons.iter().map(|why| why.why()).collect();
+        assert_eq!(words.len(), reasons.len());
+        for why in reasons {
+            assert!(!why.why().contains('\n'), "{why:?}");
+            let line = format!("not rehearsed on app.c1: {}\n", why.why());
+            let one = said(vec![skipped(&["app.c1"], why)]);
+            assert!(one.contains(&line), "{why:?}: {one}");
+        }
+        // With nothing skipped, nothing is said of a rehearsal.
+        let none = said(Vec::new());
+        assert!(!none.contains("rehearsed"), "{none}");
     }
 
     #[test]

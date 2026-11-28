@@ -9,6 +9,7 @@ use super::{
     Demo, OwnDatabase, code, generate_key, key_line, on_server, plan_checksum, stderr, stdout,
     succeeds, text_of,
 };
+use pbps_model::adoption::Skipped;
 use pbps_model::{Change, ConstraintChange, IndexChange, PartitionChange, SavedPlan};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 const TARGET: &str = "PBPS_ADOPT1671_TARGET";
 const SCRATCH: &str = "PBPS_ADOPT1671_SCRATCH";
 
-fn engines(mut check: impl FnMut(&str, &str)) {
+pub(super) fn engines(mut check: impl FnMut(&str, &str)) {
     for (server, image) in [
         ("PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_OLD_SCRATCH_IMAGE"),
         ("PBPS_TEST_PG_DB", "PBPS_TEST_PG_SCRATCH_IMAGE"),
@@ -28,7 +29,7 @@ fn engines(mut check: impl FnMut(&str, &str)) {
 
 /// What `pbps.yml` selects.
 #[derive(Clone, Copy)]
-enum Resolver<'a> {
+pub(super) enum Resolver<'a> {
     None,
     Docker(&'a str),
     /// A supplied server nothing answers on.
@@ -36,13 +37,13 @@ enum Resolver<'a> {
 }
 
 /// A database holding `setup`, adopted, and its project.
-struct Project {
+pub(super) struct Project {
     own: OwnDatabase,
-    d: Demo,
+    pub(super) d: Demo,
 }
 
 impl Project {
-    fn new(server: &str, slug: &str, setup: &str) -> Self {
+    pub(super) fn new(server: &str, slug: &str, setup: &str) -> Self {
         let own = OwnDatabase::new(server, slug);
         on_server(own.connection(), setup);
         let d = Demo::new(slug);
@@ -55,11 +56,11 @@ impl Project {
         project
     }
 
-    fn connection(&self) -> &str {
+    pub(super) fn connection(&self) -> &str {
         self.own.connection()
     }
 
-    fn select(&self, resolver: Resolver<'_>) {
+    pub(super) fn select(&self, resolver: Resolver<'_>) {
         let (entry, selected) = match resolver {
             Resolver::None => (String::new(), ""),
             Resolver::Docker(image) => (
@@ -85,7 +86,7 @@ impl Project {
         .unwrap();
     }
 
-    fn run(&self, args: &[&str]) -> std::process::Output {
+    pub(super) fn run(&self, args: &[&str]) -> std::process::Output {
         self.d.run_with_env(
             args,
             &[
@@ -109,7 +110,7 @@ impl Project {
     }
 
     /// The connected plan of the declarations, and what planning printed.
-    fn plan(&self, name: &str, extra: &[&str]) -> (PathBuf, String) {
+    pub(super) fn plan(&self, name: &str, extra: &[&str]) -> (PathBuf, String) {
         succeeds(self.d.run(&["plan"]));
         self.connected(name, extra)
     }
@@ -124,7 +125,7 @@ impl Project {
         (path, stdout(&planned))
     }
 
-    fn apply(&self, plan: &Path, extra: &[&str]) -> std::process::Output {
+    pub(super) fn apply(&self, plan: &Path, extra: &[&str]) -> std::process::Output {
         let checksum = plan_checksum(plan);
         let mut args = vec![
             "apply",
@@ -142,7 +143,7 @@ impl Project {
     }
 
     /// The database is what the declarations say, with nothing left to plan.
-    fn in_sync(&self) {
+    pub(super) fn in_sync(&self) {
         succeeds(self.run(&["verify", "--env", "prod"]));
         let next = succeeds(self.run(&["plan", "--env", "prod"]));
         assert!(
@@ -153,7 +154,7 @@ impl Project {
         );
     }
 
-    fn oid(&self, index: &str) -> String {
+    pub(super) fn oid(&self, index: &str) -> String {
         text_of(
             self.connection(),
             &format!("SELECT 'app.{index}'::regclass::oid::text"),
@@ -162,7 +163,7 @@ impl Project {
 
     /// The index's parent in the partition tree, or nothing where it is the
     /// table's own.
-    fn parent_of(&self, index: &str) -> String {
+    pub(super) fn parent_of(&self, index: &str) -> String {
         text_of(
             self.connection(),
             &format!(
@@ -173,12 +174,12 @@ impl Project {
     }
 }
 
-fn saved(plan: &Path) -> SavedPlan {
+pub(super) fn saved(plan: &Path) -> SavedPlan {
     serde_json::from_slice(&std::fs::read(plan).unwrap()).unwrap()
 }
 
 /// The names the plan drops ahead of its attach, indexes and constraints.
-fn drops(plan: &SavedPlan) -> Vec<String> {
+pub(super) fn drops(plan: &SavedPlan) -> Vec<String> {
     let json = serde_json::to_value(&plan.changes).unwrap();
     let mut names: Vec<String> = json["changes"]
         .as_array()
@@ -323,7 +324,10 @@ fn without_an_answer_the_plan_is_the_one_made_without_a_resolver() {
 
 /// The scratch's answer for `app.late` under `app.ev`, asked directly: what
 /// planning reads of `target`, rehearsed on `scratch`.
-fn rehearsed(target: &str, scratch: &str) -> Option<pbps_model::adoption::AttachRehearsal> {
+fn rehearsed(
+    target: &str,
+    scratch: &str,
+) -> Result<pbps_model::adoption::AttachRehearsal, Skipped> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -398,14 +402,17 @@ fn a_meeting_rename_and_an_invalid_index_get_no_answer() {
         let answered = rehearsed(p.connection(), scratch.connection());
         assert_eq!(
             answered.map(|answer| answer.kept),
-            Some([("late_m".into(), "ev_a".into())].into())
+            Ok([("late_m".into(), "ev_a".into())].into())
         );
         on_server(
             p.connection(),
             "UPDATE pg_index SET indisvalid = false \
              WHERE indexrelid = 'app.late_m'::regclass",
         );
-        assert_eq!(rehearsed(p.connection(), scratch.connection()), None);
+        assert_eq!(
+            rehearsed(p.connection(), scratch.connection()),
+            Err(Skipped::InvalidIndex)
+        );
         p.attach("late", "");
         succeeds(p.d.run(&["plan"]));
         p.d.commit();
@@ -491,7 +498,7 @@ fn a_staged_plan_can_hold_an_attach_that_keeps_every_own_index() {
 }
 
 /// Every index, key and exclusion the plan drops, by name, in order of name.
-fn taken_off(plan: &SavedPlan) -> Vec<String> {
+pub(super) fn taken_off(plan: &SavedPlan) -> Vec<String> {
     let mut names: Vec<String> = plan
         .changes
         .changes

@@ -657,6 +657,7 @@ pub(super) fn refuse_pinned_movement(
     let mut roles: BTreeSet<&pbps_model::RoleName> = BTreeSet::new();
     for p in &changes.changes {
         objects.extend(p.change.objects());
+        objects.extend(pbps_model::adoption::adopts(&p.change).map(|of| &of.table));
         touched_modules.extend(p.change.module_id());
         roles.extend(p.change.roles());
     }

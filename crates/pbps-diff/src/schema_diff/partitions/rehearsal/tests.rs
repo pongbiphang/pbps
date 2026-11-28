@@ -2,7 +2,7 @@ use super::*;
 use crate::identity::Context;
 use crate::schema_diff::tests::Postgres;
 use pbps_dialect::MinimalDialect;
-use pbps_model::adoption::RelationIndex;
+use pbps_model::adoption::{AttachedAnswer, RelationIndex, Skipped};
 use pbps_model::{
     Column, IndexColumn, Module, ModuleKind, PartitionBound, PartitionBy, PartitionOf,
 };
@@ -123,6 +123,10 @@ impl World {
     }
 
     fn questions_given(&self, intents: &[pbps_model::Intent]) -> Vec<Question> {
+        self.all_questions(intents).attaches
+    }
+
+    fn all_questions(&self, intents: &[pbps_model::Intent]) -> Questions {
         self.sides(intents, |base, declared| {
             questions(
                 base,
@@ -189,7 +193,7 @@ fn answer(world: &World) -> AttachAnswer {
 }
 
 fn answer_to(question: Question) -> AttachAnswer {
-    AttachAnswer {
+    AttachAnswer::Attach(AttachedAnswer {
         uid: question.uid,
         parent: question.parent,
         rehearsal: AttachRehearsal {
@@ -197,7 +201,21 @@ fn answer_to(question: Question) -> AttachAnswer {
             table: vec![read("c_z"), read("c_a")],
             kept: [("c_z".into(), "p_n".into())].into(),
         },
-    }
+    })
+}
+
+fn inner(answer: &AttachAnswer) -> &AttachedAnswer {
+    let AttachAnswer::Attach(inner) = answer else {
+        panic!("an attach's answer: {answer:?}")
+    };
+    inner
+}
+
+/// `answer` with its attach's fields edited.
+fn edited(answer: &AttachAnswer, edit: &dyn Fn(&mut AttachedAnswer)) -> AttachAnswer {
+    let mut inner = inner(answer).clone();
+    edit(&mut inner);
+    AttachAnswer::Attach(inner)
 }
 
 fn dropped(changes: &[Change]) -> Vec<&str> {
@@ -363,6 +381,20 @@ fn a_plan_that_can_move_a_definition_before_the_attach_asks_nothing() {
         .unwrap()
         .nullable = true;
     assert_eq!(reshaped.questions(), []);
+    // The reason is said where the plan itself stands: an engine that plans the
+    // two together.
+    let meeting = crate::schema_diff::meeting_shape_tests::Engine {
+        enabled: true,
+        label: "postgres",
+    };
+    let found = reshaped.sides(&[], |base, declared| {
+        questions(base, declared, &meeting, &Hints::default(), base.schema)
+    });
+    assert_eq!(found.attaches, []);
+    let [(_, why)] = &found.skipped[..] else {
+        panic!("one reason: {found:?}")
+    };
+    assert_eq!(*why, Skipped::ParentColumns);
 
     // A column renamed on a table the attach does not touch.
     let mut renamed = World::new();
@@ -383,16 +415,18 @@ fn a_plan_that_can_move_a_definition_before_the_attach_asks_nothing() {
                 .iter()
                 .any(|p| matches!(p.change, Change::Column(ColumnChange::RenameColumn { .. })))
         );
-        assert_eq!(
-            questions(
-                base,
-                declared,
-                &MinimalDialect,
-                &Hints::default(),
-                base.schema
-            ),
-            []
+        let found = questions(
+            base,
+            declared,
+            &MinimalDialect,
+            &Hints::default(),
+            base.schema,
         );
+        assert_eq!(found.attaches, []);
+        let [(_, why)] = &found.skipped[..] else {
+            panic!("one reason: {found:?}")
+        };
+        assert_eq!(*why, Skipped::Unsettles);
     });
 }
 
@@ -415,7 +449,7 @@ fn a_plan_that_updates_an_extension_asks_nothing() {
         .ids;
     let asked = |world: &World| {
         world.sides(&[], |base, declared| {
-            questions(base, declared, &Postgres, &Hints::default(), base.schema)
+            questions(base, declared, &Postgres, &Hints::default(), base.schema).attaches
         })
     };
     // The package standing as it was does not stop the question.
@@ -432,7 +466,7 @@ fn a_plan_that_updates_an_extension_asks_nothing() {
     };
     let plan: Vec<_> = world.sides(&[], |base, declared| {
         assert_eq!(
-            questions(base, declared, &Postgres, &hints, base.schema),
+            questions(base, declared, &Postgres, &hints, base.schema).attaches,
             []
         );
         crate::diff(base, declared, &Postgres, &hints)
@@ -512,7 +546,7 @@ fn an_answer_leaves_its_index_to_the_attach_and_changes_nothing_else() {
     let answer = answer(&world);
     let with = world.plan(vec![answer.clone()]);
     assert_eq!(dropped(&with), ["c_a"]);
-    assert_eq!(recorded(&with), Some(&answer.rehearsal));
+    assert_eq!(recorded(&with), Some(&inner(&answer).rehearsal));
     // The same changes otherwise, in the same order, and none added.
     let expected: Vec<_> = without
         .iter()
@@ -524,7 +558,7 @@ fn an_answer_leaves_its_index_to_the_attach_and_changes_nothing_else() {
             if let Change::Partition(PartitionChange::AttachPartition { rehearsal, .. }) =
                 &mut change
             {
-                *rehearsal = Some(Box::new(answer.rehearsal.clone()));
+                *rehearsal = Some(Box::new(inner(&answer).rehearsal.clone()));
             }
             change
         })
@@ -537,11 +571,7 @@ fn an_answer_that_does_not_agree_with_its_question_plans_as_without_a_resolver()
     let world = World::new();
     let without = world.plan(Vec::new());
     let good = answer(&world);
-    let wrong = |edit: &dyn Fn(&mut AttachAnswer)| {
-        let mut answer = good.clone();
-        edit(&mut answer);
-        vec![answer]
-    };
+    let wrong = |edit: &dyn Fn(&mut AttachedAnswer)| vec![edited(&good, edit)];
     let keyed = |mut index: RelationIndex| {
         index.constraint = Some("UNIQUE (n)".into());
         index
@@ -703,7 +733,7 @@ fn under(name: &str, constraint: &str) -> RelationIndex {
 /// An answer for [`keyed_world`] that keeps both keys and one index.
 fn keyed_answer(world: &World) -> AttachAnswer {
     let question = world.questions().pop().expect("a question");
-    AttachAnswer {
+    AttachAnswer::Attach(AttachedAnswer {
         uid: question.uid,
         parent: question.parent,
         rehearsal: AttachRehearsal {
@@ -726,7 +756,7 @@ fn keyed_answer(world: &World) -> AttachAnswer {
             ]
             .into(),
         },
-    }
+    })
 }
 
 #[test]
@@ -743,7 +773,7 @@ fn a_kept_key_and_unique_constraint_lose_their_drops_and_nothing_else_changes() 
     let answer = keyed_answer(&world);
     let with = world.plan(vec![answer.clone()]);
     assert_eq!(taken_off(&with), ["c_a"]);
-    assert_eq!(recorded(&with), Some(&answer.rehearsal));
+    assert_eq!(recorded(&with), Some(&inner(&answer).rehearsal));
     assert_eq!(with.len() + 3, without.len());
     assert!(with.iter().all(|change| {
         matches!(
@@ -762,9 +792,7 @@ fn an_answer_pairing_two_kinds_or_reading_another_plans_as_without_a_resolver() 
     let good = keyed_answer(&world);
     assert_ne!(world.plan(vec![good.clone()]), without);
     let wrong = |edit: &dyn Fn(&mut AttachRehearsal)| {
-        let mut answer = good.clone();
-        edit(&mut answer.rehearsal);
-        vec![answer]
+        vec![edited(&good, &|answer| edit(&mut answer.rehearsal))]
     };
     let keep = |own: &str, by: &str| -> BTreeMap<ObjectLocalName, ObjectLocalName> {
         [(own.into(), by.into())].into()
@@ -886,7 +914,7 @@ fn excluding_world() -> (World, [pbps_model::Intent; 1]) {
 
 fn excluding_answer(question: Question) -> AttachAnswer {
     let exclusion = |name| under(name, "EXCLUDE USING btree (id WITH =)");
-    AttachAnswer {
+    AttachAnswer::Attach(AttachedAnswer {
         uid: question.uid,
         parent: question.parent,
         rehearsal: AttachRehearsal {
@@ -894,7 +922,7 @@ fn excluding_answer(question: Question) -> AttachAnswer {
             table: vec![read("c_z"), read("c_a"), exclusion("t_x")],
             kept: [("t_x".into(), "p_x".into())].into(),
         },
-    }
+    })
 }
 
 #[test]
@@ -909,10 +937,11 @@ fn a_retired_exclusion_the_parents_might_take_is_asked_about_and_may_be_kept() {
     let answer = excluding_answer(question.clone());
     let with = world.plan_given(&retired, vec![answer.clone()]);
     assert_eq!(taken_off(&with), ["c_a", "c_z"]);
-    assert_eq!(recorded(&with), Some(&answer.rehearsal));
+    assert_eq!(recorded(&with), Some(&inner(&answer).rehearsal));
     // Under another kind of the parent's it is dropped as without an answer.
-    let mut crossed = answer;
-    crossed.rehearsal.kept = [("t_x".into(), "p_n".into())].into();
+    let crossed = edited(&answer, &|a| {
+        a.rehearsal.kept = [("t_x".into(), "p_n".into())].into();
+    });
     assert_eq!(world.plan_given(&retired, vec![crossed]), without);
 }
 
@@ -941,10 +970,8 @@ fn an_exclusion_that_is_declared_unretired_or_untaken_is_never_asked_about() {
         ids: &unretired.ids,
     };
     assert!(crate::diff(base, side, &MinimalDialect, &Hints::default()).is_err());
-    assert_eq!(
-        questions(base, side, &MinimalDialect, &Hints::default(), base.schema),
-        []
-    );
+    // A refused plan asks nothing, and gives no reason either.
+    assert!(questions(base, side, &MinimalDialect, &Hints::default(), base.schema).is_empty());
 
     // Retired, and over another number of keys than any of the parent's: its
     // drop is the retirement's, and the engine has no say.
