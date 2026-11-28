@@ -504,6 +504,17 @@ def check(root):
                 errors.append(
                     f"engine `{engine}`: {WORKFLOW_FILE}: `gate.needs` is missing live job `{live_job}`"
                 )
+            # A job that exists and gates the merge but no longer runs the
+            # engine's ignored tests would pass every check above.
+            if live_job in jobs and isinstance(crate, str) and not any(
+                re.search(rf"\bcargo test\b.*-p {re.escape(crate)}\b.*--ignored\b", line)
+                and not line.lstrip().startswith("#")
+                for line in jobs[live_job]
+            ):
+                errors.append(
+                    f"engine `{engine}`: {WORKFLOW_FILE}: live job `{live_job}` runs no "
+                    f"`cargo test -p {crate} ... --ignored` step"
+                )
 
         # 2. compatibility-matrix.json and ci.yml compatibility matrix
         engine_cells = compat_by_engine.get(engine, [])

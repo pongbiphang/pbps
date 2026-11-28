@@ -71,8 +71,12 @@ jobs:
     runs-on: ubuntu-latest
   live:
     runs-on: ubuntu-latest
+    steps:
+      - run: cargo test -p pbps-mssql --test live -- --ignored
   live-pg:
     runs-on: ubuntu-latest
+    steps:
+      - run: cargo test -p pbps-pg --test live -- --ignored
   compatibility:
     runs-on: ubuntu-latest
     strategy:
@@ -225,13 +229,43 @@ class EngineListsTest(unittest.TestCase):
 
     def test_missing_ci_live_job_and_gate_need_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
-            workflow = BASE_WORKFLOW.replace("  live-pg:\n    runs-on: ubuntu-latest\n", "")
+            workflow = BASE_WORKFLOW.replace(
+                "  live-pg:\n    runs-on: ubuntu-latest\n    steps:\n"
+                "      - run: cargo test -p pbps-pg --test live -- --ignored\n",
+                "",
+            )
+            self.assertNotEqual(workflow, BASE_WORKFLOW)
             write_tree(Path(tmp), {cel.WORKFLOW_FILE: workflow})
             errors = cel.check(Path(tmp))
             self.assertTrue(
                 any("postgres" in e and cel.WORKFLOW_FILE in e and "live-pg" in e for e in errors),
                 errors,
             )
+
+    def test_a_live_job_that_no_longer_runs_the_engines_tests_fails(self):
+        step = "      - run: cargo test -p pbps-pg --test live -- --ignored\n"
+        for replacement in (
+            "      - run: echo skipped\n",
+            # A comment that names the command is not a step.
+            "      # - run: cargo test -p pbps-pg --test live -- --ignored\n",
+            # Another engine's tests do not cover this one.
+            "      - run: cargo test -p pbps-mssql --test live -- --ignored\n",
+            # Without `--ignored` the live tests are compiled and skipped.
+            "      - run: cargo test -p pbps-pg --test live\n",
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                workflow = BASE_WORKFLOW.replace(step, replacement)
+                self.assertNotEqual(workflow, BASE_WORKFLOW)
+                write_tree(Path(tmp), {cel.WORKFLOW_FILE: workflow})
+                errors = cel.check(Path(tmp))
+                self.assertEqual(
+                    [e for e in errors if "runs no" in e],
+                    [
+                        "engine `postgres`: .github/workflows/ci.yml: live job `live-pg` "
+                        "runs no `cargo test -p pbps-pg ... --ignored` step"
+                    ],
+                    replacement,
+                )
 
     def test_missing_compatibility_cell_in_ci_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
