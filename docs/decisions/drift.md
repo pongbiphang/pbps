@@ -217,9 +217,12 @@ direction. It never reads `__pbps_state`, takes no lock and writes nothing.
   made of its base's at creation (DEC-2537.1). Without a record, only a
   default equal to the base domain's own is taken for that copy; any other is
   compared.
-- **What the read left out is no difference.** A declared module the read
-  could not express (an encrypted procedure) is set aside before the
-  comparison and reported as `diff.not-compared`, never as a create.
+- **What the read left out is no difference.** A declared object that the
+  read names as left out and that is absent from what it read back (an
+  encrypted procedure, a PostgreSQL table with a rewrite rule) is set aside
+  before the comparison and reported as `diff.not-compared`, never as a
+  create. An object the read holds is compared whatever part of it was left
+  out. One rule for every kind of object the read can omit, not one per kind.
 - **Declaration problems are exit 1.** Exit 2 means the database differs;
   declarations that do not load leave the question unanswered.
 - **Outside the comparison:** roles, grants, row security and declared rows.

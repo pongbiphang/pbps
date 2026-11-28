@@ -83,6 +83,10 @@ pub struct Managed {
     /// recorded: a newly declared module that collides with an encrypted one
     /// already standing there.
     pub unreadable: Vec<(pbps_db::catalog::LimitationTarget, String)>,
+    /// Every object the read says it left out or could not express, by
+    /// identity, managed or not: the catalog's limitations and its unreadable
+    /// modules. A target can name a part of an object the read still holds.
+    pub omitted: Vec<pbps_db::catalog::LimitationTarget>,
     /// The rows read back under the read scope the caller asked for. Not yet
     /// placed in the schema: `plan --db` projects two different views out of
     /// one read (see [`pbps_model::data::read_scopes`]).
@@ -506,6 +510,12 @@ pub(super) async fn managed_state_full(
             .collect(),
         unrevocable: pulled.unrevocable.clone(),
         unreadable,
+        omitted: pulled
+            .limitations
+            .iter()
+            .map(|limitation| limitation.target.clone())
+            .chain(pulled.unmanaged_modules.iter().map(|m| m.target.clone()))
+            .collect(),
         rows,
         unmanaged_relations,
         relations,

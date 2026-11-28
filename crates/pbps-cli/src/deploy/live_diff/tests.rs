@@ -268,20 +268,16 @@ fn the_text_report_escapes_what_it_prints_and_is_empty_for_none() {
 /// stands in the database: it is reported as not compared, never as a create.
 #[test]
 fn a_declared_module_the_read_could_not_express_is_no_create() {
+    use pbps_db::catalog::LimitationTarget;
     let id: ModuleId = "app.v".parse().unwrap();
     let other: ModuleId = "app.w".parse().unwrap();
+    let live = one_table(&["id"]);
     let mut declared = one_table(&["id"]);
     declared
         .modules
         .insert(id.clone(), view("SELECT id FROM app.t"));
-    let unreadable = [(
-        pbps_db::catalog::LimitationTarget::module(id.clone()),
-        "view app.v (encrypted)".to_owned(),
-    )];
-    let found = compared(
-        &without_the_unreadable(&declared, &unreadable),
-        &one_table(&["id"]),
-    );
+    let omitted = [LimitationTarget::module(id.clone())];
+    let found = compared(&without_the_omitted(&declared, &live, &omitted), &live);
     assert!(found.changes.is_empty(), "{:?}", found.changes);
 
     // Negative: a declared module the database lacks, and that the read did
@@ -289,10 +285,7 @@ fn a_declared_module_the_read_could_not_express_is_no_create() {
     declared
         .modules
         .insert(other.clone(), view("SELECT 1 AS one"));
-    let found = compared(
-        &without_the_unreadable(&declared, &unreadable),
-        &one_table(&["id"]),
-    );
+    let found = compared(&without_the_omitted(&declared, &live, &omitted), &live);
     let [only] = found.changes.changes.as_slice() else {
         panic!("one change, got {:?}", found.changes);
     };
@@ -300,14 +293,47 @@ fn a_declared_module_the_read_could_not_express_is_no_create() {
         matches!(&only.change, Change::Module(pbps_model::change::ModuleChange::CreateModule { id: created, .. }) if *created == other),
         "{only:?}"
     );
-    // Negative: an unreadable module nobody declared sets nothing aside.
-    let elsewhere = [(
-        pbps_db::catalog::LimitationTarget::module("app.x".parse().unwrap()),
-        "view app.x (encrypted)".to_owned(),
-    )];
+    // Negative: an omitted module nobody declared sets nothing aside.
+    let elsewhere = [LimitationTarget::module("app.x".parse().unwrap())];
     assert_eq!(
-        without_the_unreadable(&declared, &elsewhere).modules.len(),
+        without_the_omitted(&declared, &live, &elsewhere)
+            .modules
+            .len(),
         2
+    );
+}
+
+/// A table the read left out whole (a PostgreSQL table with a rewrite rule) is
+/// no create; a table the read holds is compared whatever part of it the read
+/// left out.
+#[test]
+fn a_declared_table_the_read_left_out_is_no_create_and_a_table_it_holds_is_compared() {
+    use pbps_db::catalog::LimitationTarget;
+    let other = TableName::new("app", "u");
+    let declared = schema_of(&[(&table(), &["id"]), (&other, &["id", "note"])]);
+    let live = schema_of(&[(&other, &["id"])]);
+    let omitted = [
+        LimitationTarget::Relation(table()),
+        LimitationTarget::Relation(other.clone()),
+    ];
+    let found = compared(&without_the_omitted(&declared, &live, &omitted), &live);
+    let [only] = found.changes.changes.as_slice() else {
+        panic!("one change, got {:?}", found.changes);
+    };
+    // Negative: `app.u` is read back, so its missing column still counts.
+    assert!(
+        matches!(&only.change, Change::Column(ColumnChange::AddColumn { table: on, .. }) if *on == other),
+        "{only:?}"
+    );
+    // Negative: with nothing omitted, the absent table is a create.
+    let found = compared(&without_the_omitted(&declared, &live, &[]), &live);
+    assert!(
+        found.changes.changes.iter().any(|planned| matches!(
+            &planned.change,
+            Change::Table(TableChange::CreateTable { name, .. }) if *name == table()
+        )),
+        "{:?}",
+        found.changes
     );
 }
 

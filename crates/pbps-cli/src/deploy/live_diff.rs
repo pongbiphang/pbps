@@ -155,7 +155,7 @@ pub fn cmd_live_diff(project: &Project, target: &Target, json: bool) -> anyhow::
         }
     };
 
-    let declared = without_the_unreadable(&loaded.schema, &managed.unreadable);
+    let declared = without_the_omitted(&loaded.schema, &managed.scoped.schema, &managed.omitted);
     let mut compared = compare(
         &declared,
         &loaded.hints,
@@ -368,21 +368,43 @@ fn without_the_parts_not_compared(schema: &mut Schema) {
     }
 }
 
-/// The declarations without the modules the read could not express.
+/// The declarations without what the read left out.
 ///
-/// Such a module stands in the database but is absent from the schema read
+/// An object the read omitted (an encrypted procedure, a PostgreSQL table with
+/// a rewrite rule) stands in the database but is absent from the schema read
 /// back, so compared as read it would be a create. The read already says it
-/// was left out (`diff.not-compared`); here it is no difference either way,
-/// as `plan --db` refuses to plan around it (ADR-0002).
-fn without_the_unreadable(
+/// was left out (`diff.not-compared`); here it is no difference either way, as
+/// `plan --db` refuses to plan around it (ADR-0002). Only an object absent
+/// from the read is set aside: a target can name a part of an object the read
+/// still holds, and the rest of that object is compared.
+fn without_the_omitted(
     declared: &Schema,
-    unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
+    live: &Schema,
+    omitted: &[pbps_db::catalog::LimitationTarget],
 ) -> Schema {
+    use pbps_db::catalog::LimitationTarget;
     let mut declared = declared.clone();
     declared.modules.retain(|id, _| {
-        !unreadable
-            .iter()
-            .any(|(target, _)| target.matches_module(id))
+        live.modules.contains_key(id) || !omitted.iter().any(|target| target.matches_module(id))
+    });
+    declared.tables.retain(|name, _| {
+        live.tables.contains_key(name)
+            || !omitted
+                .iter()
+                .any(|target| matches!(target, LimitationTarget::Relation(n) if n == name))
+    });
+    declared.types.retain(|name, _| {
+        live.types.contains_key(name)
+            || !omitted.iter().any(|target| {
+                matches!(target, LimitationTarget::Type(n)
+                    if n.schema == name.schema() && n.name == name.name())
+            })
+    });
+    declared.search.retain(|name, _| {
+        live.search.contains_key(name)
+            || !omitted
+                .iter()
+                .any(|target| matches!(target, LimitationTarget::Search(n) if n == name))
     });
     declared
 }
