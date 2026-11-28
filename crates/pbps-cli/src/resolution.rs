@@ -129,9 +129,11 @@ pub struct ResolverAssessment {
     /// Apart from the rest because it is a proof from the catalog, not from
     /// the plan alone.
     pub proven_by_dependency: usize,
-    /// Of `unaffected`, the routines whose body the engine did not bind when
-    /// it created them. Their headers were checked and their bodies were not
-    /// (DEC-2987.1), which a reader must be able to tell from a proof.
+    /// Kept routines whose body the engine did not bind when it created
+    /// them, whatever the answer to their header: unaffected, or answered by
+    /// the resolver. Neither checks the body (DEC-2987.1), which a reader must
+    /// be able to tell from a proof. Known from the engine's dependency
+    /// facts, so zero where none were read.
     pub body_not_checked: usize,
     /// Kept surfaces the plan recreates from their declarations anyway.
     pub rebuilt: usize,
@@ -179,7 +181,7 @@ impl ResolverAssessment {
             need: ResolutionNeed::NotNeeded,
             unaffected: assessment.count(Answer::Unaffected),
             proven_by_dependency: assessment.count_unaffected(UnaffectedReason::ByDependency),
-            body_not_checked: assessment.count_unaffected(UnaffectedReason::Unparsed),
+            body_not_checked: assessment.unbound_bodies(),
             rebuilt: assessment.count(Answer::Rebuild),
             authorization: None,
             authorization_notice: None,

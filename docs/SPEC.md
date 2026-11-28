@@ -3618,9 +3618,10 @@ DEC-1674.1).**
   procedural or string-bodied routine has no creation-time binding, so neither
   the assessment nor a resolver has anything of its body to compare. Its
   header (parameter and return types, parameter defaults) is checked like any
-  other surface. Such a routine is counted unaffected, the plan's report says
-  how many bodies were not checked, and what a body finds when it runs is
-  left to the routine's own tests.
+  other surface, and may be proven unaffected or need the resolver like one.
+  Whatever that answer, a plan that moves names says in its report how many
+  kept bodies were not checked, where the engine's dependency facts were
+  read; what a body finds when it runs is left to the routine's own tests.
 - A **selected** resolver that the plan requires but that is unavailable,
   incompatible or inconclusive prevents writing either deployable plan or SQL
   output. Diagnostics name the object, uncertainty and remedy. With no

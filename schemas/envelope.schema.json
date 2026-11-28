@@ -1801,7 +1801,7 @@
           "minimum": 0
         },
         "body_not_checked": {
-          "description": "Of `unaffected`, the routines whose body the engine did not bind when\nit created them. Their headers were checked and their bodies were not\n(DEC-2987.1), which a reader must be able to tell from a proof.",
+          "description": "Kept routines whose body the engine did not bind when it created\nthem, whatever the answer to their header: unaffected, or answered by\nthe resolver. Neither checks the body (DEC-2987.1), which a reader must\nbe able to tell from a proof. Known from the engine's dependency\nfacts, so zero where none were read.",
           "type": "integer",
           "format": "uint",
           "minimum": 0
