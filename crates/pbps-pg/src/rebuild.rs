@@ -39,13 +39,13 @@ pub struct Verification {
     naming: pbps_diff::order::catalog::graph::Naming,
 }
 impl Verification {
-    pub fn finish<D: ?Sized>(
+    pub fn finish<D: pbps_dialect::Dialect>(
         &self,
         before: Side<'_>,
         desired: Side<'_>,
         hints: &Hints,
         plan: CanonicalPlan<D>,
-        dialect: &dyn pbps_dialect::Dialect,
+        dialect: &D,
     ) -> Result<FinishedPlan<D>, FinishError> {
         let input = Input {
             root: &self.root,

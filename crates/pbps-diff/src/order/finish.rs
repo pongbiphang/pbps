@@ -186,11 +186,22 @@ pub fn connected<D: Dialect + ?Sized>(
 ///     finish::rebuild(plan, input, prepared, &MinimalDialect)
 /// }
 /// ```
-pub fn rebuild<D: ?Sized>(
+///
+/// The dialect is the plan's own engine, as at the other entries. Another
+/// engine's dialect cannot finish the plan:
+///
+/// ```compile_fail
+/// use pbps_diff::order::{CanonicalPlan, finish, rebuild::{Input, Prepared}};
+/// use pbps_dialect::{Dialect, MinimalDialect};
+/// fn other_engine<D: Dialect>(plan: CanonicalPlan<D>, input: &Input<'_>, prepared: &Prepared) {
+///     let _ = finish::rebuild(plan, input, prepared, &MinimalDialect);
+/// }
+/// ```
+pub fn rebuild<D: Dialect>(
     plan: CanonicalPlan<D>,
     input: &rebuild::Input<'_>,
     prepared: &rebuild::Prepared,
-    dialect: &dyn Dialect,
+    dialect: &D,
 ) -> Result<FinishedPlan<D>, FinishError> {
     rebuild::verify_plan(input, prepared, plan.changes(), dialect).map_err(FinishError::Rebuild)?;
     Ok(FinishedPlan::new(plan))
