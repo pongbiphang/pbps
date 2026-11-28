@@ -211,6 +211,34 @@ pub fn assess_with_facts(
     })
 }
 
+/// The modules of `among` that `ordinary` keeps and provably cannot rebind:
+/// the ones [`assess_with_facts`] answers unaffected by the dependencies the
+/// engine recorded (DEC-2987.5).
+///
+/// Narrower than "unaffected" on purpose. A routine whose body the engine
+/// does not bind at creation is unaffected as a creation-time question and
+/// is not returned here: nothing was recorded for its body, so a mention in
+/// it is still the only signal there is.
+#[must_use]
+pub fn proven_by_dependency(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    ordinary: &ChangeSet,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
+    facts: &DependencyFacts,
+    among: &BTreeSet<ModuleId>,
+) -> BTreeSet<ModuleId> {
+    let assessment = assess_with_facts(base, desired, ordinary, dialect, Some(facts));
+    among
+        .iter()
+        .filter(|id| {
+            assessment.unaffected_reason(&Surface::Module((*id).clone()))
+                == Some(UnaffectedReason::ByDependency)
+        })
+        .cloned()
+        .collect()
+}
+
 fn with_dialect<R>(
     dialect: &(impl pbps_dialect::Dialect + ?Sized),
     run: impl FnOnce(&Engine<'_>, &Hooks<'_>) -> R,
@@ -3506,6 +3534,95 @@ mod dependency_facts_tests {
             run(&schema, &schema, Vec::new(), Some(&facts)).unbound_bodies(),
             0
         );
+    }
+
+    /// Only a parsed module the engine's record proves is exempt from a
+    /// rebuild its text asks for (DEC-2987.5). A routine arrives as `total`:
+    /// a view that only names an output column so is proven; a view with an
+    /// edge on a routine of that name, a routine whose body the engine did
+    /// not bind, and a view the facts do not cover are not.
+    #[test]
+    fn only_a_parsed_module_the_record_proves_is_exempt_from_a_rebuild() {
+        let mut schema = two_table_schema();
+        let ids_of = |names: &[&str]| -> BTreeSet<ModuleId> {
+            names.iter().map(|name| name.parse().unwrap()).collect()
+        };
+        schema.modules.insert(
+            "app.v_alias".parse().unwrap(),
+            view("SELECT id AS total FROM app.t"),
+        );
+        schema.modules.insert(
+            "app.v_call".parse().unwrap(),
+            view("SELECT lib.total(id) FROM app.t"),
+        );
+        schema.modules.insert(
+            "app.v_uncovered".parse().unwrap(),
+            view("SELECT id AS total FROM app.u"),
+        );
+        schema.modules.insert(
+            "app.f_body()".parse().unwrap(),
+            routine("RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN total(); END; $$"),
+        );
+        let relation = |name: &str| DependencyEdge::Relation(name.parse().unwrap());
+        let facts = DependencyFacts {
+            surfaces: BTreeMap::from([
+                (module_surface("app.v_alias"), parsed([relation("app.t")])),
+                (
+                    module_surface("app.v_call"),
+                    parsed([
+                        relation("app.t"),
+                        DependencyEdge::Routine("lib.total".parse().unwrap()),
+                    ]),
+                ),
+                (
+                    module_surface("app.f_body()"),
+                    SurfaceDependencies::Unparsed(BTreeSet::new()),
+                ),
+            ]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::from([("total".into(), CatalogName::Clear)]),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
+        };
+        let base_ids = resolve_ids(&schema, &IdsFile::default());
+        let ordinary = ChangeSet {
+            changes: vec![PlannedChange::new(Change::Module(
+                ModuleChange::CreateModule {
+                    id: "app.total()".parse().unwrap(),
+                    module: Box::new(routine("RETURNS int LANGUAGE sql RETURN 1")),
+                },
+            ))],
+        };
+        let side = crate::Side {
+            schema: &schema,
+            ids: &base_ids,
+        };
+        let proven = |facts: &DependencyFacts, among: &[&str]| {
+            proven_by_dependency(
+                side,
+                side,
+                &ordinary,
+                &MinimalDialect,
+                facts,
+                &ids_of(among),
+            )
+        };
+        let asked = [
+            "app.v_alias",
+            "app.v_call",
+            "app.v_uncovered",
+            "app.f_body()",
+        ];
+        assert_eq!(proven(&facts, &asked), ids_of(&["app.v_alias"]));
+        // Only what was asked about is answered, however much else is proven.
+        assert_eq!(proven(&facts, &["app.v_call"]), BTreeSet::new());
+        // Negative: a built-in already answers to the arriving name, so no
+        // surface of this plan can be proven and every rebuild stays.
+        let held = DependencyFacts {
+            catalog_names: BTreeMap::from([("total".into(), CatalogName::Held)]),
+            ..facts.clone()
+        };
+        assert_eq!(proven(&held, &asked), BTreeSet::new());
     }
 
     /// A table moved to another schema carries its indexes and owned

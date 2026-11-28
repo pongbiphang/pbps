@@ -223,7 +223,16 @@ pub(super) fn rebind_modules(
     // One set, so a module both the dialect and the caller ask for is rebuilt
     // once.
     let candidates = match rebinding {
-        Rebinding::Candidates => dialect.rebound_modules(declared.schema, &arriving, &changed),
+        Rebinding::Candidates => {
+            let mut candidates = dialect.rebound_modules(declared.schema, &arriving, &changed);
+            // A candidate is a mention in a module's text. Where the engine's
+            // own record shows the mention binds nothing an arrival can move,
+            // it is no reason to rebuild (DEC-2987.5). Only the dialect's
+            // candidates are narrowed: a rebuild the caller or an enum asks
+            // for rests on something other than a name.
+            candidates.retain(|id| !hints.rebinding_proven.contains(id));
+            candidates
+        }
         Rebinding::Evidence => BTreeSet::new(),
     };
     let rebound: BTreeSet<ModuleId> = candidates

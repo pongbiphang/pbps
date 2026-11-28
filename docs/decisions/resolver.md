@@ -7247,3 +7247,20 @@ DEC-2987.1 made the assessment record why a surface is unaffected. Until now the
 Rejected:
 - **Three top-level counts that replace `unaffected`.** Every reader would have to sum them to get the number the report already had.
 - **Listing the routines by name.** The count tells the reader the limit applies; the names are every procedural routine the plan keeps, on every plan, which is the project's own inventory.
+
+<a id="dec-2987-5"></a>
+
+**DEC-2987.5. A connected plan leaves out a candidate rebuild the engine's recorded dependencies prove unnecessary.**
+
+ADR-0013 rebuilds an unchanged module whenever its text mentions a name the plan makes arrive (DECISIONS 422). The mention is all an offline plan has. A connected plan can ask what the module bound when it was created (DEC-2987.1), and a mention that bound nothing an arrival can move, such as an output column or a local variable named like an arriving routine, is then a rebuild for nothing: a view dropped and created again, with its grants and whatever depends on it, for a binding that cannot change.
+
+- **The proof is DEC-2987.1's, unchanged.** A candidate is left out only when the assessment answers it unaffected *by dependency* for the plan made without its rebuild. The differential live test that gates that rule gates this use of it.
+- **A routine whose body the engine did not bind stays a candidate.** It is unaffected as a creation-time question, but nothing was recorded for its body, so the mention is still the only signal. So does a module the facts do not cover, every candidate of a plan of a class the facts do not describe, and every candidate when the read fails, which is one note and never an error.
+- **Proven against the plan that is sealed.** The facts are read for a plan. The candidates are first proven against the plan with none of them rebuilt, then the plan is made again with the proven ones left out and they are proven against that; one that no longer holds gets its rebuild back. The set only shrinks, so this ends, usually after two reads.
+- **With or without a resolver selected.** DEC-1515.1's second case seals the ordinary plan. Narrowing only where no resolver is selected would make selecting one produce a plan with more rebuilds for the same change.
+- **Only the dialect's candidates are narrowed.** A rebuild the engine's own dependencies force around a recreated module (DEC-314.1), or an enum rebuild asks for, rests on something other than a name and is made whatever was proven.
+- **The exemption travels as a hint** (`Hints::rebinding_proven`), beside the other connected facts, so every plan derived later in the same run keeps it, and an offline plan has none.
+
+Rejected:
+- **Dropping the text scan where facts exist.** The scan also covers the forms that bind and leave no dependency row; the proof already keeps a module whose text mentions an arriving relation or type.
+- **Proving against the ordinary plan.** There the candidates are already rebuilt, so the assessment has no question to answer about them.

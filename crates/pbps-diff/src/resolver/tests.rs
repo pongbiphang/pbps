@@ -5694,3 +5694,66 @@ fn a_filtered_index_is_a_surface_only_where_its_filter_can_bind() {
     assert_eq!(names(true), ["expression", "filtered"]);
     assert_eq!(names(false), ["expression"]);
 }
+
+/// A module a connected plan proved by dependency is left out of the rebuilds
+/// the dialect asks for by text, and out of nothing else (DEC-2987.5): the
+/// other candidates are still rebuilt, and a rebuild the caller asks for is
+/// made whatever was proven, because it rests on an engine dependency and
+/// not on a name.
+#[test]
+fn a_proven_module_is_left_out_of_the_text_candidates_and_of_no_other_rebuild() {
+    use pbps_model::{Hints, IdsFile, Module, ModuleKind, Schema};
+    let view = |definition: &str| Module {
+        kind: ModuleKind::View,
+        description: None,
+        definition: definition.into(),
+        options: Default::default(),
+    };
+    let (kept, other): (pbps_model::ModuleId, pbps_model::ModuleId) =
+        ("app.kept".parse().unwrap(), "app.other".parse().unwrap());
+    let mut base = Schema::default();
+    base.modules.insert(kept.clone(), view("SELECT 1 AS n"));
+    base.modules.insert(other.clone(), view("SELECT 2 AS n"));
+    let mut desired = base.clone();
+    desired
+        .modules
+        .insert("app.arrives".parse().unwrap(), view("SELECT 3 AS n"));
+    let before_ids = ids(&base, &IdsFile::default());
+    let after_ids = ids(&desired, &before_ids);
+    let rebuilt = |hints: &Hints, also: &BTreeSet<pbps_model::ModuleId>| {
+        let plan = crate::diff_rebuilding(
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Candidates,
+            hints,
+            also,
+        )
+        .unwrap();
+        plan.changes
+            .iter()
+            .filter_map(|planned| {
+                if let Change::Module(ModuleChange::AlterModule { id, .. }) = &planned.change {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let none = BTreeSet::new();
+    let both = BTreeSet::from([kept.clone(), other.clone()]);
+    assert_eq!(rebuilt(&Hints::default(), &none), both);
+    let proven = Hints {
+        rebinding_proven: BTreeSet::from([kept.clone()]),
+        ..Hints::default()
+    };
+    assert_eq!(rebuilt(&proven, &none), BTreeSet::from([other.clone()]));
+    // Negative: the caller's own rebuild of the proven module is still made.
+    assert_eq!(rebuilt(&proven, &BTreeSet::from([kept.clone()])), both);
+}

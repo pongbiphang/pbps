@@ -437,6 +437,7 @@ pub(super) async fn bootstrap_async(
                 enum_comments: Default::default(),
                 domain_array_holders: Default::default(),
                 enum_dependents: Default::default(),
+                rebinding_proven: Default::default(),
                 // Nothing is created here: the packages are the prerequisites.
                 extension_requires: Default::default(),
                 extension_drops: Default::default(),
