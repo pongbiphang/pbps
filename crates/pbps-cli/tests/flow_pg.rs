@@ -18644,7 +18644,8 @@ fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
 /// Three kinds the unmanaged inventory used to miss (#3038): a table the read
 /// leaves out whole (a rewrite rule), a standalone sequence and a text search
 /// configuration, none declared. `verify` and `plan --db` name all three and
-/// refuse under `unmanaged: error`; once they are gone, neither names them.
+/// refuse under `unmanaged: error`; once they are gone, neither names them, and
+/// a declared one the record does not hold yet is not called unmanaged.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn undeclared_omitted_tables_sequences_and_text_search_obey_unmanaged_policy() {
@@ -18723,6 +18724,26 @@ fn undeclared_omitted_tables_sequences_and_text_search_obey_unmanaged_policy() {
     .unwrap();
     d.commit();
     assert_eq!(names_ours(&d.run(&["verify", "--db", connection])), 0);
+
+    // A declared one the record does not hold yet is the project's, not
+    // somebody else's: `plan --db` does not call it unmanaged.
+    std::fs::write(
+        d.dir.join("schema/app.decl_cfg.textsearch-config.yml"),
+        "text_search_config: app.decl_cfg\nparser: pg_catalog.\"default\"\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    on_server(
+        connection,
+        "CREATE TEXT SEARCH CONFIGURATION app.decl_cfg (PARSER = pg_catalog.\"default\")",
+    );
+    let planned = d.run(&["plan", "--db", connection]);
+    assert!(
+        !stderr(&planned).contains("decl_cfg"),
+        "{}",
+        stderr(&planned)
+    );
 }
 
 /// #1723: each relation-namespace occupant follows its table through the

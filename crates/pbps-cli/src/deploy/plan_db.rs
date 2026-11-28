@@ -595,19 +595,21 @@ pub(super) async fn plan_db_selected(
         for_policy
             .unmanaged_modules
             .retain(|m| !loaded.schema.modules.contains_key(m));
-        // A standalone sequence is the project's when it declares it or the
-        // record holds it (the plan drops what the record holds and the
-        // declarations do not).
+        // A standalone sequence or a text search object is the project's when
+        // it declares it or the record holds it: the plan compares the one and
+        // drops the other, so neither is somebody else's.
         let managed_sequences = loaded
             .schema
             .sequences
             .keys()
             .chain(entry.snapshot.schema.sequences.keys())
             .collect();
+        let mut policy_ids = recorded_ids.clone();
+        policy_ids.search.extend(resolved.ids.search.clone());
         report_unmanaged(
             &for_policy,
             &managed.unreadable,
-            &recorded_ids,
+            &policy_ids,
             &recorded_modules,
             Some(&managed_sequences),
             project.config.unmanaged,

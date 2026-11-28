@@ -402,7 +402,7 @@ pub(super) fn warn_unreleased(label: &str, released: &Result<bool, pbps_db::DbEr
 #[error("{0}")]
 pub struct UnmanagedPolicy(String);
 
-/// Converts unreadable modules and type limitations into the common identity
+/// Converts unreadable modules and type and text search limitations into the common identity
 /// and description form used by connected commands.
 pub(crate) fn unreadable_objects(
     pulled: &pbps_db::catalog::Pulled,
@@ -442,6 +442,24 @@ pub(crate) fn unreadable_objects(
                             limitation.detail
                         ),
                     )
+                }),
+        )
+        // So does a text search object the read could not express: absent
+        // from the scoped read, so only this half can name it (#3038).
+        .chain(
+            pulled
+                .limitations
+                .iter()
+                .filter_map(|limitation| match &limitation.target {
+                    pbps_db::catalog::LimitationTarget::Search(name) => Some((
+                        limitation.target.clone(),
+                        format!("{} ({})", name.shown(), limitation.detail),
+                    )),
+                    pbps_db::catalog::LimitationTarget::Type(_)
+                    | pbps_db::catalog::LimitationTarget::Relation(_)
+                    | pbps_db::catalog::LimitationTarget::SharedModule(_)
+                    | pbps_db::catalog::LimitationTarget::Module(_)
+                    | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => None,
                 }),
         )
         .collect()

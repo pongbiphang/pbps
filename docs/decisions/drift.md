@@ -253,7 +253,10 @@ nor refused under `unmanaged: error`.
   and `pbps diff`) are gone.
 - **A text search object is judged by its identity.** The cut keeps every one
   the database holds (DEC-2728.1); the inventory lists those no identity names,
-  as it does a table.
+  as it does a table, and one the read could not express is carried with the
+  other unreadable objects, judged the same way. `plan --db` judges by the
+  declared and the recorded identities together, since a declared one the
+  record does not hold yet is the project's.
 - **A sequence is judged by the caller's list.** A standalone sequence has no
   identity (DEC-2721.1), so which ones are the project's is only known to the
   command: the record for `verify` and `status`, the declarations for `diff`,

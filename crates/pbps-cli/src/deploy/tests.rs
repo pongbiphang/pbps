@@ -13744,3 +13744,35 @@ fn an_omitted_relation_nobody_manages_is_unmanaged_in_every_cut() {
     );
     assert!(scoped.unmanaged.is_empty(), "{:?}", scoped.unmanaged);
 }
+
+/// A text search object the read could not express is absent from the scoped
+/// read, so the unreadable half of the inventory is what names it; one an
+/// identity names is the project's (#3038).
+#[test]
+fn an_omitted_text_search_object_nobody_manages_is_unmanaged() {
+    use pbps_db::catalog::{Limitation, LimitationTarget, Pulled};
+    use pbps_model::{SearchKind, SearchRef};
+    let name = SearchRef::new(SearchKind::Config, "app.odd".parse().unwrap());
+    let pulled = Pulled {
+        limitations: vec![Limitation {
+            target: LimitationTarget::Search(name.clone()),
+            detail: "its parser cannot be represented".into(),
+        }],
+        ..Default::default()
+    };
+    let unreadable = unreadable_objects(&pulled);
+    let modules = BTreeSet::new();
+    let mut ids = IdsFile::default();
+    let scoped = pbps_diff::scope(&pulled.schema, &ids, &modules, &BTreeSet::new());
+    let listed = unmanaged_objects(&scoped, &unreadable, &ids, &modules, None);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(listed[0].contains("app.odd"), "{listed:?}");
+    assert!(
+        listed[0].contains("its parser cannot be represented"),
+        "{listed:?}"
+    );
+    // Negative: an identity names it, so it is a managed limitation instead.
+    ids.search
+        .insert(pbps_model::Uid::generate(pbps_model::UidKind::Search), name);
+    assert!(unmanaged_objects(&scoped, &unreadable, &ids, &modules, None).is_empty());
+}
