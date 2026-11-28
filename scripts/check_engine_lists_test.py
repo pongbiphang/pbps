@@ -229,6 +229,21 @@ class EngineListsTest(unittest.TestCase):
                     repr(value),
                 )
 
+    def test_a_null_document_is_refused_and_not_read_as_nothing_to_check(self):
+        for rel_path in (
+            cel.MARKER_FILE,
+            cel.COMPAT_MATRIX_FILE,
+            cel.OWNERS_FILE,
+            cel.RULES_FILE,
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                write_tree(Path(tmp), {rel_path: "null"})
+                self.assertEqual(
+                    cel.check(Path(tmp)),
+                    [f"{rel_path}: the document is `null`, which registers nothing"],
+                    rel_path,
+                )
+
     def test_in_process_marker_without_reason_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             marker = json.loads(json.dumps(BASE_MARKER))

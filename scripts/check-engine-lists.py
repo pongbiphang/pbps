@@ -236,10 +236,16 @@ def read_json(root, rel_path, errors):
     if text is None:
         return None
     try:
-        return json.loads(text)
+        document = json.loads(text)
     except json.JSONDecodeError as error:
         errors.append(f"{rel_path}: invalid JSON: {error}")
         return None
+    # `None` means "could not be read" to every caller, and each skips its
+    # checks on it. A document that is `null` parses to the same value, so it
+    # is refused here: no caller can then see `None` without an error.
+    if document is None:
+        errors.append(f"{rel_path}: the document is `null`, which registers nothing")
+    return document
 
 
 def flow_list(lines, key_pattern):
