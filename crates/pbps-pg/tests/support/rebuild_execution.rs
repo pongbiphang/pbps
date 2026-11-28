@@ -1,4 +1,5 @@
 use super::*;
+use pbps_diff::order::{CanonicalPlan, Schedule, Source, finish};
 use pbps_model::IndexChange;
 use pbps_model::ModuleChange;
 use pbps_model::PartitionChange;
@@ -280,41 +281,83 @@ fn final_verification_keeps_every_part_and_the_expansions_completion_order() {
     assert!(verify_plan(&f.input(), &prepared, &edited, &pg).is_err());
 }
 
+fn expanded_plan(
+    input: &Input<'_>,
+    prepared: &Prepared,
+    pg: &pbps_pg::Postgres,
+) -> CanonicalPlan<pbps_pg::Postgres> {
+    let root = pbps_diff::diff(input.before, input.desired, pg, input.hints).unwrap();
+    continue_plan(root, input, prepared.clone(), pg).unwrap()
+}
+
 #[test]
-fn exact_rebuild_verification_finishes_only_the_verified_sequence() {
-    use pbps_diff::order::{finish, rebuild};
+fn a_rebuild_finishes_only_with_its_prepared_catalog() {
+    let mut f = Fixture::new();
+    let pg = pbps_pg::Postgres::new();
+    let prepared = f.prepare().unwrap();
+    let plan = expanded_plan(&f.input(), &prepared, &pg);
+    let finished = finish::rebuild(plan.clone(), &f.input(), &prepared, &pg).unwrap();
+    assert_eq!(finished.changes(), plan.changes());
+
+    // A second catalog read reserves an address the original sequence uses.
+    let occupied = &prepared.addresses()[0].address;
+    let Fact::Present(names) = &mut f.naming else {
+        unreachable!()
+    };
+    names
+        .get_mut(&occupied.schema)
+        .unwrap()
+        .types
+        .insert(occupied.name.clone().into(), obj(90));
+    let other_prepared = f.prepare().unwrap();
+    let other_input = f.input();
+    assert_ne!(prepared.addresses(), other_prepared.addresses());
+    let reason = verify_plan(&other_input, &other_prepared, plan.changes(), &pg).unwrap_err();
+    let Err(error) = finish::rebuild(plan, &other_input, &other_prepared, &pg) else {
+        panic!("the rebuild finished in a different catalog context");
+    };
+    assert!(matches!(
+        &error,
+        finish::FinishError::Rebuild(detail) if detail == &reason
+    ));
+    assert_eq!(error.to_string(), reason);
+}
+
+#[test]
+fn rebuild_finish_refuses_a_changed_sequence_in_its_prepared_catalog() {
+    use pbps_model::resolver::OrderReason;
     let f = Fixture::new();
     let pg = pbps_pg::Postgres::new();
     let input = f.input();
     let prepared = f.prepare().unwrap();
-    let root = pbps_diff::diff(input.before, input.desired, &pg, input.hints).unwrap();
-    let final_order = rebuild::continue_plan(root, &input, prepared.clone(), &pg).unwrap();
-    let proof = || rebuild::verify_sequence(&input, &prepared, final_order.changes(), &pg).unwrap();
-    let finished = finish::rebuild(final_order.clone(), proof()).unwrap();
-    assert_eq!(finished.changes(), final_order.changes());
-
-    // The fixture uses a second ordinary canonical sequence with no changes.
-    let empty = pbps_diff::diff(input.before, input.before, &pg, &Hints::default()).unwrap();
-    use pbps_diff::order::deployment::{Sources, schedule};
-    let declarations = schedule::Declarations {
-        schema: input.before.schema,
-        sources: Sources {
-            before: input.before,
-            after: input.before.ids,
-        },
-        annotations: &Default::default(),
+    let plan = expanded_plan(&input, &prepared, &pg);
+    let steps = &plan.changes().changes;
+    let own = steps
+        .iter()
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Index(IndexChange::BuildPartitionedIndex(_))
+            )
+        })
+        .unwrap();
+    let analyze = steps
+        .iter()
+        .position(|p| {
+            matches!(
+                p.change,
+                Change::Partition(PartitionChange::AnalyzeTableTree(_))
+            )
+        })
+        .unwrap();
+    let mut schedule = Schedule::new(steps.len());
+    schedule.edge(analyze, own, Source::Effect, OrderReason::Structural);
+    let reordered = schedule.settle(plan).unwrap().into_planning();
+    let reason = verify_plan(&input, &prepared, reordered.changes(), &pg).unwrap_err();
+    let Err(error) = finish::rebuild(reordered, &input, &prepared, &pg) else {
+        panic!("the reordered rebuild finished");
     };
-    let other = schedule::schedule(empty, &declarations, &Default::default(), &pg)
-        .unwrap()
-        .changes;
-    let error = finish::rebuild(other, proof())
-        .err()
-        .expect("a proof cannot finish another sequence");
-    assert!(matches!(
-        error,
-        finish::FinishError::RebuildSequence { position: 1, .. }
-    ));
-    assert!(error.to_string().contains("app."), "{error}");
+    assert_eq!(error.to_string(), reason);
 }
 
 #[test]

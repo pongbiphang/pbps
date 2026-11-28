@@ -2038,19 +2038,10 @@ impl PlanSession for pbps_pg::Postgres {
             };
             facts.order_and_refuse(changes, frame.label, planned)?;
         }
-        let rebuild = state
-            .rebuild_verification
-            .as_ref()
-            .map(|verification| {
-                verification
-                    .verify(frame.base, frame.declared, frame.hints, changes, self)
-                    .map_err(anyhow::Error::msg)
-            })
-            .transpose()?;
         Ok(Ordered {
             facts: state.name_facts.as_ref().map(NameFacts::slots),
             membership: state.membership.take(),
-            rebuild,
+            rebuild: state.rebuild_verification.take(),
         })
     }
 

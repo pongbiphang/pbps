@@ -10,6 +10,7 @@ use pbps_model::resolver::OrderingProof;
 use pbps_model::{Change, ChangeSet, Finding, ModuleDeps, PlanMode, Text};
 
 pub use super::plan::{Standalone, StandaloneScheduled};
+use super::rebuild;
 use super::shadow::{self, Stage};
 use super::slots;
 use super::{
@@ -56,8 +57,8 @@ pub enum FinishError {
     Replay(String),
     #[error("{0}")]
     PendingExpansion(String),
-    #[error("final order differs from the verified rebuild at step {position} ({object})")]
-    RebuildSequence { position: usize, object: String },
+    #[error("{0}")]
+    Rebuild(String),
 }
 
 /// An engine-branded plan that passed its route's final check.
@@ -175,37 +176,23 @@ pub fn connected<D: Dialect + ?Sized>(
     Ok(FinishedPlan::new(plan))
 }
 
-/// Finish the exact sequence the rebuild verifier read.
-///
-/// ```compile_fail
-/// use pbps_diff::order::{CanonicalPlan, finish, rebuild::Prepared};
-/// use pbps_dialect::MinimalDialect;
-/// fn finish_preparation(plan: CanonicalPlan<MinimalDialect>, prepared: Prepared) {
-///     let _ = finish::rebuild(plan, prepared);
-/// }
-/// ```
+/// Verify the rebuild against its preparation and finish that sequence.
 ///
 /// ```
-/// use pbps_diff::order::{CanonicalPlan, finish, rebuild};
+/// use pbps_diff::order::{CanonicalPlan, finish, rebuild::{Input, Prepared}};
 /// use pbps_dialect::MinimalDialect;
-/// fn finish_rebuild(plan: CanonicalPlan<MinimalDialect>, input: &rebuild::Input<'_>,
-///                   prepared: &rebuild::Prepared) -> Result<(), String> {
-///     let proof = rebuild::verify_sequence(input, prepared, plan.changes(), &MinimalDialect)?;
-///     let _ = finish::rebuild(plan, proof).map_err(|error| error.to_string())?;
-///     Ok(())
+/// fn finish_rebuild(plan: CanonicalPlan<MinimalDialect>, input: &Input<'_>,
+///                   prepared: &Prepared) -> Result<finish::FinishedPlan<MinimalDialect>, finish::FinishError> {
+///     finish::rebuild(plan, input, prepared, &MinimalDialect)
 /// }
 /// ```
 pub fn rebuild<D: ?Sized>(
     plan: CanonicalPlan<D>,
-    proof: super::rebuild::VerifiedSequence,
+    input: &rebuild::Input<'_>,
+    prepared: &rebuild::Prepared,
+    dialect: &dyn Dialect,
 ) -> Result<FinishedPlan<D>, FinishError> {
-    if let Some((at, expected)) = proof.mismatch(plan.changes()) {
-        let step = plan.changes().changes.get(at).unwrap_or(expected);
-        return Err(FinishError::RebuildSequence {
-            position: at + 1,
-            object: subject(&step.change),
-        });
-    }
+    rebuild::verify_plan(input, prepared, plan.changes(), dialect).map_err(FinishError::Rebuild)?;
     Ok(FinishedPlan::new(plan))
 }
 

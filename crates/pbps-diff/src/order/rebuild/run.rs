@@ -7,7 +7,7 @@ use crate::order::{
 use pbps_model::IndexChange;
 use pbps_model::PartitionChange;
 use pbps_model::TableChange;
-use pbps_model::resolver::{OrderReason, OrderingProof};
+use pbps_model::resolver::OrderReason;
 use std::fmt;
 
 #[derive(Debug)]
@@ -501,79 +501,4 @@ pub fn verify_plan(
         }
     }
     Ok(())
-}
-
-/// The sequence accepted by the exact rebuild verifier. Only verification
-/// can issue it, and finish compares every change before granting authority.
-///
-/// ```compile_fail
-/// use pbps_diff::order::rebuild::VerifiedSequence;
-/// let changes = pbps_model::ChangeSet::default();
-/// let wire = pbps_model::resolver::OrderingProof::new(&changes, Default::default()).unwrap();
-/// let _ = VerifiedSequence { changes, wire };
-/// ```
-///
-/// ```
-/// use pbps_diff::order::rebuild::{Input, Prepared, VerifiedSequence, verify_sequence};
-/// use pbps_dialect::Dialect;
-/// fn certify(input: &Input<'_>, prepared: &Prepared, sequence: &pbps_model::ChangeSet,
-///            engine: &dyn Dialect) -> Result<VerifiedSequence, String> {
-///     verify_sequence(input, prepared, sequence, engine)
-/// }
-/// ```
-#[derive(Debug)]
-pub struct VerifiedSequence {
-    changes: ChangeSet,
-    wire: OrderingProof,
-}
-
-impl VerifiedSequence {
-    pub(in crate::order) fn mismatch<'a>(
-        &'a self,
-        actual: &'a ChangeSet,
-    ) -> Option<(usize, &'a PlannedChange)> {
-        // Some nested model values compare independent of their wire order.
-        // Use the existing wire proof to catch even those substitutions.
-        let different_bytes = self.wire.validate(actual).is_err();
-        let wire_step = |step: &PlannedChange| {
-            OrderingProof::new(
-                &ChangeSet {
-                    changes: vec![step.clone()],
-                },
-                Default::default(),
-            )
-            .expect("an empty set of ordering edges is valid")
-        };
-        let expected = &self.changes.changes;
-        expected
-            .iter()
-            .enumerate()
-            .find(|(at, step)| {
-                actual.changes.get(*at).is_none_or(|actual| {
-                    actual != *step
-                        || actual.provenance != step.provenance
-                        || (different_bytes && wire_step(actual) != wire_step(step))
-                })
-            })
-            .or_else(|| {
-                actual
-                    .changes
-                    .get(expected.len())
-                    .map(|step| (expected.len(), step))
-            })
-    }
-}
-
-pub fn verify_sequence(
-    input: &Input<'_>,
-    prepared: &Prepared,
-    plan: &ChangeSet,
-    dialect: &dyn Dialect,
-) -> Result<VerifiedSequence, String> {
-    verify_plan(input, prepared, plan, dialect)?;
-    Ok(VerifiedSequence {
-        changes: plan.clone(),
-        wire: OrderingProof::new(plan, Default::default())
-            .expect("an empty set of ordering edges is valid"),
-    })
 }

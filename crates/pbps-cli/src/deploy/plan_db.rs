@@ -1088,15 +1088,7 @@ pub(super) async fn plan_db_selected(
             let ordered = dialect
                 .order_by_catalog(&mut plan_state, &mut conn, &mut cs, frame)
                 .await?;
-            let cs = ordered.finish(
-                cs,
-                finish::Inputs {
-                    before: frame.recorded,
-                    after: frame.written,
-                    modules: &hints.annotations.modules(frame.written.schema),
-                },
-                dialect.as_ref(),
-            )?;
+            let cs = ordered.finish(cs, frame, dialect.as_ref())?;
             let checks = dialect
                 .check_final_order(&plan_state, &mut conn, cs.changes(), frame)
                 .await?;

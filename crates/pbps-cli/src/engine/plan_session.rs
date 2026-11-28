@@ -76,7 +76,6 @@ use pbps_dialect::{routines::RoutineAdmission, slots::CatalogFacts};
 use pbps_diff::order::{
     CanonicalPlan,
     finish::{self, Catalog, FinishError, FinishedPlan, Inputs},
-    rebuild::VerifiedSequence,
 };
 
 pub(super) mod mssql;
@@ -139,7 +138,7 @@ pub(crate) struct ScheduleReads {
 pub(crate) struct Ordered {
     facts: Option<CatalogFacts>,
     membership: Option<MembershipRead>,
-    rebuild: Option<VerifiedSequence>,
+    rebuild: Option<RebuildVerification>,
 }
 
 #[derive(Debug)]
@@ -160,11 +159,11 @@ impl Ordered {
     pub(crate) fn finish<D: crate::emission::Engine>(
         self,
         plan: CanonicalPlan<D>,
-        inputs: Inputs<'_>,
+        frame: Frame<'_>,
         dialect: &D,
     ) -> Result<FinishedPlan<D>, FinishError> {
-        if let Some(proof) = self.rebuild {
-            return finish::rebuild(plan, proof);
+        if let Some(verification) = self.rebuild {
+            return verification.finish(frame.base, frame.declared, frame.hints, plan, dialect);
         }
         let membership = self.membership.as_ref();
         let configured = membership.map(|read| dialect.with_planning_version(read.version));
@@ -174,7 +173,11 @@ impl Ordered {
         };
         finish::connected(
             plan,
-            inputs,
+            Inputs {
+                before: frame.recorded,
+                after: frame.written,
+                modules: &frame.hints.annotations.modules(frame.written.schema),
+            },
             configured.as_ref().unwrap_or(dialect),
             catalog,
         )

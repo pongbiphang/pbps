@@ -123,9 +123,10 @@ the existing settlements or change their order (DEC-1959.5, DEC-1959.6).
    annotation legs, membership obligations and name handovers. It replays the
    requirements and names against the baseline. It returns the same sequence
    or refuses by name. Standalone plans omit the computed-column releases that
-   need connected ordering. A PostgreSQL rebuild finishes with the exact
-   verifier's sequence proof. Early debug observations and live commutation
-   checks still exercise the earlier passes and expose missing effects.
+   need connected ordering. Finishing a PostgreSQL rebuild runs the exact
+   verifier on that sequence and its prepared catalog context. Early debug
+   observations and live commutation checks still exercise the earlier passes
+   and expose missing effects.
    Admission preserves the reviewed order of a saved artifact. Sealing and
    admission leave proof and origins out of checksum bytes (DEC-1959.5).
 

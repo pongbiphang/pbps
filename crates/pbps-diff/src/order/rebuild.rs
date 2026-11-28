@@ -11,7 +11,7 @@ use pbps_model::operation::Source as OriginSource;
 use pbps_model::{operation::*, plan_names::PlanNames, *};
 use std::collections::{BTreeMap, BTreeSet};
 mod run;
-pub use run::{Expanded, VerifiedSequence, expand, verify_plan, verify_sequence};
+pub use run::{Expanded, expand, verify_plan};
 
 /// Engine naming receives shared release facts and the validated proposed ledger.
 /// Its recipes are checked against every approved part and reserved member.
@@ -53,6 +53,13 @@ pub struct PartStep {
 /// A read-only inventory, not a plan or permission to consume the recorded file.
 /// ```compile_fail
 /// fn upgrade(p: pbps_diff::order::rebuild::Prepared) -> pbps_diff::order::PlanningPlan { p }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::rebuild::Prepared;
+/// fn replace_inventory(prepared: Prepared) -> Prepared {
+///     Prepared { parts: Vec::new(), ..prepared }
+/// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct Prepared {

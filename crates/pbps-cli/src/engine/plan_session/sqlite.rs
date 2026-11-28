@@ -4006,17 +4006,8 @@ mod tests {
             let ordered_check =
                 now(dialect.order_by_catalog(&mut state, &mut conn, &mut scheduled, frame))
                     .expect("order_by_catalog");
-            use pbps_diff::order::finish;
             let finished = ordered_check
-                .finish(
-                    scheduled,
-                    finish::Inputs {
-                        before: base_side,
-                        after: desired_side,
-                        modules: &hints.annotations.modules(&desired),
-                    },
-                    &dialect,
-                )
+                .finish(scheduled, frame, &dialect)
                 .expect("the scheduled plan passes the final check");
             assert_eq!(check.engine, "SQLite");
             assert_eq!(check.status, "passed");

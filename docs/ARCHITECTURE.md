@@ -166,8 +166,9 @@ in [ORDERING](ORDERING.md#adding-an-engine) (DEC-1959.6).
   capabilities as neutral facts. Unread and read-empty remain distinct;
   `pbps-diff::order` owns their pure constraints and structural application.
   The CLI catalog pass transfers its private result to the final check. The
-  check accepts its slot and membership observations as inputs. A rebuild
-  needs the sequence proof issued by the exact verifier in order.
+  check accepts its slot and membership observations as inputs. The rebuild
+  entry in `order` runs the exact verifier on the plan with the prepared
+  catalog context before granting execution authority.
 - The emitter supplies `Statement` transaction and batch requirements,
   intermediate rename/create/release names and execution metadata. Lowering
   retains source IDs/origins and indivisible statement groups, branded by the
