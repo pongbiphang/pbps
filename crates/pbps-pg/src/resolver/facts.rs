@@ -246,6 +246,10 @@ WITH req AS (
 )
 SELECT req.idx,
        (n.oid IS NOT NULL AND CASE req.kind
+         -- A type of the name counts although a sequence has no row type of
+         -- its own: the engine avoids only relation names when it chooses, and
+         -- then refuses the statement because the type exists (measured on 16
+         -- and 18).
          WHEN 'relation' THEN
            EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.relnamespace = n.oid AND c.relname = req.obj_name)
            OR EXISTS (SELECT 1 FROM pg_catalog.pg_type t WHERE t.typnamespace = n.oid AND t.typname = req.obj_name)

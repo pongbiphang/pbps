@@ -1120,7 +1120,10 @@ impl PlanEffects {
                     }
                     ModuleId::Trigger { on, name } => {
                         // A constraint trigger creates a constraint row under
-                        // its name in the table's schema.
+                        // its name in the table's schema. The declaration is
+                        // the trigger's text, which does not say which kind it
+                        // is, so every trigger counts: that can only keep a
+                        // question, never drop one.
                         self.arriving_constraints
                             .insert(ObjectName::new(&on.schema, name));
                     }
