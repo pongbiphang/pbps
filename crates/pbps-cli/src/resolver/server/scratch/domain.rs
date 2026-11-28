@@ -116,7 +116,6 @@ pub(super) async fn run(
         schema: &types,
         ids: &ids,
     };
-    let unavailable = |why: String| Refused::Unavailable(ProduceError::Run(Error::Binding(why)));
     let bootstrap =
         pbps_diff::bootstrap(base, desired_types, &dialect, &hints).map_err(|errors| {
             unavailable(format!("the declared types cannot be ordered: {errors:?}"))
@@ -141,11 +140,10 @@ pub(super) async fn run(
             before: base,
             after: desired_types,
             modules: &hints.annotations.modules(&types),
-            captured: &Default::default(),
         },
         &dialect,
     )
-    .map_err(|error| unavailable(error.to_string()))?
+    .map_err(unavailable)?
     .ordered(PlanMode::Transactional, &dialect);
     let lowered = pbps_dialect::lower::lower_all(
         &ordered as &dyn pbps_diff::order::PlanView<pbps_pg::Postgres>,
@@ -311,4 +309,25 @@ fn expression_parts(statement: &pbps_dialect::DeclaredTypeStatement) -> String {
         );
     }
     parts.join(" and ")
+}
+
+fn unavailable(why: impl std::fmt::Display) -> Refused {
+    Refused::Unavailable(ProduceError::Run(Error::Binding(why.to_string())))
+}
+
+#[cfg(test)]
+mod final_order_tests {
+    use super::*;
+
+    #[test]
+    fn domain_scratch_final_order_is_a_named_binding_refusal() {
+        let refused = unavailable(crate::final_order_refusal());
+        let Refused::Unavailable(ProduceError::Run(Error::Binding(why))) = refused else {
+            panic!("domain scratch must report a binding refusal");
+        };
+        assert!(
+            why.contains("app.first") && why.contains("app.second"),
+            "{why}"
+        );
+    }
 }

@@ -2466,3 +2466,23 @@ Rejected:
 - Refusing first could reject a valid plan that the settlement is meant to repair.
 
 The route-end measurement, final settlement and the rule for unread name-slot rows at a route end remain open.
+
+<a id="dec-2993-11"></a>
+
+**DEC-2993.11. The final stage checks the given fresh order in every build (#2993).** The stage borrows the completed plan and reads the stated effects, typed and module declarations, captured bindings, symbolic obligations and name slots. It scans stated legs for reversals and replays effects and slots from the baseline. A reversal names both steps by position and subject and states the reason in plain words. An unread managed owner names the step and the object when the reader can locate them. A replay failure names the step and carries the checker's own rendering of the requirement. The stage returns the same plan value with its sequence, origins, IDs, capture and proof. It has no permutation or recorder override. Wire bytes and checksums stay as they were. Saved plans enter through checked admission.
+
+The standalone planner, bootstrap, rehearsal base and both resolver scratch builds supply their own declaration sides. They omit the computed-column releases owned by the connected SQL Server pass (DEC-1431.1 and DEC-2228.1). The ordinary connected join also supplies the catalog's name evidence. PostgreSQL carries the stored membership query and the planning server version from the shared schedule. An unqueried membership catalog and an empty queried catalog are distinct. The ordinary day-to-day read uses the same name timeline as the old final observer. Membership uses the registered boundary timeline and its operation IDs.
+
+The early observer and final check make the same typed waiver decisions. An ordinary unprovided requirement or lasting slot contest retains its existing waiver. Unknown slot comparisons and intentionally unavailable intermediate lowering retain readable evidence. An unmet membership obligation refuses. Text guess, inferred and lexical candidate legs do not take part. Every other source is stated: effect, binding, declared, annotation, catalog, execution and search legs. Some stated requirements come from token matching in dialect effect readers. A false positive in one of those rules belongs to that reader. Connected computed-module release checks retain the old observer's behaviour. The existing catalog computed precedence pass still supplies exact ordering.
+
+The exact PostgreSQL rebuild verifier issues an opaque proof over the sequence that passed its replay and rule checks. The final entry compares the supplied sequence with that proof before making an ordered value. Ordinary catalog evidence cannot waive the final check. Inside the CLI, the catalog pass owns its private result and consumes it at the join. A library caller can supply fewer facts and receive a weaker check or a refusal. The final check does not attest that a catalog pass ran. This removes the skip examined in #3102. The maintainer accepted this boundary as that issue's resolution: no extraction of the catalog pass into the library is planned.
+
+Policy and module dependents, generated-input dependencies, the legacy text release window, the relation census, resolver edge sources and retained proof legs, SQL Server computed precedence, search legs and collation comparisons still belong to their existing passes. The final stage moves nothing across those checks. Rebuild parts still use prepared names and effects, and the ordinary typed annotation projection onto those parts remains open (#3112).
+
+The earlier measurement recorded 3,230 offline route ends per profile and 16,214 live route ends. It observed zero backward stated legs. The 59 ordinary PostgreSQL symbolic refusals lacked the stored membership read. All 69 generic rebuild reads lacked prepared evidence and their exact paired checks passed. It also measured seven forced text cycles, two standalone computed release moves, and one synthetic role fixture without role identities.
+
+Rejected:
+
+- Repair in the same PR would require moving steps, retaining additional catalog facts and replaying across already checked regions. Repair remains C2b.
+- Passing rebuild facts to the generic stage duplicates the exact verifier's prepared-name and expansion obligations.
+- Exempting rebuild would leave the witness of the exact check outside the stage boundary.

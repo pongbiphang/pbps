@@ -281,6 +281,43 @@ fn final_verification_keeps_every_part_and_the_expansions_completion_order() {
 }
 
 #[test]
+fn exact_rebuild_verification_finishes_only_the_verified_sequence() {
+    use pbps_diff::order::{finish, rebuild};
+    let f = Fixture::new();
+    let pg = pbps_pg::Postgres::new();
+    let input = f.input();
+    let prepared = f.prepare().unwrap();
+    let root = pbps_diff::diff(input.before, input.desired, &pg, input.hints).unwrap();
+    let final_order = rebuild::continue_plan(root, &input, prepared.clone(), &pg).unwrap();
+    let proof = || rebuild::verify_sequence(&input, &prepared, final_order.changes(), &pg).unwrap();
+    let finished = finish::rebuild(final_order.clone(), proof()).unwrap();
+    assert_eq!(finished.changes(), final_order.changes());
+
+    // The fixture uses a second ordinary canonical sequence with no changes.
+    let empty = pbps_diff::diff(input.before, input.before, &pg, &Hints::default()).unwrap();
+    use pbps_diff::order::deployment::{Sources, schedule};
+    let declarations = schedule::Declarations {
+        schema: input.before.schema,
+        sources: Sources {
+            before: input.before,
+            after: input.before.ids,
+        },
+        annotations: &Default::default(),
+    };
+    let other = schedule::schedule(empty, &declarations, &Default::default(), &pg)
+        .unwrap()
+        .changes;
+    let error = finish::rebuild(other, proof())
+        .err()
+        .expect("a proof cannot finish another sequence");
+    assert!(matches!(
+        error,
+        finish::FinishError::RebuildSequence { position: 1, .. }
+    ));
+    assert!(error.to_string().contains("app."), "{error}");
+}
+
+#[test]
 fn recertification_requires_readable_managed_and_reviewed_dependency_removals() {
     let mut f = Fixture::new();
     let prepared = f.prepare().unwrap();

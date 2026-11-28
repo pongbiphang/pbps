@@ -4434,7 +4434,20 @@ fn a_computed_column_and_the_function_it_calls_drop_together() {
     );
     std::fs::remove_file(d.dir.join("schema/dbo.u.yml")).unwrap();
     ok(&d.run(&["drop-table", "dbo.u", "--reason", "goes with its function"]));
-    ok(&d.run(&["plan"]));
+    // The standalone plan has no catalog edge for this pair and keeps the
+    // differ's order; the connected plan below moves the function after the
+    // column (DEC-1431.1). The final check leaves that release out on a
+    // standalone route, so it must not refuse this plan.
+    let offline = d.dir.join("offline.sql");
+    ok(&d.run(&["plan", "--sql", offline.to_str().unwrap()]));
+    let offline = std::fs::read_to_string(offline).unwrap();
+    let function = offline
+        .find("DROP FUNCTION")
+        .expect("offline function drop");
+    let column = offline
+        .find("DROP COLUMN [called]")
+        .expect("offline column drop");
+    assert!(function < column, "{offline}");
     d.commit();
     let plan = d.dir.join("plan.json");
     let sql = d.dir.join("plan.sql");

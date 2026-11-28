@@ -165,6 +165,9 @@ in [ORDERING](ORDERING.md#adding-an-engine) (DEC-1959.6).
 - Engine catalog I/O supplies holders, bindings, dependencies, releases and
   capabilities as neutral facts. Unread and read-empty remain distinct;
   `pbps-diff::order` owns their pure constraints and structural application.
+  The CLI catalog pass transfers its private result to the final check. The
+  check accepts its slot and membership observations as inputs. A rebuild
+  needs the sequence proof issued by the exact verifier in order.
 - The emitter supplies `Statement` transaction and batch requirements,
   intermediate rename/create/release names and execution metadata. Lowering
   retains source IDs/origins and indivisible statement groups, branded by the
@@ -187,10 +190,10 @@ statements uses this staged route and must make each statement resumable or
 idempotent under that protocol. Several logical changes needing
 non-transactional execution remain refused until a separate multi-transaction
 design exists. Batch boundaries do not authorize commits.
-The release verifier remains off; tests/debug replay and live commutation
-checks remain complementary guards, with mutation audits exposing missing
-effects. This contract adds no dependency, rank, tie-break, settlement stage,
-constraint union or saved-plan field.
+Fresh deployment plans pass the final order check in every build. The check
+returns the sequence it reads and names any refusal. Early debug observation
+and live commutation still check the earlier ordering passes and expose missing
+effects. The final check adds no rank, tie-break or saved-plan field.
 
 ## Isolated compose
 

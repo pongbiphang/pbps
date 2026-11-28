@@ -11,3 +11,8 @@ mod certified_fixture {
         "/../pbps-diff/tests/support/emission.rs"
     ));
 }
+
+#[cfg(test)]
+mod final_order_test;
+#[cfg(test)]
+use final_order_test::final_order_refusal;

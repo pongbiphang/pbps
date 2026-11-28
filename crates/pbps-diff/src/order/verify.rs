@@ -74,6 +74,37 @@ pub(crate) fn verify_with(
     declared: &ModuleDeps,
     checks: Checks,
 ) -> Vec<Violation> {
+    let mut out = replay(operations, effects, baseline, checks);
+    // The edges the effects imply: settled over the order given, they must
+    // give it back (DEC-1956.3). Where they would not, each edge the order
+    // runs the other way is named. A `depends_on:` edge run the other way is
+    // the replay's own finding, whatever settle makes of it (#2083).
+    let g = graph(operations, effects, baseline, declared, checks);
+    let unsettled: BTreeSet<Edge> = super::schedule::unsettled(&g, operations)
+        .into_iter()
+        .collect();
+    for e in &g.edges {
+        let (before, after) = (operations[e.before].id(), operations[e.after].id());
+        if matches!(e.source, Source::Declared | Source::Annotation) && e.before >= e.after {
+            out.push(Violation::BrokenDeclared { before, after });
+        } else if unsettled.contains(e) {
+            out.push(Violation::Edge {
+                before,
+                after,
+                edge: e.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Checks the requirements on the given order without building its graph.
+pub(super) fn replay(
+    operations: &[Operation],
+    effects: &[Effects],
+    baseline: &Baseline,
+    checks: Checks,
+) -> Vec<Violation> {
     assert_eq!(operations.len(), effects.len());
     let mut out = Vec::new();
     if effects.iter().any(|fx| !fx.symbolic.is_empty())
@@ -270,26 +301,6 @@ pub(crate) fn verify_with(
                 s.plan = true;
                 s.plan_target = fx.bound_target(key, Incarnation::Final).cloned();
             }
-        }
-    }
-    // The edges the effects imply: settled over the order given, they must
-    // give it back (DEC-1956.3). Where they would not, each edge the order
-    // runs the other way is named. A `depends_on:` edge run the other way is
-    // the replay's own finding, whatever settle makes of it (#2083).
-    let g = graph(operations, effects, baseline, declared, checks);
-    let unsettled: BTreeSet<Edge> = super::schedule::unsettled(&g, operations)
-        .into_iter()
-        .collect();
-    for e in &g.edges {
-        let (before, after) = (operations[e.before].id(), operations[e.after].id());
-        if matches!(e.source, Source::Declared | Source::Annotation) && e.before >= e.after {
-            out.push(Violation::BrokenDeclared { before, after });
-        } else if unsettled.contains(e) {
-            out.push(Violation::Edge {
-                before,
-                after,
-                edge: e.clone(),
-            });
         }
     }
     out

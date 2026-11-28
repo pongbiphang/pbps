@@ -72,7 +72,12 @@
 //! planning future that `plan_db_async` already keeps small (#2661).
 
 use super::*;
-use pbps_dialect::routines::RoutineAdmission;
+use pbps_dialect::{routines::RoutineAdmission, slots::CatalogFacts};
+use pbps_diff::order::{
+    CanonicalPlan,
+    finish::{self, Catalog, FinishError, FinishedPlan, Inputs},
+    rebuild::VerifiedSequence,
+};
 
 pub(super) mod mssql;
 pub(super) mod postgres;
@@ -130,13 +135,50 @@ pub(crate) struct ScheduleReads {
 }
 
 /// What the catalog reorders settled, for the neutral code after them.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Ordered {
-    /// Whether the engine verified the order it saved (a table rebuild's
-    /// verifier ran), which the debug observer then does not repeat.
-    pub verified: bool,
-    /// The name facts the order was settled from, for the debug observer.
-    pub facts: Option<pbps_dialect::slots::CatalogFacts>,
+    facts: Option<CatalogFacts>,
+    membership: Option<MembershipRead>,
+    rebuild: Option<VerifiedSequence>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MembershipRead {
+    version: i64,
+    catalog: Option<pbps_model::operation::MembershipCatalog>,
+}
+
+impl Ordered {
+    fn ordinary(facts: Option<CatalogFacts>) -> Self {
+        Self {
+            facts,
+            membership: None,
+            rebuild: None,
+        }
+    }
+
+    pub(crate) fn finish<D: crate::emission::Engine>(
+        self,
+        plan: CanonicalPlan<D>,
+        inputs: Inputs<'_>,
+        dialect: &D,
+    ) -> Result<FinishedPlan<D>, FinishError> {
+        if let Some(proof) = self.rebuild {
+            return finish::rebuild(plan, proof);
+        }
+        let membership = self.membership.as_ref();
+        let configured = membership.map(|read| dialect.with_planning_version(read.version));
+        let catalog = Catalog {
+            slots: self.facts.as_ref(),
+            membership: membership.and_then(|read| read.catalog.as_ref()),
+        };
+        finish::connected(
+            plan,
+            inputs,
+            configured.as_ref().unwrap_or(dialect),
+            catalog,
+        )
+    }
 }
 
 /// The rows and the answer of the checks that read the final order.
@@ -666,7 +708,7 @@ pub(crate) trait PlanSession: crate::emission::Engine {
             frame.declared.schema,
             changes,
         )?;
-        Ok(Ordered::default())
+        Ok(Ordered::ordinary(None))
     }
 
     /// The checks that read the final order, in the planning transaction: a

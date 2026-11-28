@@ -41,7 +41,7 @@ impl Verification {
         hints: &Hints,
         changes: &ChangeSet,
         dialect: &dyn pbps_dialect::Dialect,
-    ) -> Result<(), String> {
+    ) -> Result<VerifiedSequence, String> {
         let input = Input {
             root: &self.root,
             before,
@@ -51,7 +51,7 @@ impl Verification {
             naming: &self.naming,
             mode: PlanMode::Transactional,
         };
-        verify_plan(&input, &self.prepared, changes, dialect)
+        verify_sequence(&input, &self.prepared, changes, dialect)
     }
 }
 

@@ -160,7 +160,6 @@ fn consumers(graph: &Graph, steps: usize, inserts: &BTreeSet<usize>) -> Vec<bool
 
 /// Before the connected release settlement, its row consumers may still
 /// precede an expression rewrite. Final replay keeps every check enabled.
-#[cfg(any(test, debug_assertions))]
 pub(super) fn pending_consumers(
     graph: &Graph,
     operations: &[pbps_model::operation::Operation],

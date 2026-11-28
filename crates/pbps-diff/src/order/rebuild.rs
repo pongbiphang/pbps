@@ -11,7 +11,7 @@ use pbps_model::operation::Source as OriginSource;
 use pbps_model::{operation::*, plan_names::PlanNames, *};
 use std::collections::{BTreeMap, BTreeSet};
 mod run;
-pub use run::{Expanded, expand, verify_plan};
+pub use run::{Expanded, VerifiedSequence, expand, verify_plan, verify_sequence};
 
 /// Engine naming receives shared release facts and the validated proposed ledger.
 /// Its recipes are checked against every approved part and reserved member.

@@ -3280,6 +3280,52 @@ fn insert_beside_a_dropped_column(required: bool) -> Plan {
     }
 }
 
+/// The final stage states a reversed effect leg in the refusal's own words:
+/// both steps by position and subject, and no key's internal rendering
+/// (#2993).
+#[test]
+fn the_final_stage_states_a_backward_effect_leg_in_plain_words() {
+    use super::finish::{self, FinishError, Inputs};
+    let finish = |reversed: bool| {
+        let mut plan = insert_beside_a_dropped_column(true);
+        if reversed {
+            plan.logical.reverse();
+        }
+        let changes = pbps_model::ChangeSet {
+            changes: plan.logical.clone(),
+        };
+        finish::offline(
+            super::plan::state(super::propose(changes.clone())),
+            Inputs {
+                before: crate::Side {
+                    schema: &plan.before,
+                    ids: &plan.before_ids,
+                },
+                after: crate::Side {
+                    schema: &plan.after,
+                    ids: &plan.after_ids,
+                },
+                modules: &ModuleDeps::new(),
+            },
+            &pbps_dialect::MinimalDialect,
+        )
+        .map(|finished| assert_eq!(finished.changes(), &changes))
+    };
+    finish(false).unwrap();
+    let error = finish(true).expect_err("the insert runs while the column still refuses it");
+    assert!(matches!(error, FinishError::Backward { .. }), "{error}");
+    let message = error.to_string();
+    assert!(
+        message.contains("step 1.0 (app.t) before step 0.0 (app.t)")
+            && message.contains("the first removes what the second needs gone"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("Uid") && !message.contains("Recorded"),
+        "{message}"
+    );
+}
+
 /// While a NOT NULL column with no default stands, the engine refuses a row
 /// inserted without it, so the insert waits for the column's drop. A
 /// nullable column lets the row in, in either order (#2086).

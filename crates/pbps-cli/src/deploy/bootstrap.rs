@@ -482,7 +482,7 @@ pub(super) async fn bootstrap_async(
             dialect.as_ref(),
         )?
         .changes;
-        let finished = finish::offline(
+        let finished = bootstrap_final_order(finish::offline(
             cs,
             finish::Inputs {
                 before: pbps_diff::Side {
@@ -494,10 +494,9 @@ pub(super) async fn bootstrap_async(
                     ids: &ids,
                 },
                 modules: &loaded.hints.annotations.modules(&loaded.schema),
-                captured: &Default::default(),
             },
             dialect.as_ref(),
-        )?;
+        ))?;
         let cs = finished.changes();
         // And the check `plan --db` runs on that final order (DEC-1576.1): an
         // expression naming, in a literal, a relation created only after it is
@@ -844,5 +843,23 @@ pub(super) async fn record_failed_bootstrap(
         Err(audit_error) => eprintln!(
             "warning: the failed bootstrap could not be added to the ledger: {audit_error}"
         ),
+    }
+}
+
+fn bootstrap_final_order<T>(
+    order: Result<T, pbps_diff::order::finish::FinishError>,
+) -> anyhow::Result<T> {
+    order.map_err(Into::into)
+}
+
+#[cfg(test)]
+mod final_order_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_final_order_keeps_the_named_command_error() {
+        let error = bootstrap_final_order::<()>(Err(crate::final_order_refusal())).unwrap_err();
+        assert!(error.is::<pbps_diff::order::finish::FinishError>());
+        assert!(error.to_string().contains("app.first"), "{error}");
     }
 }

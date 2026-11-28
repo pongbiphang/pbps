@@ -379,7 +379,14 @@ impl Contract {
         &self,
         plan: &super::super::PlanningPlan<S>,
     ) -> Result<Vec<Constraint>, String> {
-        self.edges(plan, false).map(|(edges, _)| edges)
+        self.stated(plan).map(|(edges, _)| edges)
+    }
+
+    pub(in crate::order) fn stated<S>(
+        &self,
+        plan: &super::super::PlanningPlan<S>,
+    ) -> Result<Settling, String> {
+        self.edges(plan, false)
     }
 
     /// What a pass settles by: the annotation edges and the creation facts the

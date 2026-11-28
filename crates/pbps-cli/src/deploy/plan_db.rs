@@ -1041,11 +1041,6 @@ pub(super) async fn plan_db_selected(
                 .external_role_renames(&mut conn, &recorded_snapshot.ids, &resolved.ids)
                 .await?
                 .check;
-            // The final stage reads the same bindings as the earlier passes (DEC-2143.8).
-            let empty_capture = Default::default();
-            let captured = resolution
-                .as_ref()
-                .map_or(&empty_capture, |(_, unsealed, _)| unsealed.captured());
             // First, so that what it adds is held to every check after it: a
             // view this plan now drops and recreates takes `before_a_rebuild`
             // like one the declarations edit (#314, ADR-0009 §4).
@@ -1093,16 +1088,14 @@ pub(super) async fn plan_db_selected(
             let ordered = dialect
                 .order_by_catalog(&mut plan_state, &mut conn, &mut cs, frame)
                 .await?;
-            let cs = finish::connected(
+            let cs = ordered.finish(
                 cs,
                 finish::Inputs {
                     before: frame.recorded,
                     after: frame.written,
                     modules: &hints.annotations.modules(frame.written.schema),
-                    captured,
                 },
                 dialect.as_ref(),
-                finish::Catalog { slots: ordered.facts.as_ref(), verified: ordered.verified },
             )?;
             let checks = dialect
                 .check_final_order(&plan_state, &mut conn, cs.changes(), frame)

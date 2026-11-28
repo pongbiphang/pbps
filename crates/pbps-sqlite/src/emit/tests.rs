@@ -162,7 +162,6 @@ pub(crate) fn plan(
             before,
             after,
             modules: &hints.annotations.modules(after.schema),
-            captured: &Default::default(),
         },
         dialect,
     )
