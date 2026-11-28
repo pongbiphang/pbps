@@ -255,8 +255,9 @@ nor refused under `unmanaged: error`.
   the database holds (DEC-2728.1); the inventory lists those no identity names,
   as it does a table, and one the read could not express is carried with the
   other unreadable objects, judged the same way. `plan --db` judges by the
-  declared and the recorded identities together, since a declared one the
-  record does not hold yet is the project's.
+  recorded identities plus the declared ones the record does not hold yet,
+  which are the project's too. A recorded one being renamed keeps its recorded
+  name, the one the database still holds until the plan runs.
 - **A sequence is judged by the caller's list.** A standalone sequence has no
   identity (DEC-2721.1), so which ones are the project's is only known to the
   command: the record for `verify` and `status`, the declarations for `diff`,

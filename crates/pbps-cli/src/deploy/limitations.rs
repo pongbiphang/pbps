@@ -561,6 +561,21 @@ pub(crate) fn unmanaged_objects(
         .collect()
 }
 
+/// The recorded identities with the declared text search objects the record
+/// does not hold yet, for judging which search objects are the project's.
+/// A recorded one keeps its recorded name even when the declarations rename
+/// it: the database still holds that name until the plan runs, and replacing
+/// it would call the object being renamed somebody else's.
+pub(super) fn with_declared_search(recorded: &IdsFile, declared: &IdsFile) -> IdsFile {
+    let mut ids = recorded.clone();
+    for (uid, name) in &declared.search {
+        ids.search
+            .entry(uid.clone())
+            .or_insert_with(|| name.clone());
+    }
+    ids
+}
+
 /// Applies the `unmanaged:` policy to both representable and unreadable
 /// catalog objects outside the managed set.
 pub(super) fn report_unmanaged(

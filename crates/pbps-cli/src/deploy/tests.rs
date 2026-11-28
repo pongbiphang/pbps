@@ -13776,3 +13776,41 @@ fn an_omitted_text_search_object_nobody_manages_is_unmanaged() {
         .insert(pbps_model::Uid::generate(pbps_model::UidKind::Search), name);
     assert!(unmanaged_objects(&scoped, &unreadable, &ids, &modules, None).is_empty());
 }
+
+/// `plan --db` judges text search objects by the recorded identities plus the
+/// declared ones the record does not hold; a recorded one being renamed keeps
+/// its recorded name, which is the one the database still holds (#3038).
+#[test]
+fn a_search_object_being_renamed_is_still_the_projects() {
+    use pbps_model::{SearchKind, SearchObject, SearchRef};
+    let old = SearchRef::new(SearchKind::Config, "app.old_cfg".parse().unwrap());
+    let new = SearchRef::new(SearchKind::Config, "app.new_cfg".parse().unwrap());
+    let added = SearchRef::new(SearchKind::Config, "app.added_cfg".parse().unwrap());
+    let renamed = pbps_model::Uid::generate(pbps_model::UidKind::Search);
+    let fresh = pbps_model::Uid::generate(pbps_model::UidKind::Search);
+    let mut recorded = IdsFile::default();
+    recorded.search.insert(renamed.clone(), old.clone());
+    let mut declared = IdsFile::default();
+    declared.search.insert(renamed, new);
+    declared.search.insert(fresh, added.clone());
+
+    let mut live = pbps_model::Schema::default();
+    for key in [&old, &added] {
+        live.search.insert(
+            key.clone(),
+            SearchObject::Config {
+                parser: "pg_catalog.default".parse().unwrap(),
+                mappings: Default::default(),
+            },
+        );
+    }
+    let modules = BTreeSet::new();
+    let ids = with_declared_search(&recorded, &declared);
+    let scoped = pbps_diff::scope(&live, &ids, &modules, &BTreeSet::new());
+    let listed = unmanaged_objects(&scoped, &[], &ids, &modules, None);
+    assert!(listed.is_empty(), "{listed:?}");
+    // Negative: judged by the recorded identities alone, the declared one the
+    // record does not hold yet is called somebody else's.
+    let listed = unmanaged_objects(&scoped, &[], &recorded, &modules, None);
+    assert_eq!(listed, [added.shown().to_string()], "{listed:?}");
+}

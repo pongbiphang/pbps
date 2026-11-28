@@ -604,8 +604,7 @@ pub(super) async fn plan_db_selected(
             .keys()
             .chain(entry.snapshot.schema.sequences.keys())
             .collect();
-        let mut policy_ids = recorded_ids.clone();
-        policy_ids.search.extend(resolved.ids.search.clone());
+        let policy_ids = with_declared_search(&recorded_ids, &resolved.ids);
         report_unmanaged(
             &for_policy,
             &managed.unreadable,
