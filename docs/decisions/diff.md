@@ -10714,7 +10714,7 @@ derived again from the plan. One the declarations no longer hold is such a
 drop too, and is the one a resolver may keep (below): the parent's might take it
 before the attach, so the loose rule drops it there, whatever else asks for it.
 A redefinition's drop, which the declarations ask for whatever the parents hold,
-says nothing, nor does any drop of an own no parent's may take. The words travel on the planned change and are not
+says nothing, nor does any drop of an own no parent's may take. Nor does a retiring own under a parent's addition: the declarations drop it whatever the parent holds, and a resolver that leaves it to the addition saves a build rather than keeping it. The words travel on the planned change and are not
 sealed, as a step's provenance is not (DEC-1958.3): a plan read back from its
 file has none, and `--format json` does not carry them.
 
