@@ -126,8 +126,8 @@ use partitions::detach::detached_names;
 use partitions::detach::parent_shape_changes;
 use partitions::refusals::parent_column;
 use partitions::refusals::refuse_partition_changes;
-use partitions::rehearsal::leave_to_attach;
-pub use partitions::rehearsal::{Question, candidates, questions};
+pub use partitions::rehearsal::{AdditionQuestion, Question, Questions, candidates, questions};
+use partitions::rehearsal::{leave_to_engine, record_additions, say_skipped};
 pub use restoration::restoration_comparison;
 use roles::diff_roles;
 pub(crate) use roles::member_depth;
@@ -606,8 +606,8 @@ pub(crate) fn diff_partial_rebuilding(
     changes = changes_out;
     errs = errs_out;
     // Before every pass that reads the index drops: one a rehearsal leaves to
-    // its attach is not dropped (DEC-1671.2).
-    leave_to_attach(
+    // the engine is not dropped (DEC-1671.2, DEC-1671.3).
+    let answered = leave_to_engine(
         given,
         declared,
         dialect,
@@ -627,7 +627,15 @@ pub(crate) fn diff_partial_rebuilding(
     recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
     // After every pass that adds a parent's index, and before the foreign keys
     // over the unique ones it drops are recreated.
-    rebuild_adoptable_indexes(base, declared, &renames, dialect, &mut changes, &mut loose);
+    rebuild_adoptable_indexes(
+        base,
+        declared,
+        &renames,
+        dialect,
+        &answered.beside,
+        &mut changes,
+        &mut loose,
+    );
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
     rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
     unlink_cycles_around_persistence_switches(declared.schema, &mut changes);
@@ -685,7 +693,17 @@ pub(crate) fn diff_partial_rebuilding(
     }
     // After the hazards, whose restatement of a parent's exclusion can take a
     // partition's own as any addition can.
-    rebuild_adoptable_exclusions(base, declared, &renames, dialect, &mut changes, &mut loose);
+    rebuild_adoptable_exclusions(
+        base,
+        declared,
+        &renames,
+        dialect,
+        &answered.beside,
+        &mut changes,
+        &mut loose,
+    );
+    // After every pass that states a parent's addition.
+    record_additions(given, dialect, &answered, &mut changes);
     // Descriptions are comments only where the engine holds them; elsewhere they stay the
     // free text they were (#2729).
     if dialect.holds_descriptions() {
@@ -729,6 +747,8 @@ pub(crate) fn diff_partial_rebuilding(
         &loose,
         &mut diffed.changes.changes,
     );
+    // Said of the ordered plan, so what is said once is said of the first step.
+    say_skipped(declared, hints, &mut diffed.changes.changes);
     diffed
 }
 

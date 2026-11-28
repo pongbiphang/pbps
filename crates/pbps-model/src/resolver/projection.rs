@@ -459,6 +459,14 @@ fn authorized(
     ownership: &ObjectOwnership,
     before: bool,
 ) -> bool {
+    // A partition an addition takes an own of changes with its statement.
+    if let Surface::Table(table) = &transition.surface
+        && ownership.permits(&transition.surface)
+        && (changes.changes.iter())
+            .any(|p| crate::adoption::adopts(&p.change).any(|of| of.table == *table))
+    {
+        return true;
+    }
     changes.changes.iter().enumerate().any(|(index, step)| {
         vector_inventory_permitted(
             &step.change,
@@ -964,6 +972,7 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
         }
         Surface::Table(t) => {
             c.objects().any(|o| o == t)
+                || crate::adoption::adopts(c).any(|of| of.table == *t)
                 || grant_target(c).is_some_and(|g| {
                     matches!(g, GrantTarget::Object(o) if o == t)
                         || matches!(g, GrantTarget::Sequence(column) if &column.table == t)

@@ -842,6 +842,124 @@ fn column_requirements_follow_one_uid_through_intermediate_spellings() {
     assert!(format!("{error:#}").contains("does not have the default"));
 }
 
+/// What a parent's addition takes of a partition's own is the partition's no
+/// longer: the read after it must not hold that one, and holds every other
+/// (#1671).
+#[test]
+fn an_own_a_parents_addition_takes_leaves_its_partition_and_no_other() {
+    use pbps_model::adoption::{AdditionRehearsal, PartitionOwns};
+    let parent = TableName::new("app", "events");
+    let child = TableName::new("app", "t");
+    let index = || pbps_model::Index {
+        columns: vec![pbps_model::IndexColumn::column("id")],
+        include: Vec::new(),
+        unique: false,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+        filegroup: None,
+    };
+    let exclusion = || pbps_model::ExclusionConstraint {
+        method: pbps_model::IndexMethod::Btree,
+        keys: vec![pbps_model::ExclusionKey {
+            key: pbps_model::IndexColumn::column("id"),
+            operator: pbps_model::OperatorRef::symbol("=").unwrap(),
+        }],
+        include: Vec::new(),
+        filter: None,
+        storage_parameters: Default::default(),
+        timing: pbps_model::ExclusionTiming::Immediate,
+    };
+    let record = || {
+        Some(Box::new(AdditionRehearsal {
+            partitions: vec![PartitionOwns {
+                table: child.clone(),
+                own: Vec::new(),
+                adopted: ["taken".into()].into(),
+                beside: ["beside".into()].into(),
+            }],
+        }))
+    };
+    for excluding in [false, true] {
+        let mut before = schema(partition(None, false));
+        let mut parent_table = table();
+        parent_table.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
+            columns: vec!["id".into()],
+            strategy: Default::default(),
+        });
+        before.tables.insert(parent.clone(), parent_table);
+        let owns = before.tables.get_mut(&child).unwrap();
+        for name in ["taken", "beside"] {
+            if excluding {
+                owns.exclude.insert(name.into(), exclusion());
+            } else {
+                owns.indexes.insert(name.into(), index());
+            }
+        }
+        let added = if excluding {
+            Change::Constraint(ConstraintChange::SetExclusion {
+                table: parent.clone(),
+                name: "events_new".into(),
+                from: None,
+                to: Some(Box::new(exclusion())),
+                rehearsal: record(),
+            })
+        } else {
+            Change::Index(IndexChange::AddIndex {
+                table: parent.clone(),
+                name: "events_new".into(),
+                index: Box::new(index()),
+                clustered: false,
+                rehearsal: record(),
+            })
+        };
+        let changes = plan(vec![added]);
+        let ids = super::fixture_ids(&changes, &before);
+        let without = |names: &[&str]| {
+            let mut after = before.clone();
+            let parent = after.tables.get_mut(&parent).unwrap();
+            if excluding {
+                parent.exclude.insert("events_new".into(), exclusion());
+            } else {
+                parent.indexes.insert("events_new".into(), index());
+            }
+            let child = after.tables.get_mut(&child).unwrap();
+            for name in names {
+                child.indexes.remove(*name);
+                child.exclude.remove(*name);
+            }
+            after
+        };
+        let check = |after: &Schema| {
+            super::super::refuse_pinned_movement(
+                &pbps_pg::Postgres::new(),
+                super::Read::fixture_transactional(
+                    super::Plan {
+                        changes: &changes,
+                        ids: &ids,
+                    },
+                    &before,
+                ),
+                &before,
+                after,
+                "test",
+            )
+        };
+        check(&without(&["taken"])).expect("the addition takes it");
+        for (gone, why) in [
+            (&[][..], "`taken` is still there"),
+            (
+                &["taken", "beside"][..],
+                "`beside` is not as the plan left it",
+            ),
+        ] {
+            let error = check(&without(gone)).expect_err(why);
+            assert!(format!("{error:#}").contains(why), "{error:#}");
+        }
+    }
+}
+
 #[test]
 fn a_column_drop_before_its_parent_rename_reaches_only_its_own_partition_entry() {
     let parent = TableName::new("app", "events");

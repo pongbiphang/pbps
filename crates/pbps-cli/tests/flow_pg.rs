@@ -272,6 +272,8 @@ mod loose_drop1671;
 mod partition_trigger1811;
 #[path = "support/rehearsal1671.rs"]
 mod rehearsal1671;
+#[path = "support/resolved_adds1671.rs"]
+mod resolved_adds1671;
 #[path = "support/resolved_attach3075.rs"]
 mod resolved_attach3075;
 

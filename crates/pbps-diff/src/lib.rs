@@ -9,10 +9,11 @@
 
 mod comments;
 pub use comments::undeclared as undeclared_comments;
-/// The question an attach's own indexes put to a resolver's rehearsal
-/// (DEC-1671.2).
+/// The question a partition's own indexes put to a resolver's rehearsal: an
+/// attached table's, or a standing partition's under its parent's new ones
+/// (DEC-1671.2, DEC-1671.3).
 pub mod attach {
-    pub use crate::schema_diff::{Question, candidates, questions};
+    pub use crate::schema_diff::{AdditionQuestion, Question, Questions, candidates, questions};
 }
 pub mod conversion;
 pub mod domain_rebuild;

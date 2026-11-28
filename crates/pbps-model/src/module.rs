@@ -1086,9 +1086,10 @@ pub struct Hints {
     pub row_guard_defaults: BTreeMap<crate::ColumnRef, String>,
     /// Connected paired-binding answers, absent offline (DEC-2354.1).
     pub retained_expressions: Vec<crate::RetainedExpression>,
-    /// What a resolver's rehearsal answered about each attach's own indexes,
-    /// keys and exclusions (DEC-1671.2). Absent offline and without a
-    /// resolver, where each one an attach might take is dropped ahead of it.
+    /// What a resolver's rehearsal made of each attach's own indexes, keys and
+    /// exclusions, and of each standing partition's under its parent's new ones
+    /// (DEC-1671.2, DEC-1671.3). Absent offline and without a resolver, where
+    /// each one a parent's might take is dropped.
     pub attach_rehearsals: Vec<crate::adoption::AttachAnswer>,
 
     /// One-shot label intent, keyed by declared type and new label. It never

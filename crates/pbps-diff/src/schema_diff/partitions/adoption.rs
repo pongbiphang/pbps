@@ -14,7 +14,8 @@
 //! An own unique index a foreign key references is the exception: rebuilt, the
 //! key would be bound to the parent's clone. It is left as it stands, and where
 //! the engine would adopt it the parent's addition is refused
-//! (`refusals.rs`).
+//! (`refusals.rs`). So is one a rehearsal shows the engine leaves alone
+//! (`rehearsal.rs`, DEC-1671.3).
 //!
 //! The order is not this module's: a drop sorts ahead of every addition, a
 //! parent's addition first in its class, and `before_its_partitions_indexes`
@@ -23,9 +24,9 @@
 use super::super::constraints::may_adopt;
 use super::super::exclusions::may_adopt_exclusion;
 use super::super::*;
-use super::rehearsal::taken;
+use super::rehearsal::{addition_skip, attach_skip, taken};
 use pbps_model::ObjectLocalName;
-use pbps_model::adoption::{Remark, adds, unsettles};
+use pbps_model::adoption::{Remark, adds};
 
 /// An own index, key or exclusion the loose rule drops because one of the
 /// parent's may take it (DEC-1671.1): what the pass that pushes the drop knows
@@ -75,9 +76,10 @@ impl Loose {
 /// a rehearsal's question is asked of it.
 ///
 /// A resolver is offered only where it could keep the own and none was asked
-/// about the table: under a name the declarations give to nothing, in a plan the
-/// attach's question is asked of (DEC-1671.2). None is offered under a parent's
-/// new index, which no rehearsal answers for yet.
+/// about the table, in a plan the question is asked of (DEC-1671.2). Under an
+/// attach that is an own whose name the declarations give to nothing. Under a
+/// parent's new index it is a declared one, which a resolver keeps by leaving it
+/// beside the copy (DEC-1671.3).
 pub(in super::super) fn say_why(
     base: Side<'_>,
     declared: &Schema,
@@ -98,8 +100,8 @@ pub(in super::super) fn say_why(
             }
         });
         let askable = attach.is_some_and(|(uid, parent)| {
-            let reshaped = match (base.schema.tables.get(parent), declared.tables.get(parent)) {
-                (Some(was), Some(now)) => parent_shape_changes(was, now),
+            let skipped = match (base.schema.tables.get(parent), declared.tables.get(parent)) {
+                (Some(was), Some(now)) => attach_skip(planned, was, now).is_some(),
                 _ => true,
             };
             // A rehearsal could not leave out a key it has no name for.
@@ -108,21 +110,23 @@ pub(in super::super) fn say_why(
                     table, from: Some(key), to: None, ..
                 }) if *table == own.table && key.name.is_none())
             });
-            !reshaped
-                && !unnamed
-                && !hints.attach_rehearsals.iter().any(|a| a.uid == *uid)
-                && !planned.iter().any(|p| unsettles(&p.change))
+            !skipped && !unnamed && !hints.attach_rehearsals.iter().any(|a| a.table() == uid)
         });
+        let could_keep = if own.new {
+            could_stand_beside(base, declared, hints, loose, &own.table, planned)
+        } else {
+            askable
+                && own
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| !taken(declared, &own.table, name))
+        };
         let remark = Remark::Loose {
             by: own.by.clone(),
             exclusions: own.exclusions,
             new: own.new,
             again: own.again,
-            resolver_could_keep: askable
-                && own
-                    .name
-                    .as_ref()
-                    .is_some_and(|name| !taken(declared, &own.table, name)),
+            resolver_could_keep: could_keep,
         };
         for p in planned.iter_mut() {
             let added =
@@ -134,22 +138,54 @@ pub(in super::super) fn say_why(
     }
 }
 
+/// Whether a resolver could leave a declared own of `partition`'s standing
+/// beside its parent's new ones: none was asked about the partition, and a
+/// rehearsal would be asked of this plan (DEC-1671.3).
+fn could_stand_beside(
+    base: Side<'_>,
+    declared: &Schema,
+    hints: &Hints,
+    loose: &[Loose],
+    partition: &TableName,
+    planned: &[PlannedChange],
+) -> bool {
+    let (Some(uid), Some(was), Some(now)) = (
+        base.ids.table_uid(partition),
+        base.schema.tables.get(partition),
+        declared.tables.get(partition),
+    ) else {
+        return false;
+    };
+    let rebuilt = loose
+        .iter()
+        .filter(|own| own.new && own.table == *partition)
+        .filter_map(|own| own.name.as_ref());
+    !hints.attach_rehearsals.iter().any(|a| a.table() == uid)
+        && now.partition_of.as_ref().is_some_and(|of| {
+            addition_skip(planned, &of.parent, partition, (was, now), rebuilt).is_none()
+        })
+}
+
 /// A partition standing under a parent that gains a part, on both sides of the
 /// plan.
-struct Standing<'a, P> {
-    name: &'a TableName,
+pub(super) struct Standing<'a, P> {
+    pub name: &'a TableName,
+    pub uid: &'a Uid,
+    /// The name the base held the partition by.
+    pub base_name: &'a TableName,
+    pub parent: &'a TableName,
     /// The partition as the base held it, spelled as this plan's renames leave
     /// it, which is how the parent's new part names its columns.
-    was: Table,
-    now: &'a Table,
-    parents: &'a [P],
+    pub was: Table,
+    pub now: &'a Table,
+    pub parents: &'a [P],
 }
 
 /// The partitions standing on both sides under a parent that is itself
 /// partitioned and standing on both sides, for the parents in `added`. One the
 /// plan creates, attaches or moves has no part the base held under this parent.
-fn standing<'a, P>(
-    base: Side<'_>,
+pub(super) fn standing<'a, P>(
+    base: Side<'a>,
     declared: Side<'a>,
     renames: &Renames,
     added: &'a BTreeMap<&TableName, Vec<P>>,
@@ -178,11 +214,15 @@ fn standing<'a, P>(
         .iter()
         .filter_map(|(uid, name)| {
             let now = declared.schema.tables.get(name)?;
-            let (parent, parts) = parents.get(&now.partition_of.as_ref()?.parent)?;
+            let parent = &now.partition_of.as_ref()?.parent;
+            let (base_parent, parts) = parents.get(parent)?;
             let base_name = base.ids.tables.get(uid)?;
             let was = base.schema.tables.get(base_name)?;
-            (was.partition_of.as_ref()?.parent == **parent).then(|| Standing {
+            (was.partition_of.as_ref()?.parent == **base_parent).then(|| Standing {
                 name,
+                uid,
+                base_name,
+                parent,
                 was: renames.apply(was, base_name).into_owned(),
                 now,
                 parents: parts,
@@ -228,7 +268,8 @@ pub(super) fn referencing_key<'a>(
 /// dropped and added again as declared, and marked as dropped for that. One the plan already drops, to remove or
 /// redefine it, is left as the plan has it, and one the declarations no longer
 /// hold is among those. One a foreign key references is left standing
-/// ([`referencing_key`]).
+/// ([`referencing_key`]), and so is each of `beside`, which a rehearsal shows
+/// none of them takes.
 ///
 /// It runs ahead of `recreate_referenced_foreign_keys`, which reads these drops
 /// as it reads any other of a unique index.
@@ -237,6 +278,7 @@ pub(in super::super) fn rebuild_adoptable_indexes(
     declared: Side<'_>,
     renames: &Renames,
     dialect: &(impl Dialect + ?Sized),
+    beside: &BTreeSet<(TableName, ObjectLocalName)>,
     changes: &mut Vec<Change>,
     loose: &mut Vec<Loose>,
 ) {
@@ -267,6 +309,7 @@ pub(in super::super) fn rebuild_adoptable_indexes(
             if dropped.contains(&(partition.name, name))
                 || by.is_empty()
                 || referencing_key(declared.schema, partition.name, index).is_some()
+                || beside.contains(&(partition.name.clone(), name.clone()))
             {
                 continue;
             }
@@ -308,6 +351,7 @@ pub(in super::super) fn rebuild_adoptable_exclusions(
     declared: Side<'_>,
     renames: &Renames,
     dialect: &(impl Dialect + ?Sized),
+    beside: &BTreeSet<(TableName, ObjectLocalName)>,
     changes: &mut Vec<Change>,
     loose: &mut Vec<Loose>,
 ) {
@@ -342,7 +386,10 @@ pub(in super::super) fn rebuild_adoptable_exclusions(
                 .filter(|(_, p)| may_adopt_exclusion(p, held, dialect))
                 .map(|(parent, _)| (*parent).clone())
                 .collect();
-            if dropped.contains(&(partition.name, name)) || by.is_empty() {
+            if dropped.contains(&(partition.name, name))
+                || by.is_empty()
+                || beside.contains(&(partition.name.clone(), name.clone()))
+            {
                 continue;
             }
             let part = |from, to| {

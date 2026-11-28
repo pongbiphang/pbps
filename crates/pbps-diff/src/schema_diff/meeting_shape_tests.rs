@@ -2,9 +2,9 @@ use super::*;
 use pbps_dialect::{DialectError, MinimalDialect, TypeChangeRisk};
 use pbps_model::PartitionChange;
 use pbps_model::SearchChange;
-struct Engine {
-    enabled: bool,
-    label: &'static str,
+pub(super) struct Engine {
+    pub(super) enabled: bool,
+    pub(super) label: &'static str,
 }
 impl Dialect for Engine {
     fn name(&self) -> &'static str {

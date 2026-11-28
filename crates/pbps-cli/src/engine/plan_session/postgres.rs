@@ -1682,7 +1682,7 @@ impl PlanSession for pbps_pg::Postgres {
                 // The scratch run's future stays out of the planner's, as the
                 // retained comparison's does.
                 hints.attach_rehearsals = Box::pin(crate::resolution::attach::rehearse(
-                    entry, conn, target, before, hints, &questions, relations,
+                    entry, conn, target, before, hints, self, &questions, relations,
                 ))
                 .await?;
             }

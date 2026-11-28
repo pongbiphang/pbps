@@ -115,11 +115,11 @@ impl AttachRehearsal {
     }
 }
 
-/// A rehearsal's answer on its way to the differ, which checks it against the
-/// question it would ask before using it. One that keeps nothing says the
-/// question was put and got nothing to keep.
+/// An attach rehearsal's answer on its way to the differ, which checks it
+/// against the question it would ask before using it. One that keeps nothing
+/// says the engine takes none.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttachAnswer {
+pub struct AttachedAnswer {
     pub uid: Uid,
     pub parent: TableName,
     pub rehearsal: AttachRehearsal,
@@ -152,6 +152,88 @@ pub struct AdditionRehearsal {
     pub partitions: Vec<PartitionOwns>,
 }
 
+/// A rehearsal's answer about one standing partition, on its way to the differ,
+/// which checks it against the question it would ask before using it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdditionAnswer {
+    pub parent: Uid,
+    pub uid: Uid,
+    /// The parent's new indexes and exclusions the rehearsal ran, in order.
+    pub additions: Vec<ObjectLocalName>,
+    /// The partition's own indexes as planning read them.
+    pub own: Vec<RelationIndex>,
+    /// Each retiring own an addition took, and that addition.
+    pub adopted: BTreeMap<ObjectLocalName, ObjectLocalName>,
+    /// Each declared own no addition took.
+    pub beside: BTreeSet<ObjectLocalName>,
+}
+
+/// Why a rehearsal that had something it could save gave no answer. The plan is
+/// then the one made without a resolver, and the report says which of these it
+/// was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Skipped {
+    /// A column of the parent's is retyped, renamed, dropped or otherwise
+    /// altered, so a definition read now is not the one the engine will compare.
+    ParentColumns,
+    /// [`unsettles`].
+    Unsettles,
+    InvalidIndex,
+    /// A storage parameter of one of the partition's own indexes changes, ahead
+    /// of the parent's addition, which prints its definition otherwise.
+    OwnParameters,
+    /// The scratch could not run it.
+    Scratch,
+}
+
+impl Skipped {
+    /// The reason in the report's words.
+    pub fn why(self) -> &'static str {
+        match self {
+            Skipped::ParentColumns => "this plan also changes the parent's columns",
+            Skipped::Unsettles => {
+                "this plan also renames, rebuilds or moves what an index definition is read \
+                 through, or alters a function"
+            }
+            Skipped::InvalidIndex => "one of the indexes it would read is invalid",
+            Skipped::OwnParameters => {
+                "this plan also changes the storage parameters of one of the partition's indexes"
+            }
+            Skipped::Scratch => "the resolver's scratch could not run it",
+        }
+    }
+}
+
+/// What a resolver made of one table's own indexes, an attached one's or a
+/// standing partition's, on its way to the differ. With no resolver there is
+/// none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachAnswer {
+    Attach(AttachedAnswer),
+    Addition(Box<AdditionAnswer>),
+    Skipped { table: Uid, why: Skipped },
+}
+
+impl AttachAnswer {
+    /// The attached table's identity, or the partition's.
+    pub fn table(&self) -> &Uid {
+        match self {
+            AttachAnswer::Attach(answer) => &answer.uid,
+            AttachAnswer::Addition(answer) => &answer.uid,
+            AttachAnswer::Skipped { table, .. } => table,
+        }
+    }
+}
+
+/// Each partition the addition `change` takes an own of. It changes them with no
+/// change of the plan on them (DEC-1671.3).
+pub fn adopts(change: &Change) -> impl Iterator<Item = &PartitionOwns> {
+    record(change)
+        .into_iter()
+        .flat_map(|(_, rehearsal)| &rehearsal.partitions)
+        .filter(|of| !of.adopted.is_empty())
+}
+
 /// What the report says of a change beyond what it does. Never sealed, as a
 /// change's provenance is not: a plan read back from its file has none to say.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +251,12 @@ pub enum Remark {
         again: bool,
         /// No resolver was asked, and one could keep it.
         resolver_could_keep: bool,
+    },
+    /// A rehearsal that had something it could save gave no answer. `partitions`
+    /// is empty on an attach, whose step already names the table.
+    NotRehearsed {
+        partitions: Vec<TableName>,
+        why: Skipped,
     },
 }
 
@@ -411,8 +499,9 @@ pub fn unsettles(change: &Change) -> bool {
 }
 
 /// A change to a column of `parent`'s other than an addition, which reprints or
-/// rebinds a definition read before it.
-fn reshapes(change: &Change, parent: &TableName) -> bool {
+/// rebinds a definition read before it. A column the plan adds is in the shells a
+/// rehearsal makes (DEC-1671.3).
+pub fn reshapes(change: &Change, parent: &TableName) -> bool {
     matches!(change, Change::Column(column)
         if !matches!(column, ColumnChange::AddColumn { .. }
             | ColumnChange::SetColumnDeprecated { .. }))
@@ -421,7 +510,7 @@ fn reshapes(change: &Change, parent: &TableName) -> bool {
 
 /// A storage parameter change of one of `relation`'s indexes, which prints its
 /// definition otherwise and runs before a parent's addition.
-fn reparameterizes(change: &Change, relation: &TableName) -> bool {
+pub fn reparameterizes(change: &Change, relation: &TableName) -> bool {
     matches!(change, Change::Index(IndexChange::SetIndexStorageParameters { table, .. })
         if table == relation)
 }
@@ -1104,6 +1193,18 @@ mod tests {
         assert_eq!(read.changes, plan.changes);
         let bare = serde_json::to_string(&plan_of(vec![add_index("p_n", None)])).unwrap();
         assert!(!bare.contains("rehearsal"), "{bare}");
+    }
+
+    #[test]
+    fn an_addition_changes_each_partition_it_takes_an_own_of_and_no_other() {
+        let elsewhere = PartitionOwns {
+            table: table("d"),
+            ..owns(&[], &["c_a"])
+        };
+        let change = add_index("p_n", Some(vec![elsewhere, owns(&["c_old"], &[])]));
+        let taken: Vec<_> = adopts(&change).map(|of| &of.table).collect();
+        assert_eq!(taken, [&table("c")]);
+        assert_eq!(adopts(&add_index("p_n", None)).count(), 0);
     }
 
     #[test]

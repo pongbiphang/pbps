@@ -9,15 +9,16 @@
 //! nothing has taken. Both the comparison, of bound expressions, and the order
 //! are the engine's, so planning copies them onto empty tables and asks it.
 
-use crate::{catalog, emit, quote};
+use crate::{Postgres, catalog, emit, quote};
 use pbps_db::transport::ExecuteConnection;
 use pbps_db::{Conn, DbError};
-use pbps_diff::attach::Question;
+use pbps_dialect::Statement;
+use pbps_diff::attach::{AdditionQuestion, Question};
 use pbps_model::adoption::{
-    AttachRehearsal, HeldIndex, IndexKind, Relation, RelationIndex, Relations, difference_after,
-    record, standing, standing_own,
+    AdditionAnswer, AttachRehearsal, HeldIndex, IndexKind, Relation, RelationIndex, Relations,
+    Skipped, difference_after, record, standing, standing_own,
 };
-use pbps_model::{Change, ChangeSet, ObjectLocalName, PartitionChange, TableName};
+use pbps_model::{Change, ChangeSet, ObjectLocalName, PartitionChange, Strategy, TableName};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One row for each relation of `wanted` that is a table: its columns as
@@ -168,21 +169,21 @@ fn made(on: &str, index: &RelationIndex) -> Result<String, pbps_dialect::Dialect
     Ok(add)
 }
 
-/// The two empty relations, their indexes made in the order the first database
-/// made them but for those of the table's named in `out`, then `statement`: what
-/// took each of the table's that was taken. `PR 3` gives another statement.
+/// The parent and the table made empty, the parent's indexes, `attached` where
+/// the table is its partition beforehand, then the table's own indexes in the
+/// order the first database made them but for those named in `out`, and
+/// `statements` as apply runs them: what took each of the table's that was taken.
 async fn replay(
     conn: &mut Conn,
-    question: &Question,
-    parent: &Relation,
-    table: &Relation,
+    [(on_parent, parent), (on_table, table)]: [(&TableName, &Relation); 2],
+    attached: Option<&str>,
     out: &BTreeSet<ObjectLocalName>,
-    statement: &str,
+    statements: &[Statement],
 ) -> Result<BTreeMap<ObjectLocalName, Taken>, DbError> {
     let refused = |e: pbps_dialect::DialectError| DbError::Refused(e.to_string());
     conn.query(&catalog::canonical_path_of(conn)?).await?;
-    let mut statements = Vec::new();
-    for (name, relation) in [(&question.parent, parent), (&question.table, table)] {
+    let mut made_of = Vec::new();
+    for (name, relation) in [(on_parent, parent), (on_table, table)] {
         let mut create = format!(
             "CREATE TABLE {} ({})",
             emit::qualified(name).map_err(refused)?,
@@ -192,27 +193,33 @@ async fn replay(
             create.push_str(" PARTITION BY ");
             create.push_str(key);
         }
-        statements.push(create);
+        made_of.push(create);
     }
-    let on = emit::qualified(&question.parent).map_err(refused)?;
+    let on = emit::qualified(on_parent).map_err(refused)?;
     for held in &parent.indexes {
-        statements.push(made(&on, &held.index).map_err(refused)?);
+        made_of.push(made(&on, &held.index).map_err(refused)?);
     }
-    let on = emit::qualified(&question.table).map_err(refused)?;
+    made_of.extend(attached.map(str::to_owned));
+    let on = emit::qualified(on_table).map_err(refused)?;
     for held in &table.indexes {
-        if !out.contains(&held.index.name) {
-            statements.push(made(&on, &held.index).map_err(refused)?);
+        // A clone of a parent's is the engine's to make.
+        if !held.inherited && !out.contains(&held.index.name) {
+            made_of.push(made(&on, &held.index).map_err(refused)?);
         }
     }
-    statements.push(statement.to_owned());
     // The definitions are another database's text, so each goes to the engine
     // as one statement and no more (DEC-2354.3).
-    for sql in &statements {
+    for sql in &made_of {
         conn.execute_extended(sql).await?;
     }
+    for statement in statements {
+        crate::statement::execute(conn, statement)
+            .await
+            .map_err(|failure| failure.error)?;
+    }
     let (schema, name) = (
-        emit::literal(&question.table.schema),
-        emit::literal(&question.table.name),
+        emit::literal(&on_table.schema),
+        emit::literal(&on_table.name),
     );
     let rows = conn
         .query(&format!(
@@ -250,7 +257,7 @@ async fn replay(
 
 /// Asks the engine of `scratch`, a session that holds what the definitions call
 /// and neither relation, which of the question's indexes, keys and exclusions
-/// the attach takes. `None` leaves nothing to it.
+/// the attach takes. A record that keeps none says the engine takes none.
 ///
 /// One answer can be wrong: a unique index of the parent's takes the index under
 /// a key or unique constraint of the table's, which then stays the table's own,
@@ -263,7 +270,7 @@ pub async fn rehearse(
     question: &Question,
     parent: &Relation,
     table: &Relation,
-) -> Result<Option<AttachRehearsal>, DbError> {
+) -> Result<Result<AttachRehearsal, Skipped>, DbError> {
     // An attach never takes an invalid index, and a copy of it made on empty
     // tables is valid: the answer would be about another table.
     if parent
@@ -272,7 +279,7 @@ pub async fn rehearse(
         .chain(&table.indexes)
         .any(|i| !i.valid)
     {
-        return Ok(None);
+        return Ok(Err(Skipped::InvalidIndex));
     }
     // Any bound takes the same indexes (measured on 16 and 18).
     let (on, of) = (
@@ -280,9 +287,12 @@ pub async fn rehearse(
         emit::qualified(&question.table),
     );
     let (Ok(on), Ok(of)) = (on, of) else {
-        return Ok(None);
+        return Ok(Err(Skipped::Scratch));
     };
-    let attach = format!("ALTER TABLE {on} ATTACH PARTITION {of} DEFAULT");
+    let attach = [Statement::new(format!(
+        "ALTER TABLE {on} ATTACH PARTITION {of} DEFAULT"
+    ))];
+    let relations = [(&question.parent, parent), (&question.table, table)];
     let recorded = |relation: &Relation| relation.indexes.iter().map(|i| i.index.clone()).collect();
     let mut record = AttachRehearsal {
         parent: recorded(parent),
@@ -303,7 +313,7 @@ pub async fn rehearse(
     let mut out = question.dropped.clone();
     loop {
         scratch.execute("BEGIN").await?;
-        let taken = replay(scratch, question, parent, table, &out, &attach).await;
+        let taken = replay(scratch, relations, None, &out, &attach).await;
         scratch.execute("ROLLBACK").await?;
         let taken = match (taken, &key) {
             (Ok(taken), _) => taken,
@@ -321,9 +331,91 @@ pub async fn rehearse(
             .partition(|(own, taken)| taken.mixed || !record.pairs(own, &taken.by));
         if wrong.is_empty() {
             record.kept = right.into_iter().map(|(own, t)| (own, t.by)).collect();
-            return Ok((!record.kept.is_empty()).then_some(record));
+            return Ok(Ok(record));
         }
         out.extend(wrong.into_iter().map(|(own, _)| own));
+    }
+}
+
+/// Asks the engine of `scratch` which of a standing partition's own indexes the
+/// parent's new ones take, as `pg` would write them (DEC-1671.3).
+///
+/// A declared own the engine takes must stay the partition's own, and the plan
+/// rebuilds it around the addition as without an answer. Rebuilt, it is gone by
+/// the addition, which may then take another, so the question is asked again
+/// without each declared own that was taken, until none is. What the last round
+/// leaves is the answer: a declared own that is not taken stands beside the
+/// copy, and a retiring one that is taken becomes it.
+pub async fn rehearse_addition(
+    scratch: &mut Conn,
+    pg: &Postgres,
+    question: &AdditionQuestion,
+    parent: &Relation,
+    partition: &Relation,
+) -> Result<Result<AdditionAnswer, Skipped>, DbError> {
+    let own: Vec<&HeldIndex> = partition.indexes.iter().filter(|i| !i.inherited).collect();
+    // The addition takes an invalid own and marks the parent's index invalid
+    // (measured on 16 and 18), and a copy made on an empty table is valid.
+    if own.iter().any(|i| !i.valid) {
+        return Ok(Err(Skipped::InvalidIndex));
+    }
+    let (Ok(on), Ok(of)) = (
+        emit::qualified(&question.parent),
+        emit::qualified(&question.table),
+    ) else {
+        return Ok(Err(Skipped::Scratch));
+    };
+    let attach = format!("ALTER TABLE {on} ATTACH PARTITION {of} DEFAULT");
+    // The parent's standing indexes and their clones take part in no choice, so
+    // none is made (measured on 16 and 18).
+    let bare = Relation {
+        indexes: Vec::new(),
+        ..parent.clone()
+    };
+    let relations = [(&question.parent, &bare), (&question.table, partition)];
+    let mut changes = Vec::new();
+    for change in &question.changes {
+        let Ok(statements) = emit::emit(pg, change, Strategy::default()) else {
+            return Ok(Err(Skipped::Scratch));
+        };
+        changes.extend(statements);
+    }
+    // Each further round leaves out at least one more, so the rounds end.
+    let mut out = question.dropped.clone();
+    loop {
+        scratch.execute("BEGIN").await?;
+        let taken = replay(scratch, relations, Some(&attach), &out, &changes).await;
+        scratch.execute("ROLLBACK").await?;
+        // Only what this round made: the engine may give a copy it builds the
+        // name of one that was left out.
+        let taken: Vec<_> = taken?
+            .into_iter()
+            .filter(|(name, _)| !out.contains(name) && own.iter().any(|i| i.index.name == *name))
+            .collect();
+        // One the plan cannot take out of the way, left for a foreign key: the
+        // answer would be about a state the plan does not reach.
+        if taken
+            .iter()
+            .any(|(name, _)| !question.declared.contains(name) && !question.retiring.contains(name))
+        {
+            return Ok(Err(Skipped::Scratch));
+        }
+        let wrong: Vec<_> = taken
+            .iter()
+            .filter(|(name, _)| question.declared.contains(name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if wrong.is_empty() {
+            return Ok(Ok(AdditionAnswer {
+                parent: question.parent_uid.clone(),
+                uid: question.uid.clone(),
+                additions: question.additions().map(|(name, _)| name.clone()).collect(),
+                own: own.iter().map(|i| i.index.clone()).collect(),
+                adopted: taken.into_iter().map(|(name, t)| (name, t.by)).collect(),
+                beside: question.declared.difference(&out).cloned().collect(),
+            }));
+        }
+        out.extend(wrong);
     }
 }
 

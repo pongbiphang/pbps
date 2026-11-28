@@ -1,12 +1,14 @@
-//! The attach rehearsal's answers, taken before the first diff (DEC-1671.2).
+//! The attach and parent-addition rehearsals' answers, taken before the first
+//! diff (DEC-1671.2, DEC-1671.3).
 use super::Entry;
-use pbps_diff::attach::Question;
+use pbps_diff::attach::Questions;
 use pbps_model::Hints;
-use pbps_model::adoption::{AttachAnswer, AttachRehearsal, Relations};
+use pbps_model::adoption::{AttachAnswer, Relations, Skipped};
+use pbps_pg::Postgres;
 
-/// One answer for each question. Whatever keeps the scratch from one leaves it
-/// keeping nothing, and so the plan as it is without a resolver; the report
-/// then offers no resolver for what one was asked about (DEC-1671.3).
+/// One answer, or the reason for none, for each table with something to ask or
+/// to say. Whatever keeps the scratch from a question leaves the plan as it is
+/// without a resolver, and the report says so (DEC-1671.3).
 #[allow(clippy::too_many_arguments)]
 pub async fn rehearse(
     entry: &mut Entry<'_>,
@@ -14,23 +16,33 @@ pub async fn rehearse(
     target: &crate::db::Target,
     before: pbps_diff::Side<'_>,
     hints: &Hints,
-    questions: &[Question],
+    pg: &Postgres,
+    questions: &Questions,
     relations: &Relations,
 ) -> anyhow::Result<Vec<AttachAnswer>> {
-    let mut answers = answered(entry, conn, target, before, hints, questions, relations).await?;
-    for question in questions {
-        if !answers.iter().any(|a| a.uid == question.uid) {
-            answers.push(AttachAnswer {
-                uid: question.uid.clone(),
-                parent: question.parent.clone(),
-                rehearsal: AttachRehearsal {
-                    parent: Vec::new(),
-                    table: Vec::new(),
-                    kept: Default::default(),
-                },
-            });
-        }
-    }
+    let asked: Vec<_> = questions
+        .attaches
+        .iter()
+        .map(|q| &q.uid)
+        .chain(questions.additions.iter().map(|q| &q.uid))
+        .collect();
+    // Nothing to run opens no scratch.
+    let mut answers = if asked.is_empty() {
+        Vec::new()
+    } else {
+        answered(entry, conn, target, before, hints, pg, questions, relations).await?
+    };
+    let unanswered: Vec<_> = asked
+        .into_iter()
+        .filter(|table| !answers.iter().any(|a| a.table() == *table))
+        .map(|table| (table.clone(), Skipped::Scratch))
+        .collect();
+    answers.extend(
+        unanswered
+            .into_iter()
+            .chain(questions.skipped.iter().cloned())
+            .map(|(table, why)| AttachAnswer::Skipped { table, why }),
+    );
     Ok(answers)
 }
 
@@ -43,7 +55,8 @@ async fn answered(
     target: &crate::db::Target,
     before: pbps_diff::Side<'_>,
     hints: &Hints,
-    questions: &[Question],
+    pg: &Postgres,
+    questions: &Questions,
     relations: &Relations,
 ) -> anyhow::Result<Vec<AttachAnswer>> {
     use pbps_cli::resolver::server::{ProduceError, scratch};
@@ -61,6 +74,7 @@ async fn answered(
         &identity,
         before,
         hints,
+        pg,
         questions,
         relations,
         &open.standard,

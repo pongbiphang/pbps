@@ -701,6 +701,13 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(I
         entry.closing |= closing;
         entry.kept |= dropped.is_none();
         entry.dropped_before.extend(dropped);
+        // The engine ties an own an addition takes to the parent's: its
+        // partition changes with the statement (DEC-1671.3).
+        for of in pbps_model::adoption::adopts(&step.change) {
+            let table = Surface::Table(of.table.clone());
+            let entry = affected.entry(table).or_default();
+            (entry.opening, entry.closing, entry.kept) = (true, true, true);
+        }
     }
     let (mut transitions, opening_endpoints): (Vec<ObjectTransition>, Vec<BTreeSet<Surface>>) =
         affected
