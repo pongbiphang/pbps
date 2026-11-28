@@ -123,8 +123,6 @@ mod tests {
     use super::*;
     use crate::engine::profile::profile;
 
-    const DRIVERS: [Driver; 2] = [Driver::Mssql, Driver::Postgres];
-
     #[test]
     fn a_missing_support_record_is_refused_by_the_engines_name() {
         let refusal = require("Third", None)
@@ -156,7 +154,7 @@ mod tests {
 
     #[test]
     fn both_engines_are_supported_and_each_record_carries_its_own_container() {
-        for driver in DRIVERS {
+        for driver in crate::engine::owned_test_drivers() {
             let support =
                 crate::engine::require_owned_test(driver).expect("both engines own a test scratch");
             assert_eq!(support.container.driver, driver);

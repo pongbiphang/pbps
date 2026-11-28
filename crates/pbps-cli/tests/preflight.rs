@@ -47,12 +47,19 @@ fn plan(changes: Vec<Change>) -> ChangeSet {
     }
 }
 
+/// Dialects that support managed reference data (`InsertRow`) and `app.` schema
+/// preflight probes (SQLite does not support managed data).
+fn managed_data_dialects() -> [Box<dyn Dialect>; 2] {
+    [
+        Box::new(pbps_mssql::Mssql),
+        Box::new(pbps_pg::Postgres::new()),
+    ]
+}
+
 #[test]
 fn deliberately_unbuilt_checks_keep_their_name_and_reason_on_both_engines() {
-    for dialect in [
-        &pbps_mssql::Mssql as &dyn Dialect,
-        &pbps_pg::Postgres::new(),
-    ] {
+    for dialect in managed_data_dialects() {
+        let dialect = dialect.as_ref();
         let report = dialect.fixture_preflight(&plan(vec![inserted(), index(true, true)]));
         assert!(report.probes.is_empty(), "{report:?}");
         assert_eq!(report.unchecked.len(), 1, "{report:?}");
@@ -73,10 +80,8 @@ fn deliberately_unbuilt_checks_keep_their_name_and_reason_on_both_engines() {
 
 #[test]
 fn ordinary_checks_and_changes_needing_no_check_are_not_unchecked() {
-    for dialect in [
-        &pbps_mssql::Mssql as &dyn Dialect,
-        &pbps_pg::Postgres::new(),
-    ] {
+    for dialect in managed_data_dialects() {
+        let dialect = dialect.as_ref();
         let ordinary = dialect.fixture_preflight(&plan(vec![index(true, false)]));
         assert_eq!(ordinary.probes.len(), 1, "{ordinary:?}");
         assert!(ordinary.unchecked.is_empty(), "{ordinary:?}");
@@ -135,6 +140,7 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
     if let Change::Row(RowChange::InsertRow { defaults, .. }) = &mut row {
         defaults.insert("value".into(), "unpredictable()".into());
     }
+    // Managed-data constraint preflight applies only to server dialects; SQLite has no `--data`.
     for (dialect, checks_collations) in [
         (&pbps_mssql::Mssql as &dyn Dialect, false),
         (&pbps_pg::Postgres::new(), true),
@@ -177,10 +183,8 @@ fn an_empty_new_table_has_an_answer_and_is_not_an_unchecked_key() {
         beside_default: None,
         moves_at_most: None,
     });
-    for dialect in [
-        &pbps_mssql::Mssql as &dyn Dialect,
-        &pbps_pg::Postgres::new(),
-    ] {
+    for dialect in managed_data_dialects() {
+        let dialect = dialect.as_ref();
         let report = dialect.fixture_preflight(&plan(vec![create.clone(), index(true, false)]));
         assert_eq!(report.probes.len(), 1, "{report:?}");
         assert!(report.unchecked.is_empty(), "{report:?}");
@@ -238,10 +242,8 @@ fn probes_use_original_table_and_column_names_after_multiple_renames() {
         ..IdsFile::default()
     };
     let names = PlanNames::of(&changes.changes, &ids).unwrap();
-    for dialect in [
-        &pbps_mssql::Mssql as &dyn Dialect,
-        &pbps_pg::Postgres::new(),
-    ] {
+    for dialect in managed_data_dialects() {
+        let dialect = dialect.as_ref();
         let report = dialect.preflight(&names);
         assert!(report.unchecked.is_empty(), "{report:?}");
         let probe = report

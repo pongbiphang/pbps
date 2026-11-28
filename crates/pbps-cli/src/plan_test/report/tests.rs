@@ -118,7 +118,8 @@ fn postgres_infrastructure_codes_have_the_same_verdict_through_every_wrapper() {
 
 #[test]
 fn transport_and_refusal_verdicts_survive_wrappers_on_both_engines() {
-    for driver in [Driver::Postgres, Driver::Mssql] {
+    // Only engines that support owned `pbps test` scratch servers; SQLite has none.
+    for driver in crate::engine::owned_test_drivers() {
         for wrapper in WRAPPERS {
             for context in [false, true] {
                 for error in [

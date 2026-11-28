@@ -228,6 +228,7 @@ fn foreign_key_probe_prose_shows_raw_row_keys_and_defaulted_columns_once() {
                     })),
                 ],
             };
+            // Managed-data (`InsertRow`) preflight applies only to server dialects; SQLite has no `--data`.
             for dialect in [
                 &pbps_pg::Postgres::new() as &dyn Dialect,
                 &pbps_mssql::Mssql,

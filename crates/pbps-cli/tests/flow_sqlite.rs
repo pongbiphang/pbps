@@ -294,7 +294,7 @@ fn init_validates_plans_bootstraps_and_adopts_from_existing_sqlite_db() {
     );
     assert_eq!(code(&bad), 2);
     let err = stderr(&bad);
-    for d in ["mssql", "postgres", "sqlite"] {
+    for d in pbps_config::DialectName::ALL.iter().map(|d| d.as_str()) {
         assert!(err.contains(d), "expected `{d}` in clap error: {err}");
     }
 }

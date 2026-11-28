@@ -502,6 +502,8 @@ mod tests {
             ids: &ids,
         })
         .unwrap();
+        // Multi-schema server engines only: SQLite has only `main` and no
+        // two-statement cross-schema table transfer.
         for dialect in [
             &pbps_mssql::Mssql as &dyn crate::certified_fixture::FixtureEmission,
             &pbps_pg::Postgres::new(),

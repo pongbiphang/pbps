@@ -455,7 +455,7 @@ fn sqlite_refuses_resolver_even_with_no_rehearse_and_before_touching_missing_fil
     assert!(!missing.exists(), "must not create any file");
 
     // Negative: server engines pass `refuse_plan_resolver`.
-    for driver in [Driver::Mssql, Driver::Postgres] {
+    for driver in crate::engine::server_drivers() {
         assert!(
             crate::refuse_plan_resolver(driver, &project, Some("scratch"), Some("local")).is_ok()
         );
@@ -498,7 +498,7 @@ fn sqlite_refuses_assert_before_demanding_assertion_connection_or_files() {
     );
 
     // Negative: server engines still demand PBPS_ASSERTION_CONN first.
-    for driver in [Driver::Mssql, Driver::Postgres] {
+    for driver in crate::engine::server_drivers() {
         let server_findings = crate::plan_assert::Selection::prepare_for(
             driver,
             &ws.dir,
@@ -868,18 +868,9 @@ fn bootstrap_create_creates_missing_file_accepts_existing_and_refuses_without_fl
     assert!(err.to_string().contains("--create"), "{err}");
 
     // Negative: server engines refuse `--create` by name without connecting.
-    for (driver, dialect, expected_name) in [
-        (
-            Driver::Mssql,
-            crate::emission::SelectedDialect::Mssql(pbps_mssql::Mssql),
-            "SQL Server",
-        ),
-        (
-            Driver::Postgres,
-            crate::emission::SelectedDialect::Postgres(pbps_pg::Postgres::new()),
-            "PostgreSQL",
-        ),
-    ] {
+    for driver in crate::engine::server_drivers() {
+        let dialect = crate::engine::apply_session::selected(driver);
+        let expected_name = crate::engine::of(driver).name();
         let server_target = db::target_from_connection("Server=127.0.0.1,1;Database=x", driver);
         let err = run_async(bootstrap_async(
             &project,

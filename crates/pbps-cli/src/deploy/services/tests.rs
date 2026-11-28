@@ -47,6 +47,8 @@ impl Drop for Fixture {
 
 #[test]
 fn bootstrap_consumes_the_loaded_declarations_and_ids_without_rereading_them() {
+    // Two multi-schema server dialects (`dbo` vs `app`); SQLite's offline
+    // bootstrap path is covered in `tests/flow_sqlite.rs`.
     for pg in [false, true] {
         let fixture = Fixture::new(
             if pg {

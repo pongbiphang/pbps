@@ -229,6 +229,7 @@ fn artifacts(text: &str, dialect: &dyn FixtureEmission) -> (Schema, SavedPlan, S
 
 #[test]
 fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
+    // Server dialects with `app.` schema and server column/constraint fixtures (SQLite allows only `main`).
     for dialect in [
         &pbps_pg::Postgres::new() as &dyn FixtureEmission,
         &pbps_mssql::Mssql,
@@ -326,6 +327,7 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
 
 #[test]
 fn column_validation_shows_each_name_once() {
+    // Server dialects with `app.` schema fixtures (SQLite allows only `main`).
     for dialect in [
         &pbps_pg::Postgres::new() as &dyn FixtureEmission,
         &pbps_mssql::Mssql,

@@ -613,6 +613,7 @@ fn namespace_claims_distinguish_raw_names_from_their_shown_lookalikes() {
 
 #[test]
 fn diff_matches_raw_local_names_and_keeps_their_shown_lookalikes_distinct() {
+    // Server dialects with `app.` schema and role/constraint fixtures (SQLite allows only `main`).
     for dialect in [
         &pbps_pg::Postgres::new() as &dyn Dialect,
         &pbps_mssql::Mssql,

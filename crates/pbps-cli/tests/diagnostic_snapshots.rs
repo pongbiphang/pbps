@@ -70,6 +70,7 @@ fn conflicting_sources_preserve_dialect_findings_and_independent_errors() {
         expected["tool_version"] = env!("CARGO_PKG_VERSION").into();
         assert_eq!(actual, expected, "{label}");
     }
+    // Dialects supporting `identity: [1, 1]` on `app.t` (SQLite has neither).
     for dialect in ["postgres", "mssql"] {
         for source in ["", "    default: 7\n", "    identity: [1, 1]\n"] {
             let p = Project::new();

@@ -82,16 +82,14 @@ mod tests {
                 .into(),
             },
         );
-        for (dialect, expected) in [
-            (
-                &pbps_sqlite::dialect::Sqlite::default() as &dyn pbps_dialect::Dialect,
-                "sqlite",
-            ),
-            (
-                &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
-                "postgres",
-            ),
-        ] {
+        // Every non-SQL-Server dialect refuses SQL Server `dependency:` declarations.
+        for &name in pbps_config::DialectName::ALL
+            .iter()
+            .filter(|&&d| d != pbps_config::DialectName::Mssql)
+        {
+            let selected = crate::dialect_for(name);
+            let dialect = selected.as_ref();
+            let expected = name.as_str();
             let found = problems(&deps, dialect);
             assert_eq!(found.len(), 1, "{expected}: {found:?}");
             assert_eq!(found[0].0, "dialect.rejected");

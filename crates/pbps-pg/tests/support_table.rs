@@ -116,8 +116,9 @@ fn every_declaration_the_loader_accepts_is_held_by_an_engine() {
     let keys = loader_keys();
     assert_eq!(keys, support::DECLARATIONS, "the loader's leading keys");
     for key in &keys {
-        let held = [Engine::Postgres, Engine::SqlServer, Engine::Sqlite]
-            .into_iter()
+        let held = Engine::ALL
+            .iter()
+            .copied()
             .filter_map(|engine| support::declared_tier(engine, key))
             .collect::<Vec<_>>();
         assert!(!held.is_empty(), "no engine has a record for `{key}:`");

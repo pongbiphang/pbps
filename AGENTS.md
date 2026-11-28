@@ -31,6 +31,9 @@ Read before changing things:
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): crate boundaries and
   inviolable constraints. Read before changing crate responsibilities,
   dependencies, the model, or the dialect and driver boundaries.
+- [docs/ADDING-AN-ENGINE.md](docs/ADDING-AN-ENGINE.md): step-by-step checklist
+  for wiring a new engine, what checks each step, and what must be audited by
+  hand.
 - `docs/ADR-*.md`: standalone decision records.
 
 ## Working here

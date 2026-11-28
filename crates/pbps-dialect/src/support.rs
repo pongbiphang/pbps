@@ -24,6 +24,25 @@ pub enum Engine {
     Sqlite,
 }
 
+impl Engine {
+    /// Every engine in the support table, in the column order of
+    /// `docs/STATUS.md`'s declared-object table.
+    ///
+    /// Tied to `pbps_config::DialectName::ALL` by a bijection test in
+    /// `pbps-cli` (which sees both crates; `pbps-dialect` does not depend on
+    /// `pbps-config`).
+    pub const ALL: &'static [Self] = &[Self::Postgres, Self::SqlServer, Self::Sqlite];
+
+    /// The column heading this engine uses in `docs/STATUS.md`.
+    pub const fn heading(self) -> &'static str {
+        match self {
+            Self::Postgres => "PostgreSQL",
+            Self::SqlServer => "SQL Server",
+            Self::Sqlite => "SQLite",
+        }
+    }
+}
+
 /// What happens to an object of the kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
@@ -323,16 +342,21 @@ pub fn status_tables() -> Vec<(&'static str, String)> {
 
 fn declared_table() -> String {
     let cell = |engine, key| declared_tier(engine, key).map_or("refused", Tier::word);
-    let mut out =
-        String::from("| Declaration | PostgreSQL | SQL Server | SQLite |\n|---|---|---|---|\n");
+    let mut out = String::from("| Declaration |");
+    for &engine in Engine::ALL {
+        let _ = write!(out, " {} |", engine.heading());
+    }
+    out.push_str("\n|---|");
+    for _ in Engine::ALL {
+        out.push_str("---|");
+    }
+    out.push('\n');
     for key in DECLARATIONS {
-        let _ = writeln!(
-            out,
-            "| `{key}:` | {} | {} | {} |",
-            cell(Postgres, key),
-            cell(SqlServer, key),
-            cell(Sqlite, key),
-        );
+        let _ = write!(out, "| `{key}:` |");
+        for &engine in Engine::ALL {
+            let _ = write!(out, " {} |", cell(engine, key));
+        }
+        out.push('\n');
     }
     out
 }
@@ -391,4 +415,28 @@ fn sqlite_table() -> String {
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn every_listed_engine_has_its_own_column_in_the_declared_table() {
+        let headings: BTreeSet<&str> = Engine::ALL.iter().map(|e| e.heading()).collect();
+        assert_eq!(headings.len(), Engine::ALL.len());
+        let table = declared_table();
+        let header = table.lines().next().expect("table has a header");
+        for &engine in Engine::ALL {
+            assert!(
+                header.contains(engine.heading()),
+                "declared table header lacks `{}`: {header}",
+                engine.heading()
+            );
+        }
+        // Negative: a heading that is not an engine's is not a column.
+        assert!(!header.contains("| Oracle |"), "{header}");
+        assert_eq!(header.matches('|').count(), Engine::ALL.len() + 2);
+    }
 }

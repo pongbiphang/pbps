@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "engines": {
+    "mssql": {
+      "mode": "server",
+      "live_job": "live",
+      "live_runner": "scripts/live-tests.sh",
+      "shard_suite": "mssql",
+      "ignored_owner": "mssql",
+      "doc_label": "SQL Server",
+      "crate": "pbps-mssql"
+    },
+    "postgres": {
+      "mode": "server",
+      "live_job": "live-pg",
+      "live_runner": "scripts/live-tests-pg.sh",
+      "shard_suite": "pg",
+      "ignored_owner": "pg",
+      "doc_label": "PostgreSQL",
+      "crate": "pbps-pg"
+    },
+    "sqlite": {
+      "mode": "in-process",
+      "reason": "SQLite runs in process through bundled rusqlite; ordinary `cargo test` exercises it on Linux and Windows with no container and no `#[ignore]` test.",
+      "doc_label": "SQLite",
+      "crate": "pbps-sqlite"
+    }
+  }
+}

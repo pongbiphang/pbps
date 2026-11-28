@@ -66,9 +66,13 @@ impl Drop for Project {
     }
 }
 
+/// Dialects that support `role:` declarations and schema/object grants
+/// (SQLite has no database roles or grants).
+const ROLE_DIALECTS: [(&str, &str); 2] = [("mssql", "dbo"), ("postgres", "public")];
+
 #[test]
 fn pipe_grant_targets_validate_and_remain_in_one_markdown_cell_on_both_dialects() {
-    for (dialect, schema) in [("mssql", "dbo"), ("postgres", "public")] {
+    for (dialect, schema) in ROLE_DIALECTS {
         let project = Project::new(dialect, schema, "sales|report");
         project.run(&["validate"]);
         let out = project.run(&["docs", "--format", "markdown"]);
@@ -93,7 +97,7 @@ fn pipe_grant_targets_validate_and_remain_in_one_markdown_cell_on_both_dialects(
 
 #[test]
 fn code_fences_and_line_endings_are_safe_after_loading_both_dialects() {
-    for (dialect, schema) in [("mssql", "dbo"), ("postgres", "public")] {
+    for (dialect, schema) in ROLE_DIALECTS {
         let project = Project::new(dialect, schema, "sales|`報表\r\nnext");
         project.run(&["validate"]);
         let out = project.run(&["docs", "--format", "markdown"]);
@@ -102,7 +106,7 @@ fn code_fences_and_line_endings_are_safe_after_loading_both_dialects() {
             "{out}"
         );
     }
-    for dialect in ["mssql", "postgres"] {
+    for (dialect, _) in ROLE_DIALECTS {
         let project = Project::new(dialect, "報|`表", "sales");
         project.run(&["validate"]);
         let out = project.run(&["docs", "--format", "markdown"]);
@@ -121,7 +125,7 @@ fn code_fences_and_line_endings_are_safe_after_loading_both_dialects() {
 
 #[test]
 fn loaded_descriptions_deprecations_and_tombstones_keep_their_cells() {
-    for (dialect, schema) in [("mssql", "dbo"), ("postgres", "public")] {
+    for (dialect, schema) in ROLE_DIALECTS {
         let project = Project::new(dialect, schema, "sales");
         let value = "first|`second\n</td><tr>third";
         let quoted = serde_json::to_string(value).unwrap();
@@ -159,7 +163,7 @@ fn loaded_descriptions_deprecations_and_tombstones_keep_their_cells() {
 
 #[test]
 fn loaded_prose_preserves_comparisons_and_escapes_html_openers_on_both_dialects() {
-    for (dialect, schema) in [("mssql", "dbo"), ("postgres", "public")] {
+    for (dialect, schema) in ROLE_DIALECTS {
         for (authored, escaped) in [
             (
                 "Use `amount < 10 | mask` and a < b",
@@ -226,7 +230,7 @@ fn loaded_prose_preserves_comparisons_and_escapes_html_openers_on_both_dialects(
 
 #[test]
 fn ordinary_grants_empty_roles_and_no_roles_keep_their_markdown_bytes() {
-    for (dialect, schema) in [("mssql", "dbo"), ("postgres", "public")] {
+    for (dialect, schema) in ROLE_DIALECTS {
         let project = Project::new(dialect, schema, "sales");
         let out = project.run(&["docs", "--format", "markdown"]);
         assert!(

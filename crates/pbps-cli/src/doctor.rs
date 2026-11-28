@@ -2590,8 +2590,9 @@ mod tests {
         }
 
         // The negative: a lock that was read has no such finding, whatever
-        // a stale answer in the diagnosis says.
-        for driver in [pg, mssql] {
+        // a stale answer in the diagnosis says (network-server engines only;
+        // SQLite has no database grants).
+        for driver in crate::engine::server_drivers() {
             let mut d = diagnosed(Some(LockReadGap::TableSelect));
             d.state = "ready";
             assert!(
@@ -2918,22 +2919,14 @@ mod tests {
             pg.message
         );
 
-        // The negative: no cause, no finding, on either engine, even with the
-        // version and the edition both absent.
+        // The negative: no cause, no finding, on either network-server engine,
+        // even with the version and the edition both absent.
         d.server_capabilities_unknown = None;
         d.server_version = None;
         d.edition = None;
-        for (dialect, driver) in [
-            (
-                &pbps_mssql::Mssql as &dyn pbps_dialect::Dialect,
-                pbps_db::Driver::Mssql,
-            ),
-            (
-                &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
-                pbps_db::Driver::Postgres,
-            ),
-        ] {
-            let findings = env_findings(&d, false, dialect, driver);
+        for driver in crate::engine::server_drivers() {
+            let dialect = crate::engine::apply_session::selected(driver);
+            let findings = env_findings(&d, false, dialect.as_ref(), driver);
             assert!(
                 findings
                     .iter()

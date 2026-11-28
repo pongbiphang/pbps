@@ -7528,6 +7528,8 @@ fn explain_dialect_connection(dialect: &str, port: u16) -> String {
 
 #[test]
 fn explain_dialects_refuse_mismatched_environments_without_connecting() {
+    // Network-server dialect pairs (`explain_dialect_connection` opens a TCP listener;
+    // SQLite cross-engine refusals are covered in `tests/flow_sqlite.rs`).
     for (plan_dialect, environment_dialect) in [("mssql", "postgres"), ("postgres", "mssql")] {
         let d = Demo::new(&format!("explain-dialects-mismatch-{plan_dialect}"));
         let plan = explain_dialect_plan(&d, plan_dialect);
@@ -7648,6 +7650,7 @@ fn explain_dialects_refuse_a_mismatched_environment_whose_secret_is_unset() {
                 .to_owned()
         }
     };
+    // Network-server dialect pairs; SQLite cross-engine cases are in `tests/flow_sqlite.rs`.
     for (plan_dialect, other) in [("mssql", "postgres"), ("postgres", "mssql")] {
         let d = Demo::new(&format!("explain-unset-{plan_dialect}"));
         let plan = explain_dialect_plan(&d, plan_dialect);
@@ -7702,6 +7705,7 @@ fn explain_dialects_refuse_a_mismatched_environment_whose_secret_is_unset() {
 
 #[test]
 fn explain_dialects_keep_matching_and_bare_targets_connectable() {
+    // Network-server dialects only (`explain_dialect_connection` speaks TCP).
     for dialect in ["mssql", "postgres"] {
         let d = Demo::new(&format!("explain-dialects-connect-{dialect}"));
         let plan = explain_dialect_plan(&d, dialect);
@@ -7890,6 +7894,7 @@ fn docs_html_is_one_self_contained_file() {
 
 #[test]
 fn docs_html_keeps_roles_and_grants_for_both_dialects() {
+    // Only dialects with `role:` declarations and schema grants (SQLite has neither).
     for (dialect, schema, schema_permission) in
         [("mssql", "dbo", "select"), ("postgres", "public", "usage")]
     {
@@ -8694,6 +8699,7 @@ fn staged_cardinality_plan(dialect: &str, count: usize, staged: bool) -> pbps_mo
 
 #[test]
 fn saved_staged_cardinality_is_refused_before_connection() {
+    // Network-server connection strings only; SQLite staged plans are in `tests/flow_sqlite.rs`.
     for (dialect, unreachable) in [
         (
             "mssql",
@@ -21498,6 +21504,7 @@ fn a_staged_rename_checks_recreated_names_under_the_database_collation() {
 
 #[test]
 fn constraint_name_collisions_are_refused_before_connecting_on_both_dialects() {
+    // Network-server dialects with `app.` schema and TCP targets (SQLite allows only `main`).
     for (dialect, unreachable) in [
         (
             "mssql",
