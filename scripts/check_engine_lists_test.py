@@ -216,6 +216,19 @@ class EngineListsTest(unittest.TestCase):
                 errors,
             )
 
+    def test_an_entry_that_is_not_an_object_is_not_a_registration(self):
+        # `null` is a key that is present: it must not pass as "registered".
+        for value in (None, "in-process", [], 1):
+            with tempfile.TemporaryDirectory() as tmp:
+                marker = json.loads(json.dumps(BASE_MARKER))
+                marker["engines"]["sqlite"] = value
+                write_tree(Path(tmp), {cel.MARKER_FILE: json.dumps(marker)})
+                self.assertEqual(
+                    cel.check(Path(tmp)),
+                    ["engine `sqlite`: scripts/engine-ci.json: entry must be a JSON object"],
+                    repr(value),
+                )
+
     def test_in_process_marker_without_reason_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             marker = json.loads(json.dumps(BASE_MARKER))

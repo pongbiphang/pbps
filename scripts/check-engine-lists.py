@@ -431,9 +431,12 @@ def check(root):
 
     # Verify each engine's declared entries.
     for engine in engines:
-        entry = entries.get(engine)
-        if entry is None:
+        # Absent was reported above. A present `null` is not absent: it must
+        # reach the object check below, or it would register an engine with
+        # nothing behind it.
+        if engine not in entries:
             continue
+        entry = entries[engine]
         if not isinstance(entry, dict):
             errors.append(f"engine `{engine}`: {MARKER_FILE}: entry must be a JSON object")
             continue
