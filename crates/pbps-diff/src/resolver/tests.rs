@@ -4726,6 +4726,7 @@ fn a_parents_new_index_precedes_its_partitions_own_under_the_resolver() {
             name: name.into(),
             index: Box::new(index.clone()),
             clustered: false,
+            rehearsal: None,
         }))
     };
     // In the wrong order, as nothing else would keep them.

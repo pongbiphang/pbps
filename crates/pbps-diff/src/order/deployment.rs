@@ -892,6 +892,7 @@ pub(super) fn removal_of(
                     name: name.clone(),
                     from: Some(Box::new(held.clone())),
                     to: None,
+                    rehearsal: None,
                 })
             }
             Part::Default(column) => {
@@ -984,6 +985,7 @@ pub(super) fn restoration_of(
                     name: name.clone(),
                     index: Box::new(t.indexes.get(name).ok_or_else(unsupported)?.clone()),
                     clustered: false,
+                    rehearsal: None,
                 }),
                 Part::Exclusion(name) => Change::Constraint(ConstraintChange::SetExclusion {
                     table: table.clone(),
@@ -992,6 +994,7 @@ pub(super) fn restoration_of(
                     to: Some(Box::new(
                         t.exclude.get(name).ok_or_else(unsupported)?.clone(),
                     )),
+                    rehearsal: None,
                 }),
                 Part::Policy(_) | Part::Generated(_) => return Err(unsupported()),
                 Part::Default(column) => {

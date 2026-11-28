@@ -317,6 +317,7 @@ pub fn expose(
                             clustered: full.index_is_clustered(key.raw()),
                             name: key,
                             index: Box::new(index),
+                            rehearsal: None,
                         }),
                     ));
                 }

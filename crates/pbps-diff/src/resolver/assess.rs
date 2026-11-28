@@ -1208,7 +1208,7 @@ impl PlanEffects {
                 table,
                 name,
                 from,
-                to,
+                to, ..
             }) => {
                 if engine.indexes_are_relations {
                     self.moves_bindings = true;
@@ -3274,6 +3274,7 @@ mod dependency_facts_tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             }))],
         };
         let found = assessed_with_facts(side, side, &add_ix, &eng, &hooks, Some(&facts));

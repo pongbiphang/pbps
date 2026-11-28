@@ -247,6 +247,7 @@ fn whole_and_individual_operation_slots_claim_and_release_raw_local_names() {
             name: local("ix", RAW),
             index: Box::new(table.indexes[&local("ix", RAW)].clone()),
             clustered: false,
+            rehearsal: None,
         }),
         Change::Index(IndexChange::DropIndex {
             table: table_name.clone(),

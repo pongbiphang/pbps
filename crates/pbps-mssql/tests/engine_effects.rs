@@ -581,6 +581,7 @@ fn an_index_over_a_computed_column_follows_its_addition() {
             name: "ix_d".into(),
             index: Box::new(index),
             clustered: false,
+            rehearsal: None,
         }),
     ];
     assert_eq!(violations_from(&schema, &after, plan.clone(), &[0, 1]), []);

@@ -3160,6 +3160,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
+            rehearsal: None,
         })
     }
 

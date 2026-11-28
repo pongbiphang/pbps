@@ -170,8 +170,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         plan: &pbps_diff::order::AdmittedPlan<Self>,
         opening: Opening<'_>,
     ) -> anyhow::Result<()> {
-        // What a recorded attach rehearsal read, in full and before any
-        // statement of this plan (DEC-1671.2).
+        // What a recorded rehearsal read, in full and before any statement of
+        // this plan (DEC-1671.2, DEC-1671.3).
         self.check_rehearsed(conn, &plan.changes).await?;
         let admission = opening.approved.admission();
         self.rebuild_window(
@@ -246,7 +246,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
             .await?;
         if !resuming {
             // A resume has run some of the plan's drops, so only the compare
-            // ahead of the attach is left to it (DEC-1671.2).
+            // ahead of each recorded statement is left to it (DEC-1671.2).
             self.check_rehearsed(conn, &plan.changes).await?;
             self.check_domain_alterations(conn, &plan.changes, stored)
                 .await?;
@@ -256,8 +256,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         }
         Ok(())
     }
-    /// Holds the target to every attach rehearsal the plan records, before
-    /// its first statement (DEC-1671.2).
+    /// Holds the target to every rehearsal the plan records, before its first
+    /// statement (DEC-1671.2, DEC-1671.3).
     ///
     /// An engine that records none refuses a plan that holds one rather than
     /// skip it.
@@ -269,23 +269,23 @@ pub(crate) trait ApplySession: crate::emission::Engine {
                     rehearsal: Some(_),
                     ..
                 })
-            )),
-            "this plan records an attach rehearsal, which this engine cannot check; plan again \
-             against the database"
+            ) || pbps_model::adoption::record(&p.change).is_some()),
+            "this plan records a rehearsal, which this engine cannot check; plan again against \
+             the database"
         );
         Ok(())
     }
-    /// The same just before one attach runs, in its transaction, as `attach`
-    /// records it less what the plan has dropped by then.
-    async fn hold_attach(
+    /// The same just before one recorded statement runs, in its transaction, as
+    /// `pinned` records it less what the plan has done by then.
+    async fn hold_rehearsed(
         &self,
         _conn: &mut Conn,
         _changes: &ChangeSet,
-        _attach: &pbps_model::Change,
+        _pinned: &pbps_model::Change,
     ) -> anyhow::Result<()> {
         anyhow::bail!(
-            "this statement attaches under a rehearsal, which this engine cannot check; plan \
-             again against the database"
+            "this statement runs under a rehearsal, which this engine cannot check; plan again \
+             against the database"
         )
     }
     /// Checks the declared types a plan relies on against the pins it holds.
@@ -396,8 +396,8 @@ pub(crate) trait ApplySession: crate::emission::Engine {
                 let admission = approved.admission();
                 self.vet_introduced(conn, &admission, change).await?;
             }
-            if let Some(attach) = &stmt.attach_pin {
-                self.hold_attach(conn, &plan.changes, attach).await?;
+            if let Some(pinned) = &stmt.rehearsal_pin {
+                self.hold_rehearsed(conn, &plan.changes, pinned).await?;
             }
         }
         Ok(())
@@ -949,12 +949,12 @@ pub(crate) async fn before_statement<S: ApplySession>(
     session
         .check_drop_requirement(conn, admission, stmt)
         .await?;
-    if let Some(attach) = &stmt.attach_pin {
+    if let Some(pinned) = &stmt.rehearsal_pin {
         // Never skipped for want of the plan that holds the record.
         let plan = plan.ok_or_else(|| {
-            anyhow::anyhow!("an attach under a rehearsal runs only from its saved plan")
+            anyhow::anyhow!("a statement under a rehearsal runs only from its saved plan")
         })?;
-        session.hold_attach(conn, &plan.changes, attach).await?;
+        session.hold_rehearsed(conn, &plan.changes, pinned).await?;
     }
     // The routines a table expression calls are judged just before the statement
     // that introduces it, with what the plan created earlier in place (DEC-2563.4).

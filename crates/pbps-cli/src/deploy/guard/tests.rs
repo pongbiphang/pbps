@@ -1799,6 +1799,7 @@ fn index_settings_fold_in_execution_order_and_follow_the_surviving_table() {
                 name: "ix".into(),
                 index: Box::new(index("80")),
                 clustered: false,
+                rehearsal: None,
             }),
         ]),
         plan(vec![
@@ -1811,6 +1812,7 @@ fn index_settings_fold_in_execution_order_and_follow_the_surviving_table() {
                 name: "ix".into(),
                 index: Box::new(index("90")),
                 clustered: false,
+                rehearsal: None,
             }),
             setting(&from, Some("80")),
             renamed(),
@@ -1921,6 +1923,7 @@ fn a_created_tables_parts_use_the_final_definition_and_settings() {
                 name: "ix".into(),
                 index: Box::new(index("80", true)),
                 clustered: false,
+                rehearsal: None,
             }),
             Change::Index(IndexChange::SetIndexStorageParameters {
                 table: name.clone(),
@@ -2419,6 +2422,7 @@ fn a_new_clustered_part_cannot_leave_the_table_as_a_heap() {
                 name: "ix".into(),
                 index: Box::new(index),
                 clustered: true,
+                rehearsal: None,
             }),
             with_index,
             "index `ix`",

@@ -257,6 +257,7 @@ mod tests {
                 name: "own".into(),
                 from: None,
                 to: Some(Box::new(exclusion())),
+                rehearsal: None,
             },
         ))
     }

@@ -1426,6 +1426,7 @@ mod tests {
                 name: "ix".into(),
                 index: Box::new(index_on("app.t", "ix", filter)),
                 clustered: false,
+                rehearsal: None,
             }))],
         }
     }

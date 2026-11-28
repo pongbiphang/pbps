@@ -951,6 +951,11 @@ pub enum IndexChange {
         /// This index is the table's clustered one ([`Table::clustered`]).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         clustered: bool,
+        /// What a resolver's rehearsal answered about standing partitions' own
+        /// indexes under this one of their parent's (DEC-1671.3). Present only
+        /// where it leaves one to it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rehearsal: Option<Box<crate::adoption::AdditionRehearsal>>,
     },
     DropIndex {
         table: TableName,
@@ -1003,6 +1008,9 @@ pub enum ConstraintChange {
         name: ObjectLocalName,
         from: Option<Box<ExclusionConstraint>>,
         to: Option<Box<ExclusionConstraint>>,
+        /// As [`IndexChange::AddIndex`]'s, on an add only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rehearsal: Option<Box<crate::adoption::AdditionRehearsal>>,
     },
     AddForeignKey {
         table: TableName,
@@ -3029,6 +3037,7 @@ impl Change {
                 name,
                 index,
                 clustered,
+                ..
             }) => it(
                 table,
                 Some(name.raw()),
@@ -3618,11 +3627,16 @@ pub struct PlannedChange {
     /// and two plans that differ only here are the same plan.
     #[serde(skip)]
     pub provenance: Option<Provenance>,
+
+    /// What the plan output says of this step beyond what it does (DEC-1671.3).
+    /// Never sealed, as the provenance is not.
+    #[serde(skip)]
+    pub remarks: Vec<crate::adoption::Remark>,
 }
 
 /// Equal on everything the plan file seals, which leaves out the provenance
-/// (DEC-1958.3): a plan read back from its file has none, and is still the
-/// plan that was written.
+/// (DEC-1958.3) and the remarks: a plan read back from its file has neither,
+/// and is still the plan that was written.
 impl PartialEq for PlannedChange {
     fn eq(&self, other: &Self) -> bool {
         // Destructured, so a field added later has to be placed here.
@@ -3633,6 +3647,7 @@ impl PartialEq for PlannedChange {
             strategy,
             findings,
             provenance: _,
+            remarks: _,
         } = self;
         *change == other.change
             && *drop_guard == other.drop_guard
@@ -3683,6 +3698,7 @@ impl PlannedChange {
             strategy: Strategy::default(),
             findings: Vec::new(),
             provenance: None,
+            remarks: Vec::new(),
         }
     }
 
@@ -3833,6 +3849,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             }),
             set(IndexPart::Index("other".into())),
             set(IndexPart::PrimaryKey),
@@ -4460,6 +4477,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             })
         };
         assert_eq!(

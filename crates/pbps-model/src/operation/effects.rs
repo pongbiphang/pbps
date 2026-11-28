@@ -1457,6 +1457,7 @@ impl Cx<'_> {
                 name,
                 from,
                 to,
+                ..
             }) => {
                 let owner = self.table(table)?.subject()?;
                 self.exists(ObjectKey::Table(owner.clone()));

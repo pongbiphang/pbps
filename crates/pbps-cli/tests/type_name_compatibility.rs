@@ -388,7 +388,9 @@ where
         .replace(", drop_guard: None", "")
         .replace(" exclude: {},", "")
         // SQL Server's `filegroup` (#2813), empty on every captured object.
-        .replace(", filegroup: None", "");
+        .replace(", filegroup: None", "")
+        // What the report says of a step (DEC-1671.3), which no file holds.
+        .replace(", remarks: []", "");
     let outputs = [
         ("schema.json", serde_json::to_string(&schema).unwrap()),
         (

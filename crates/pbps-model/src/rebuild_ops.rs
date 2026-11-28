@@ -235,6 +235,7 @@ impl BuildPartitionedIndex {
                     name,
                     index: Box::new(index.clone()),
                     clustered: false,
+                    rehearsal: None,
                 })
             }
             PartitionIndexDefinition::PrimaryKey(key) => {
@@ -259,6 +260,7 @@ impl BuildPartitionedIndex {
                     name,
                     from: None,
                     to: Some(Box::new(x.clone())),
+                    rehearsal: None,
                 })
             }
         }

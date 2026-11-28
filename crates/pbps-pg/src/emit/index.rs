@@ -57,7 +57,11 @@ pub(super) fn emit(pg: &Postgres, change: &Change, index: &IndexChange, strategy
             Err(no_clustered_layout(table))
         }
         IndexChange::AddIndex {
-            table, name, index, ..
+            table,
+            name,
+            index,
+            rehearsal,
+            ..
         } => {
             let sql = create_index(table, name.raw(), index, strategy)?;
             if built_concurrently(index, strategy) {
@@ -74,7 +78,11 @@ pub(super) fn emit(pg: &Postgres, change: &Change, index: &IndexChange, strategy
                         .building_index(table.clone(), name),
                 ])
             } else {
-                Ok(vec![on(pg, table, &sql)?])
+                let mut statement = on(pg, table, &sql)?;
+                // The executor compares the partitions with the record just
+                // before it (DEC-1671.3).
+                statement.rehearsal_pin = rehearsal.is_some().then(|| Box::new(change.clone()));
+                Ok(vec![statement])
             }
         }
         // No `CONCURRENTLY` on the drop, deliberately. It would make the

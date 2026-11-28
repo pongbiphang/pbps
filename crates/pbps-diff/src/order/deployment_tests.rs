@@ -374,6 +374,7 @@ fn a_new_exclusion_that_calls_a_created_function_is_moved_behind_it() {
                     timing: ExclusionTiming::Immediate,
                 })
             }),
+            rehearsal: None,
         }))
     };
     let function = || {
@@ -560,6 +561,7 @@ fn a_restored_exclusion_subsumes_the_parameter_edit_of_its_backing_index() {
             name: name.into(),
             from: from.then(|| exclusion.clone()),
             to: to.then(|| exclusion.clone()),
+            rehearsal: None,
         })
     };
     let kept = |changes: Vec<Change>| {

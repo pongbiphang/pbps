@@ -70,6 +70,7 @@ fn index(key: IndexKey, filter: Option<&str>) -> Change {
             filegroup: None,
         }),
         clustered: false,
+        rehearsal: None,
     })
 }
 

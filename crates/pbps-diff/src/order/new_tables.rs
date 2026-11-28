@@ -64,6 +64,7 @@ impl<D: Dialect + ?Sized> NewTables<'_, D> {
                     name: name_in_table.clone(),
                     index: Box::new(index.clone()),
                     clustered: table.index_is_clustered(name_in_table.raw()),
+                    rehearsal: None,
                 })));
             }
         }

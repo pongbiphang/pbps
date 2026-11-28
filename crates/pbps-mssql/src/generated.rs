@@ -245,6 +245,7 @@ fn parts_in(
                 clustered: table.index_is_clustered(key.raw()),
                 name: key,
                 index: Box::new(index),
+                rehearsal: None,
             }));
         } else {
             bare.indexes.insert(key, index);

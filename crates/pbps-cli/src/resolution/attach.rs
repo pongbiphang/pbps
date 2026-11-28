@@ -2,13 +2,42 @@
 use super::Entry;
 use pbps_diff::attach::Question;
 use pbps_model::Hints;
-use pbps_model::adoption::{AttachAnswer, Relations};
+use pbps_model::adoption::{AttachAnswer, AttachRehearsal, Relations};
 
-/// Whatever keeps the scratch from answering leaves the questions unanswered,
-/// and so the plan as it is without a resolver. A cleanup it cannot confirm is
-/// the one failure that is not an answer.
+/// One answer for each question. Whatever keeps the scratch from one leaves it
+/// keeping nothing, and so the plan as it is without a resolver; the report
+/// then offers no resolver for what one was asked about (DEC-1671.3).
 #[allow(clippy::too_many_arguments)]
 pub async fn rehearse(
+    entry: &mut Entry<'_>,
+    conn: &mut pbps_db::Conn,
+    target: &crate::db::Target,
+    before: pbps_diff::Side<'_>,
+    hints: &Hints,
+    questions: &[Question],
+    relations: &Relations,
+) -> anyhow::Result<Vec<AttachAnswer>> {
+    let mut answers = answered(entry, conn, target, before, hints, questions, relations).await?;
+    for question in questions {
+        if !answers.iter().any(|a| a.uid == question.uid) {
+            answers.push(AttachAnswer {
+                uid: question.uid.clone(),
+                parent: question.parent.clone(),
+                rehearsal: AttachRehearsal {
+                    parent: Vec::new(),
+                    table: Vec::new(),
+                    kept: Default::default(),
+                },
+            });
+        }
+    }
+    Ok(answers)
+}
+
+/// What the scratch answers. A cleanup it cannot confirm is the one failure
+/// that is not an answer.
+#[allow(clippy::too_many_arguments)]
+async fn answered(
     entry: &mut Entry<'_>,
     conn: &mut pbps_db::Conn,
     target: &crate::db::Target,

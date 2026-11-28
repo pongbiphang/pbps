@@ -1032,6 +1032,7 @@ fn a_new_replica_identity_index_does_not_order_the_old_one_s_parameter_change() 
                 name: "ix_new".into(),
                 index: Box::new(index()),
                 clustered: false,
+                rehearsal: None,
             })),
             p(Change::TableProperty(
                 TablePropertyChange::SetReplicaIdentity {
@@ -2767,6 +2768,7 @@ fn a_replica_identity_switched_to_an_index_over_a_new_not_null_column_verifies_c
                 name: "ix".into(),
                 index: Box::new(index),
                 clustered: false,
+                rehearsal: None,
             })),
             p(Change::TableProperty(
                 TablePropertyChange::SetReplicaIdentity {
@@ -3786,6 +3788,7 @@ fn rows_swapping_the_values_of_a_rebuilt_unique_index_draw_no_cycle() {
                 name: "ix".into(),
                 index: Box::new(index(&["x"])),
                 clustered: false,
+                rehearsal: None,
             })),
         ],
         before,
@@ -4669,6 +4672,7 @@ fn add_index(table: &str, index: (String, pbps_model::Index)) -> PlannedChange {
         name: index.0.into(),
         index: Box::new(index.1),
         clustered: false,
+        rehearsal: None,
     }))
 }
 

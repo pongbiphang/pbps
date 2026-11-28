@@ -338,6 +338,7 @@ fn index_create_and_drop_are_each_others_inverse() {
         name: ObjectLocalName::new("i"),
         index: Box::new(index(&["a", "b"], true, Some("b IS NOT NULL"))),
         clustered: false,
+        rehearsal: None,
     });
     let drop = Change::Index(IndexChange::DropIndex {
         table: tn("t"),
@@ -379,6 +380,7 @@ fn a_descending_key_is_written_and_kept() {
         name: ObjectLocalName::new("i"),
         index: Box::new(i),
         clustered: false,
+        rehearsal: None,
     });
     let out = statements(&sqlite(), add).expect("emits");
     assert_eq!(out[0].sql, "CREATE INDEX main.\"i\" ON \"t\" (\"a\" DESC);");

@@ -112,6 +112,7 @@ fn a_statement_in_its_own_batch_stays_inside_the_transaction() {
                 filegroup: None,
             }),
             clustered: false,
+            rehearsal: None,
         }),
         ONLINE,
     );
@@ -178,6 +179,7 @@ fn lowering_a_plan_writes_exactly_the_statements_emit_writes() {
             filegroup: None,
         }),
         clustered: false,
+        rehearsal: None,
     });
     let changes = [
         planned(

@@ -460,6 +460,7 @@ mod tests {
                     name: "no_similar".into(),
                     from,
                     to,
+                    rehearsal: None,
                 },
             ))],
         };

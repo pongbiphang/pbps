@@ -803,7 +803,7 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(I
             table,
             name,
             from: None,
-            to: Some(_),
+            to: Some(_), ..
         }) => (
             Exact(Surface::Index {
                 table: table.clone(),
@@ -900,6 +900,7 @@ fn planned_absence(owner: &Surface, changes: &ChangeSet, before: bool) -> bool {
                 name,
                 from: None,
                 to: Some(_),
+                ..
             }) if before => Surface::Index {
                 table: table.clone(),
                 name: name.clone(),
@@ -992,7 +993,7 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
         }
         Surface::Index { table, name } => {
             matches!(c, Change::Index(IndexChange::AddIndex { table: t, name: n, .. }) | Change::Index(IndexChange::DropIndex { table: t, name: n }) if t == table && n == name)
-                || matches!(c, Change::Constraint(ConstraintChange::SetExclusion { table: t, name: n, from: None, to: Some(_) }) if t == table && n == name)
+                || matches!(c, Change::Constraint(ConstraintChange::SetExclusion { table: t, name: n, from: None, to: Some(_), .. }) if t == table && n == name)
                 || matches!(c, Change::Index(IndexChange::SetIndexStorageParameters { table: t, target: crate::change::IndexPart::Index(n), .. }) if t == table && n == name)
         }
         Surface::Type(name) => match c {
@@ -1114,6 +1115,7 @@ mod tests {
                 name: "no_overlap".into(),
                 from,
                 to,
+                rehearsal: None,
             })
         };
         let index = Surface::Index {

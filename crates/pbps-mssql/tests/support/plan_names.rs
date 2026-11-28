@@ -118,6 +118,7 @@ async fn layout_estimates_measure_each_occupant_before_and_after_name_reuse() {
                 storage_parameters: Default::default(),
                 filegroup: None,
             }),
+            rehearsal: None,
         }),
     ]
     .map(PlannedChange::new);

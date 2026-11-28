@@ -368,7 +368,7 @@ impl Reconstruction {
                     table,
                     name,
                     from: None,
-                    to: Some(_),
+                    to: Some(_), ..
                 }) => {
                     steps.push(make(
                         &format!(

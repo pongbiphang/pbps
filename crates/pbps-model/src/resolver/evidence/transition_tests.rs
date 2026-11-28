@@ -419,6 +419,7 @@ fn removing_a_predicate_can_retain_the_plain_index_catalog_record() {
                 storage_parameters: Default::default(),
                 filegroup: None,
             }),
+            rehearsal: None,
         })));
     evidence.transitions[0].after = evidence.transitions[0].before.clone();
     // Scratch compiles the plain index as the same catalog record.

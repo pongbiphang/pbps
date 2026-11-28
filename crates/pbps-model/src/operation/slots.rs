@@ -583,6 +583,7 @@ pub fn names(
             name,
             from,
             to,
+            ..
         }) => {
             if from.is_some() {
                 nx.part(

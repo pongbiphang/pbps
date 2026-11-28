@@ -96,6 +96,7 @@ pub(super) fn diff_exclusions(
             name: key.clone(),
             from: Some(Box::new(was.clone())),
             to: None,
+            rehearsal: None,
         })
     };
     let add_half = |key: &pbps_model::ObjectLocalName, now: &pbps_model::ExclusionConstraint| {
@@ -104,6 +105,7 @@ pub(super) fn diff_exclusions(
             name: key.clone(),
             from: None,
             to: Some(Box::new(now.clone())),
+            rehearsal: None,
         })
     };
     for (key, was) in &base.exclude {
@@ -262,12 +264,14 @@ pub(super) fn exclusion_hazards<'a>(
                         name: key.clone(),
                         from: Some(Box::new(x.clone())),
                         to: None,
+                        rehearsal: None,
                     }));
                     stated.push(Change::Constraint(ConstraintChange::SetExclusion {
                         table: name.clone(),
                         name: key.clone(),
                         from: None,
                         to: Some(Box::new(now.clone())),
+                        rehearsal: None,
                     }));
                 }
             }

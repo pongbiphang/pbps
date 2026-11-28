@@ -1022,6 +1022,7 @@ mod effects_of_each_kind {
                         storage_parameters: BTreeMap::new(),
                         timing: pbps_model::ExclusionTiming::Immediate,
                     })),
+                    rehearsal: None,
                 }),
             ),
             (
@@ -1041,6 +1042,7 @@ mod effects_of_each_kind {
                         timing: pbps_model::ExclusionTiming::Immediate,
                     })),
                     to: None,
+                    rehearsal: None,
                 }),
             ),
             (
@@ -1080,6 +1082,7 @@ mod effects_of_each_kind {
                     name: "ix2".into(),
                     index: Box::new(index()),
                     clustered: false,
+                    rehearsal: None,
                 }),
             ),
             (

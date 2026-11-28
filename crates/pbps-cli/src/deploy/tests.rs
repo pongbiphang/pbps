@@ -2950,6 +2950,7 @@ fn an_index_the_plan_creates_meets_held_and_carried_names() {
             name: name.into(),
             index: index.clone(),
             clustered: false,
+            rehearsal: None,
         }))
     };
     let add_unique = |name: &str| {
@@ -3171,6 +3172,7 @@ fn an_occupant_is_matched_by_the_name_its_owner_has_at_each_change() {
             name: "n_pkey".into(),
             index: index.clone(),
             clustered: false,
+            rehearsal: None,
         }))
     };
     let rename = |from: &TableName, to: &TableName| {
@@ -5073,6 +5075,7 @@ fn fixed_sequence_claims_meet_catalog_and_planned_relations_after_releases() {
         name: target.name.clone().into(),
         index: Box::new(serde_json::from_str(r#"{"columns":[{"name":"n"}]}"#).unwrap()),
         clustered: false,
+        rehearsal: None,
     });
     for claim in claims {
         assert!(
@@ -5168,6 +5171,7 @@ fn an_added_index_meets_unrecorded_relations() {
             name: name.into(),
             index: Box::new(serde_json::from_str(r#"{"columns": [{"name": "n"}]}"#).unwrap()),
             clustered: false,
+            rehearsal: None,
         }))],
     };
     let empty = pbps_diff::Scoped {
@@ -7766,6 +7770,7 @@ fn a_touched_table_answers_for_the_shape_the_plan_leaves_alone() {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             },
         ))],
     };
@@ -8546,6 +8551,7 @@ fn a_created_tables_split_index_answers_for_its_structure() {
                 name: "ix".into(),
                 index: Box::new(planned_index.clone()),
                 clustered: false,
+                rehearsal: None,
             })),
         ],
     };
@@ -8649,6 +8655,7 @@ fn a_created_index_is_held_to_its_declared_parameters() {
             name: "ix".into(),
             index: Box::new(index("70")),
             clustered: false,
+            rehearsal: None,
         }))],
     };
     let check = |plan: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
@@ -9884,6 +9891,7 @@ fn a_touched_tables_layout_moved_by_someone_else_is_movement() {
                 name: "ix".into(),
                 index: Box::new(ix),
                 clustered: true,
+                rehearsal: None,
             })),
             PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: name.clone(),
@@ -11084,6 +11092,7 @@ fn a_redefined_index_is_judged_by_its_net_result() {
                     name: "ix_note".into(),
                     index: Box::new(index(true)),
                     clustered: false,
+                    rehearsal: None,
                 },
             )),
         ],
@@ -11258,6 +11267,7 @@ fn early_part_drops_follow_their_table_and_still_enforce_absence() {
                         name: "gone".into(),
                         index: Box::new(original.indexes["gone"].clone()),
                         clustered: false,
+                        rehearsal: None,
                     })));
                 let mut restored = Schema {
                     tables: [(destination.clone(), original.clone())].into(),
@@ -13035,6 +13045,7 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
             name: "ix".into(),
             index: Box::new(index("id", false)),
             clustered: false,
+            rehearsal: None,
         },
     ));
     check(
@@ -13085,6 +13096,7 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
             name: "ix".into(),
             index: Box::new(over(pbps_model::IndexKey::Expression("id+1".into()))),
             clustered: false,
+            rehearsal: None,
         },
     ));
     check(
@@ -13111,6 +13123,7 @@ fn a_part_this_plan_adds_is_held_to_its_definition() {
             name: "ix".into(),
             index: Box::new(index("id", false)),
             clustered: true,
+            rehearsal: None,
         },
     ));
     check(

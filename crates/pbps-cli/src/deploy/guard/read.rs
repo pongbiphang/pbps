@@ -273,6 +273,7 @@ mod tests {
                     name: "ix".into(),
                     index: Box::new(index()),
                     clustered: false,
+                    rehearsal: None,
                 }),
                 Change::Index(IndexChange::SetIndexStorageParameters {
                     table: name.clone(),

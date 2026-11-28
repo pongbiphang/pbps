@@ -440,10 +440,11 @@ pub struct Statement {
     /// (#1638, DEC-1638.1). `None` on every other statement.
     pub scan_check: Option<ScanCheck>,
 
-    /// On the `ATTACH` of an attach that records a rehearsal, that change:
-    /// apply compares both relations with the record just before the
-    /// statement, in its transaction (DEC-1671.2).
-    pub attach_pin: Option<Box<pbps_model::Change>>,
+    /// On the statement of a change that records a rehearsal, an `ATTACH` or a
+    /// parent's index or exclusion, that change: apply compares the relations
+    /// with the record just before the statement, in its transaction
+    /// (DEC-1671.2, DEC-1671.3).
+    pub rehearsal_pin: Option<Box<pbps_model::Change>>,
 }
 
 /// A staged attach's temporary CHECK, as the statement that adds or
@@ -585,7 +586,7 @@ impl Statement {
             creates: Vec::new(),
             releases: Vec::new(),
             scan_check: None,
-            attach_pin: None,
+            rehearsal_pin: None,
         }
     }
 

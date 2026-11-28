@@ -178,6 +178,7 @@ fn an_index_the_engine_cannot_hold_is_refused_not_written() {
             name: ObjectLocalName::new("i"),
             index: Box::new(i),
             clustered: false,
+            rehearsal: None,
         })
     };
     assert!(statements(&Sqlite::default(), add(expression)).is_err());
@@ -187,6 +188,7 @@ fn an_index_the_engine_cannot_hold_is_refused_not_written() {
         name: ObjectLocalName::new("i"),
         index: Box::new(index(&["a"], false, None)),
         clustered: true,
+        rehearsal: None,
     });
     assert!(statements(&Sqlite::default(), clustered).is_err());
 }

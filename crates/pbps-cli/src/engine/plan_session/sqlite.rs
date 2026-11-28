@@ -1336,6 +1336,7 @@ mod tests {
                 storage_parameters: BTreeMap::new(),
                 timing: Default::default(),
             })),
+            rehearsal: None,
         })]);
         let ex_err = now(dialect.support_rows(&mut conn, &exclusion, &ids_of(&exclusion), reads))
             .unwrap_err();
@@ -1668,6 +1669,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             })),
         ];
         let expr_cs = ChangeSet {
@@ -1978,6 +1980,7 @@ mod tests {
                 name: "ix_items".into(),
                 index: Box::new(idx),
                 clustered: false,
+                rehearsal: None,
             }),
             Change::Module(ModuleChange::CreateModule {
                 id: view_id,
@@ -3192,6 +3195,7 @@ mod tests {
                     name: "ix_qty".into(),
                     index: Box::new(idx),
                     clustered: false,
+                    rehearsal: None,
                 })],
             )
             .expect("add index passes every PlanSession position");

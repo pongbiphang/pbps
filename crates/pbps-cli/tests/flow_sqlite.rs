@@ -163,6 +163,93 @@ fn exec_sqlite(db: &Path, sql: &str) {
     });
 }
 
+/// Only PostgreSQL records what a parent's new index leaves of a partition's own
+/// (DEC-1671.3). A plan of another engine that holds such a record is refused
+/// before any statement, SQLite's and SQL Server's alike.
+#[test]
+fn a_plan_holding_a_parents_addition_record_is_refused_on_sqlite_and_sql_server() {
+    use pbps_model::adoption::{AdditionRehearsal, PartitionOwns, RelationIndex};
+    let p = SqliteProject::new("record1671");
+    p.bootstrap_starter();
+    p.write_schema(
+        "main.items.yml",
+        &format!("{ITEMS_TABLE}indexes:\n  ix_name:\n    columns: [name]\n"),
+    );
+    assert_eq!(code(&p.pbps(&["plan"])), 0);
+    let plan_file = p.dir.join("index.plan.json");
+    let planned = p.pbps(&[
+        "plan",
+        "--db",
+        p.db_str(),
+        "--out",
+        plan_file.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&planned), 0, "{}", stderr(&planned));
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan_file).unwrap()).unwrap();
+    let mut recorded = saved.clone();
+    let mut additions = 0;
+    for planned in &mut recorded.changes.changes {
+        if let pbps_model::Change::Index(pbps_model::IndexChange::AddIndex { rehearsal, .. }) =
+            &mut planned.change
+        {
+            *rehearsal = Some(Box::new(AdditionRehearsal {
+                partitions: vec![PartitionOwns {
+                    table: pbps_model::TableName::new("main", "part"),
+                    own: vec![RelationIndex {
+                        name: "part_own".into(),
+                        index: "CREATE INDEX part_own".into(),
+                        constraint: None,
+                    }],
+                    adopted: Default::default(),
+                    beside: ["part_own".into()].into(),
+                }],
+            }));
+            additions += 1;
+        }
+    }
+    assert_eq!(additions, 1);
+    let apply = |dir: &SqliteProject, plan: &pbps_model::SavedPlan, db: &str| {
+        let path = dir.dir.join("edited.plan.json");
+        std::fs::write(&path, serde_json::to_string_pretty(plan).unwrap()).unwrap();
+        let checksum = plan_checksum(&path);
+        dir.pbps(&[
+            "apply",
+            "--db",
+            db,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+        ])
+    };
+    let refused = apply(&p, &recorded, p.db_str());
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("invalid parent rehearsal on main.items"),
+        "{}",
+        stderr(&refused)
+    );
+
+    // The same record in a SQL Server plan, refused before any connection.
+    let other = SqliteProject::new("record1671-mssql");
+    std::fs::write(other.root.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    let mut server = recorded.clone();
+    server.dialect = "mssql".into();
+    let unreachable = "Server=tcp:127.0.0.1,1;User Id=nobody;Password=none;Database=none";
+    let refused = apply(&other, &server, unreachable);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("invalid parent rehearsal on main.items"),
+        "{}",
+        stderr(&refused)
+    );
+
+    // Without the record the plan is the one that was written, and applies.
+    let applied = apply(&p, &saved, p.db_str());
+    assert_eq!(code(&applied), 0, "{}", stderr(&applied));
+}
+
 #[test]
 fn init_validates_plans_bootstraps_and_adopts_from_existing_sqlite_db() {
     let ws = TempDir::new("init");

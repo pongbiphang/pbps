@@ -146,6 +146,7 @@ fn the_boolean_words_are_gated_in_every_text_a_statement_keeps() {
             name: pbps_model::ObjectLocalName::new("i"),
             index: Box::new(super::golden::index(&["a"], false, Some(filter))),
             clustered: false,
+            rehearsal: None,
         })
     };
     let with_view = |body: &str| {

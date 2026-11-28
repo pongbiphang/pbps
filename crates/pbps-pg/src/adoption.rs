@@ -1,6 +1,8 @@
-//! Which of a table's indexes, keys and exclusions an attach takes as its
-//! parent's clones (#1671, DEC-1671.2): the two relations read from a database,
-//! rehearsed on a scratch, and held to that reading when the plan is applied.
+//! Which indexes, keys and exclusions the engine takes as a parent's clones
+//! (#1671): an attached table's at the attach, read from a database and
+//! rehearsed on a scratch (DEC-1671.2). The plan's records of that, and of a
+//! standing partition's own under its parent's new ones (DEC-1671.3), are held
+//! to the database when the plan is applied.
 //!
 //! The engine takes, for each index of the parent's in the order they were
 //! made, the first of the table's in that order which it holds equal and which
@@ -12,7 +14,8 @@ use pbps_db::transport::ExecuteConnection;
 use pbps_db::{Conn, DbError};
 use pbps_diff::attach::Question;
 use pbps_model::adoption::{
-    AttachRehearsal, HeldIndex, IndexKind, Relation, RelationIndex, Relations, difference, standing,
+    AttachRehearsal, HeldIndex, IndexKind, Relation, RelationIndex, Relations, difference_after,
+    record, standing, standing_own,
 };
 use pbps_model::{Change, ChangeSet, ObjectLocalName, PartitionChange, TableName};
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,7 +52,9 @@ pub(crate) fn query<'a>(wanted: impl IntoIterator<Item = &'a TableName>) -> Stri
                                      'name', ic.relname,
                                      'index', pg_catalog.pg_get_indexdef(i.indexrelid),
                                      'constraint', pg_catalog.pg_get_constraintdef(k.oid),
-                                     'valid', i.indisvalid)
+                                     'valid', i.indisvalid,
+                                     'inherited', EXISTS (SELECT 1 FROM pg_catalog.pg_inherits h
+                                                           WHERE h.inhrelid = i.indexrelid))
                                  ORDER BY i.indexrelid)
                             FROM pg_catalog.pg_index i
                             JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
@@ -79,6 +84,7 @@ struct Index {
     index: String,
     constraint: Option<String>,
     valid: bool,
+    inherited: bool,
 }
 
 /// The rows of [`query`]. A wanted relation with no row is not in the catalog;
@@ -108,6 +114,7 @@ pub(crate) fn decode<'a>(
                         constraint: i.constraint.map(Into::into),
                     },
                     valid: i.valid,
+                    inherited: i.inherited,
                 })
                 .collect(),
         });
@@ -320,27 +327,55 @@ pub async fn rehearse(
     }
 }
 
+/// What one relation is held to: its indexes in order, and the names that
+/// follow them, whose definitions the engine prints. A partition's list holds its
+/// own, a parent's clones left out.
+struct Expected<'a> {
+    table: &'a TableName,
+    indexes: Vec<RelationIndex>,
+    added: Vec<ObjectLocalName>,
+    partition: bool,
+}
+
+/// How `found`, a relation as read now, is not what it is held to, or `None`.
+/// One the catalog does not hold is not one with no index.
+fn unlike(expected: &Expected<'_>, found: Option<&Relation>) -> Option<String> {
+    let Some(relation) = found else {
+        return Some("it is not there".to_owned());
+    };
+    let held: Vec<_> = relation
+        .indexes
+        .iter()
+        .filter(|i| !(expected.partition && i.inherited))
+        .cloned()
+        .collect();
+    difference_after(&expected.indexes, &expected.added, &held)
+}
+
 /// Compares each relation with what the record says it holds.
-async fn compare(
-    conn: &mut Conn,
-    expected: [(&TableName, Vec<RelationIndex>); 2],
-) -> Result<(), DbError> {
-    let found = read(conn, &[expected[0].0, expected[1].0]).await?;
-    for (name, indexes) in &expected {
-        let how = match found.get(*name).and_then(Option::as_ref) {
-            Some(relation) => difference(indexes, &relation.indexes),
-            None => Some("it is not there".to_owned()),
-        };
-        if let Some(how) = how {
+async fn compare(conn: &mut Conn, expected: &[Expected<'_>], what: &str) -> Result<(), DbError> {
+    let wanted: Vec<_> = expected.iter().map(|e| e.table).collect();
+    let found = read(conn, &wanted).await?;
+    for one in expected {
+        if let Some(how) = unlike(one, found.get(one.table).and_then(Option::as_ref)) {
             return Err(DbError::Refused(format!(
-                "`{name}` is not as the attach's rehearsal read it: {how}. Which of the table's \
-                 indexes the attach takes was decided on that reading, so it is not run. Restore \
-                 the indexes, or plan again with `pbps plan --db`.",
-                name = name.shown()
+                "`{name}` is not as the {what}'s rehearsal read it: {how}. Which of its indexes \
+                 the engine takes was decided on that reading, so the statement is not run. \
+                 Restore the indexes, or plan again with `pbps plan --db`.",
+                name = one.table.shown()
             )));
         }
     }
     Ok(())
+}
+
+fn attached<'a>(table: &'a TableName, indexes: Vec<RelationIndex>) -> Expected<'a> {
+    Expected {
+        table,
+        indexes,
+        added: Vec::new(),
+        partition: false,
+    }
 }
 
 /// Before any statement of an apply: every relation of every recorded
@@ -356,52 +391,108 @@ pub async fn check(conn: &mut Conn, changes: &ChangeSet) -> Result<(), DbError> 
         {
             compare(
                 conn,
-                [
-                    (parent, rehearsal.parent.clone()),
-                    (table, rehearsal.table.clone()),
+                &[
+                    attached(parent, rehearsal.parent.clone()),
+                    attached(table, rehearsal.table.clone()),
                 ],
+                "attach",
             )
             .await?;
+        }
+        if let Some((_, rehearsal)) = record(&planned.change) {
+            let each: Vec<_> = rehearsal
+                .partitions
+                .iter()
+                .map(|of| Expected {
+                    table: &of.table,
+                    indexes: of.own.clone(),
+                    added: Vec::new(),
+                    partition: true,
+                })
+                .collect();
+            compare(conn, &each, "parent's addition").await?;
         }
     }
     Ok(())
 }
 
-/// Just before one attach, in its transaction and under the locks it takes, the
-/// parent's first as the statement takes them: the record less what the plan has
-/// dropped by now.
-pub async fn hold(conn: &mut Conn, changes: &ChangeSet, attach: &Change) -> Result<(), DbError> {
-    let at = changes.changes.iter().position(|p| p.change == *attach);
-    let (
-        Some(at),
-        Change::Partition(PartitionChange::AttachPartition {
-            table,
-            parent,
-            rehearsal: Some(rehearsal),
-            ..
-        }),
-    ) = (at, attach)
-    else {
-        return Err(DbError::Refused(
-            "the statement's attach is not one of the plan's recorded rehearsals".into(),
-        ));
-    };
+/// The lock apply takes on `parent` ahead of a recorded addition of it, without
+/// `ONLY`, which locks its partitions too. The strongest mode any of its
+/// recorded additions needs, taken at the first, so that none upgrades a lock it
+/// holds: an exclusion's statement takes `ACCESS EXCLUSIVE`, and an index's only
+/// `SHARE`, which still lets another index be made or dropped.
+fn parents_lock(changes: &ChangeSet, parent: &TableName) -> &'static str {
+    let exclusion = changes.changes.iter().any(|p| {
+        record(&p.change).is_some_and(|(of, _)| of == parent)
+            && matches!(p.change, Change::Constraint(_))
+    });
+    if exclusion {
+        "ACCESS EXCLUSIVE"
+    } else {
+        "SHARE ROW EXCLUSIVE"
+    }
+}
+
+/// Just before one recorded statement, in its transaction and under locks held
+/// to the commit: the record as the plan's earlier changes leave it.
+pub async fn hold(conn: &mut Conn, changes: &ChangeSet, pinned: &Change) -> Result<(), DbError> {
     let refused = |e: pbps_dialect::DialectError| DbError::Refused(e.to_string());
+    let not_recorded = || {
+        DbError::Refused(
+            "the statement's change is not one of the plan's recorded rehearsals".into(),
+        )
+    };
+    let at = changes
+        .changes
+        .iter()
+        .position(|p| p.change == *pinned)
+        .ok_or_else(not_recorded)?;
+    if let Change::Partition(PartitionChange::AttachPartition {
+        table,
+        parent,
+        rehearsal: Some(rehearsal),
+        ..
+    }) = pinned
+    {
+        // The parent's first, as the statement takes them.
+        conn.execute(&format!(
+            "LOCK TABLE ONLY {} IN SHARE UPDATE EXCLUSIVE MODE; \
+             LOCK TABLE ONLY {} IN ACCESS EXCLUSIVE MODE;",
+            emit::qualified(parent).map_err(refused)?,
+            emit::qualified(table).map_err(refused)?
+        ))
+        .await?;
+        return compare(
+            conn,
+            &[
+                attached(parent, standing(changes, at, parent, &rehearsal.parent)),
+                attached(table, standing(changes, at, table, &rehearsal.table)),
+            ],
+            "attach",
+        )
+        .await;
+    }
+    let (parent, rehearsal) = record(pinned).ok_or_else(not_recorded)?;
     conn.execute(&format!(
-        "LOCK TABLE ONLY {} IN SHARE UPDATE EXCLUSIVE MODE; \
-         LOCK TABLE ONLY {} IN ACCESS EXCLUSIVE MODE;",
+        "LOCK TABLE {} IN {} MODE;",
         emit::qualified(parent).map_err(refused)?,
-        emit::qualified(table).map_err(refused)?
+        parents_lock(changes, parent)
     ))
     .await?;
-    compare(
-        conn,
-        [
-            (parent, standing(changes, at, parent, &rehearsal.parent)),
-            (table, standing(changes, at, table, &rehearsal.table)),
-        ],
-    )
-    .await
+    let each: Vec<_> = rehearsal
+        .partitions
+        .iter()
+        .map(|of| {
+            let (indexes, added) = standing_own(changes, at, &of.table, &of.own);
+            Expected {
+                table: &of.table,
+                indexes,
+                added,
+                partition: true,
+            }
+        })
+        .collect();
+    compare(conn, &each, "parent's addition").await
 }
 
 #[cfg(test)]
@@ -412,7 +503,8 @@ mod tests {
         serde_json::json!({
             "schema_name": "app", "table_name": name, "partition_key": null,
             "columns": ["n integer"],
-            "indexes": [{"name": "i", "index": "CREATE INDEX i", "constraint": null, "valid": false}],
+            "indexes": [{"name": "i", "index": "CREATE INDEX i", "constraint": null, "valid": false,
+                         "inherited": true}],
         })
     }
 
@@ -433,5 +525,128 @@ mod tests {
         }
         assert!(decode(&wanted, &[row("other")]).is_err());
         assert!(decode(&wanted, &[row("c"), row("c")]).is_err());
+    }
+
+    fn held(name: &str, inherited: bool) -> HeldIndex {
+        HeldIndex {
+            index: RelationIndex {
+                name: name.into(),
+                index: format!("CREATE INDEX {name}").into(),
+                constraint: None,
+            },
+            valid: true,
+            inherited,
+        }
+    }
+
+    /// An attach holds a relation's every index; a parent's addition holds a
+    /// partition's own, a parent's clones left out, and what earlier changes add
+    /// to it by name.
+    #[test]
+    fn each_compare_holds_its_own_list_and_a_missing_relation_is_not_an_empty_one() {
+        let table = TableName::new("app", "c");
+        let relation = Relation {
+            columns: Vec::new(),
+            partition_key: None,
+            indexes: vec![held("own", false), held("clone", true)],
+        };
+        let expected = |names: &[&str], added: &[&str], partition| Expected {
+            table: &table,
+            indexes: names.iter().map(|n| held(n, false).index).collect(),
+            added: added.iter().map(|n| (*n).into()).collect(),
+            partition,
+        };
+        let found = Some(&relation);
+        assert_eq!(unlike(&expected(&["own"], &[], true), found), None);
+        assert_eq!(
+            unlike(&expected(&["own", "clone"], &[], false), found),
+            None
+        );
+        let attach = unlike(&expected(&["own"], &[], false), found).unwrap();
+        assert!(attach.contains("has the index `clone`"), "{attach}");
+        let both = Relation {
+            indexes: vec![held("own", false), held("later", false)],
+            ..relation.clone()
+        };
+        assert_eq!(
+            unlike(&expected(&["own"], &["later"], true), Some(&both)),
+            None
+        );
+        let unadded = unlike(&expected(&["own"], &["later"], true), found).unwrap();
+        assert!(
+            unadded.contains("no longer has the index `later`"),
+            "{unadded}"
+        );
+        let empty = Relation {
+            indexes: Vec::new(),
+            ..relation.clone()
+        };
+        assert_eq!(unlike(&expected(&[], &[], true), Some(&empty)), None);
+        assert_eq!(
+            unlike(&expected(&[], &[], true), None).as_deref(),
+            Some("it is not there")
+        );
+    }
+
+    #[test]
+    fn a_parent_is_locked_as_strongly_as_its_recorded_additions_need() {
+        use pbps_model::adoption::AdditionRehearsal;
+        let parent = TableName::new("app", "p");
+        let recorded = || {
+            Some(Box::new(AdditionRehearsal {
+                partitions: Vec::new(),
+            }))
+        };
+        let index = |rehearsal| {
+            pbps_model::PlannedChange::new(Change::Index(pbps_model::IndexChange::AddIndex {
+                table: parent.clone(),
+                name: "p_n".into(),
+                index: Box::new(pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn::column("n")],
+                    include: Vec::new(),
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                    filegroup: None,
+                }),
+                clustered: false,
+                rehearsal,
+            }))
+        };
+        let exclusion = |table: &TableName, rehearsal| {
+            pbps_model::PlannedChange::new(Change::Constraint(
+                pbps_model::ConstraintChange::SetExclusion {
+                    table: table.clone(),
+                    name: "p_x".into(),
+                    from: None,
+                    to: Some(Box::new(pbps_model::ExclusionConstraint {
+                        method: Default::default(),
+                        keys: Vec::new(),
+                        include: Vec::new(),
+                        filter: None,
+                        storage_parameters: Default::default(),
+                        timing: pbps_model::ExclusionTiming::Immediate,
+                    })),
+                    rehearsal,
+                },
+            ))
+        };
+        let lock = |changes| parents_lock(&ChangeSet { changes }, &parent);
+        assert_eq!(lock(vec![index(recorded())]), "SHARE ROW EXCLUSIVE");
+        assert_eq!(
+            lock(vec![index(recorded()), exclusion(&parent, recorded())]),
+            "ACCESS EXCLUSIVE"
+        );
+        // An unrecorded exclusion, or another parent's, asks nothing of it.
+        let other = TableName::new("app", "q");
+        assert_eq!(
+            lock(vec![
+                index(recorded()),
+                exclusion(&parent, None),
+                exclusion(&other, recorded())
+            ]),
+            "SHARE ROW EXCLUSIVE"
+        );
     }
 }

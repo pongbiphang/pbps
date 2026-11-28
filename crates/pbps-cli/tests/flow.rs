@@ -8105,6 +8105,7 @@ fn apply_refuses_a_plan_that_relabels_a_rebuilt_routine_as_a_fresh_one() {
         strategy: Default::default(),
         findings: Default::default(),
         provenance: None,
+        remarks: Vec::new(),
     };
     let plan = pbps_model::SavedPlan::new(
         pbps_model::PlanOrigin::Database,
@@ -8206,6 +8207,7 @@ fn apply_refuses_a_plan_that_builds_a_routine_and_settles_nothing_about_public()
                 strategy: Default::default(),
                 findings: Default::default(),
                 provenance: None,
+                remarks: Vec::new(),
             }],
         },
         pbps_model::IdsFile::default(),
@@ -8262,6 +8264,7 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
                 strategy: Default::default(),
                 findings: Default::default(),
                 provenance: None,
+                remarks: Vec::new(),
             }],
         },
         pbps_model::IdsFile::default(),

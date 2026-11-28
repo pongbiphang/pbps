@@ -9986,6 +9986,7 @@ async fn an_online_index_is_built_concurrently_and_says_it_leaves_the_transactio
             name: name.into(),
             index: Box::new(index.clone()),
             clustered: false,
+            rehearsal: None,
         })
     };
 
@@ -23996,6 +23997,7 @@ async fn narrowing_projection_counts_rounding_collisions_without_losing_nulls() 
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             }),
             _ => Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table,
@@ -33472,6 +33474,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             }),
             format!("CREATE INDEX ix ON {s}.t (v) WHERE v > 0"),
         ),
@@ -33499,6 +33502,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             }),
             format!("CREATE INDEX ix_plain ON {s}.t (v)"),
         ),
@@ -36344,6 +36348,7 @@ async fn concurrent_build_recovery_preserves_existing_objects_and_quotes_its_own
                         filegroup: None,
                     }),
                     clustered: false,
+                    rehearsal: None,
                 }),
                 Strategy { online },
             )

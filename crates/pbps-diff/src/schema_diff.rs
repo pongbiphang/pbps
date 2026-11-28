@@ -114,8 +114,10 @@ use numbering::numbering_after_deletes;
 use numbering::numbering_put_on;
 use numbering::refuse_rows_referencing_late_inserts;
 use numbering::sequence_release_depths;
+use partitions::adoption::Loose;
 use partitions::adoption::rebuild_adoptable_exclusions;
 use partitions::adoption::rebuild_adoptable_indexes;
+use partitions::adoption::say_why;
 use partitions::attach::Attached;
 use partitions::attach::attached;
 use partitions::attach::diff_partition_columns;
@@ -596,6 +598,7 @@ pub(crate) fn diff_partial_rebuilding(
             index,
             renames,
             standing,
+            mut loose,
         },
         changes_out,
         errs_out,
@@ -624,7 +627,7 @@ pub(crate) fn diff_partial_rebuilding(
     recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
     // After every pass that adds a parent's index, and before the foreign keys
     // over the unique ones it drops are recreated.
-    rebuild_adoptable_indexes(base, declared, &renames, dialect, &mut changes);
+    rebuild_adoptable_indexes(base, declared, &renames, dialect, &mut changes, &mut loose);
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
     rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
     unlink_cycles_around_persistence_switches(declared.schema, &mut changes);
@@ -682,7 +685,7 @@ pub(crate) fn diff_partial_rebuilding(
     }
     // After the hazards, whose restatement of a parent's exclusion can take a
     // partition's own as any addition can.
-    rebuild_adoptable_exclusions(base, declared, &renames, dialect, &mut changes);
+    rebuild_adoptable_exclusions(base, declared, &renames, dialect, &mut changes, &mut loose);
     // Descriptions are comments only where the engine holds them; elsewhere they stay the
     // free text they were (#2729).
     if dialect.holds_descriptions() {
@@ -718,7 +721,15 @@ pub(crate) fn diff_partial_rebuilding(
     // (#1908). The cache keeps equal keys in their original order, as the
     // stable sort did, so the order is the same.
     crate::order::normalization::sort_draft(&mut planned, |p| facts.key(p));
-    finish_sort(planned, base, declared, dialect, renames, errs)
+    let mut diffed = finish_sort(planned, base, declared, dialect, renames, errs);
+    say_why(
+        given,
+        declared.schema,
+        hints,
+        &loose,
+        &mut diffed.changes.changes,
+    );
+    diffed
 }
 
 /// What one comparison produced: the changes the differ could express, and the

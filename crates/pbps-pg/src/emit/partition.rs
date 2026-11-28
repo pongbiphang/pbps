@@ -107,7 +107,7 @@ pub(super) fn attach(
         qualified(table)?,
         bound_clause(bound)
     ));
-    statement.attach_pin = matches!(
+    statement.rehearsal_pin = matches!(
         change,
         Change::Partition(PartitionChange::AttachPartition {
             rehearsal: Some(_),

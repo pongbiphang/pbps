@@ -184,6 +184,7 @@ impl Inline {
                                 name: key.clone(),
                                 from: None,
                                 to: Some(Box::new(c.clone())),
+                                rehearsal: None,
                             })
                         }),
                         PartKey::ForeignKey(key) => full.foreign_keys.get(key).map(|c| {
@@ -206,6 +207,7 @@ impl Inline {
                                 name: key.clone(),
                                 index: Box::new(c.clone()),
                                 clustered: full.index_is_clustered(key.raw()),
+                                rehearsal: None,
                             })
                         }),
                         PartKey::Computed(column) => {
