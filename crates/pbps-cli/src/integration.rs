@@ -190,6 +190,7 @@ macro_rules! envelope_branches {
             "state show" => crate::state_history::ShowData,
             "state diff" => crate::state_history::DiffData,
             "state export" => crate::state_history::ExportData,
+            "diff" => crate::deploy::LiveDiffData,
         }
     };
 }

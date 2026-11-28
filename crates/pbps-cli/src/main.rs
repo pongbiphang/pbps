@@ -615,6 +615,21 @@ enum Command {
         format: OutputFormat,
     },
 
+    /// Compare the declarations with a live database, without its ledger
+    ///
+    /// Reads the catalog and writes nothing: no ledger is needed and none is
+    /// created. Objects are paired by name. Roles, grants, row security and
+    /// declared rows are not compared. Exit 0 when nothing differs, 2 when
+    /// something does, 1 when the question could not be answered.
+    Diff {
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// text (default) or json
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
+    },
+
     /// Record the database's current state in its ledger
     Snapshot {
         #[command(flatten)]
@@ -704,6 +719,7 @@ impl Command {
             Command::Validate { format, .. } => ("validate", *format),
             Command::Fmt { format, .. } => ("fmt", *format),
             Command::Verify { format, .. } => ("verify", *format),
+            Command::Diff { format, .. } => ("diff", *format),
             Command::Status { format, .. } => ("status", *format),
             // Everything else either speaks no envelope (the write commands,
             // `docs`, the intent commands) or returns before discovery.
@@ -1095,6 +1111,7 @@ fn run() -> anyhow::Result<()> {
         | Command::Validate { .. }
         | Command::Fmt { .. }
         | Command::Verify { .. }
+        | Command::Diff { .. }
         | Command::Status { .. }
         | Command::Explain { .. }
         | Command::Schema { .. }
@@ -1808,6 +1825,17 @@ fn run() -> anyhow::Result<()> {
                 target.resolve(&project),
             )?;
             deploy::cmd_verify(&project, &target, json)
+        }
+        Command::Diff { target, format } => {
+            let json = format == OutputFormat::Json;
+            // As for `verify`: an unset `url_env` is answered in the envelope.
+            let target = output::or_unanswerable(
+                "diff",
+                json,
+                "environment.unconfigured",
+                target.resolve(&project),
+            )?;
+            deploy::cmd_live_diff(&project, &target, json)
         }
         Command::Snapshot { target, force } => {
             let target = target.resolve(&project)?;

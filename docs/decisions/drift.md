@@ -187,3 +187,51 @@ collation projections are not comparers, recorders or builders and are left alon
 Adding a name-only kind is a field of `NameOnly`, a line in each of its functions
 (the compiler lists them) and one row of the table-driven test in
 `name_only/tests.rs`. Standalone sequences (DEC-2721.1) were the second.
+
+<a id="dec-3028-1"></a>
+
+**DEC-3028.1. `pbps diff` compares the declarations with a live database by name, without the ledger, and reports text apart from structure.**
+`verify` answers "has the database moved since pbps recorded it" and needs a
+ledger; nothing answered "does this database hold what the declarations say"
+for a database pbps never deployed. `diff` reads the catalog through the
+reader `verify` uses and compares it with the declarations in `plan`'s
+direction. It never reads `__pbps_state`, takes no lock and writes nothing.
+
+- **Pairing is by name.** A ledger is what holds an identity for a live
+  object; without one, both sides resolve identities from one scope (the
+  declared names and the identity files' names), so a name on both sides is one
+  object and a renamed one is a drop and a create. Guessing a rename from
+  shape would be a rename decision (SPEC 14.3). The report adds
+  `diff.names-only` when its changes could be one rename.
+- **Text is compared apart.** The engines store an expression in their own
+  spelling, and the differ compares text exactly, so a hand-built database
+  would report every check as dropped and added. The changes are computed with
+  the declared text overlaid where the object stands on both sides, and each
+  overlaid text that differs is listed with both spellings. Not judging
+  equivalence is deliberate: proving two spellings equal needs each engine's
+  expression grammar, and a wrong "equal" here would hide a real difference.
+  Both lists count as findings, since the command cannot tell a respelling
+  from a changed rule.
+- **No record, so no recorded projection.** The overlay takes a derived
+  domain's DEFAULT, when its declaration omits one, for the copy the engine
+  made of its base's at creation (DEC-2537.1). Without a record, only a
+  default equal to the base domain's own is taken for that copy; any other is
+  compared.
+- **What the read left out is no difference.** A declared object that the
+  read names as left out and that is absent from what it read back (an
+  encrypted procedure, a PostgreSQL table with a rewrite rule) is set aside
+  before the comparison and reported as `diff.not-compared`, never as a
+  create. An object the read holds is compared whatever part of it was left
+  out. One rule for every kind of object the read can omit, not one per kind.
+  An undeclared relation the read left out still exists, so it is listed as
+  unmanaged and `unmanaged: error` refuses it, as the plan's read
+  (`managed_state_once`) counts it.
+- **Declaration problems are exit 1.** Exit 2 means the database differs;
+  declarations that do not load leave the question unanswered.
+- **Outside the comparison:** roles, grants, row security and declared rows.
+  Their comparisons need the recorded state (what pbps granted, which rows it
+  owns), which this command does not read.
+
+It is not a plan: no option writes SQL or a plan file, and the changes carry
+no risk gate. The command lives in `pbps-cli` (`deploy/live_diff.rs`) over
+`pbps_diff::diff_partial` and touches no engine crate.

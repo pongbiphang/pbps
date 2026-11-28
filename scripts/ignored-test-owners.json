@@ -3542,7 +3542,15 @@
       "owner": "pg",
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
-      "cases": ["consumer_contracts_connected_refusals_and_saved_apply_boundary"]
+      "cases": [
+        "consumer_contracts_connected_refusals_and_saved_apply_boundary",
+        "live_diff_pg::a_matching_database_is_no_difference_and_nothing_is_written",
+        "live_diff_pg::a_missing_column_is_one_added_column",
+        "live_diff_pg::what_was_not_compared_is_listed_and_is_no_difference",
+        "live_diff_pg::names_are_all_it_pairs_by_so_a_rename_is_a_drop_and_a_create",
+        "live_diff_pg::a_respelled_text_is_reported_apart_from_the_changes",
+        "live_diff_pg::a_ledger_does_not_change_the_answer"
+      ]
     },
     {
       "target": ["pbps-pg", "test", "live"],
@@ -3703,7 +3711,13 @@
         "drop_requirements2400_mssql::a_late_violating_row_rolls_back_the_drop_and_prior_statements_on_sql_server",
         "drop_requirements2400_mssql::unsafe_requirements_write_nothing_and_referenced_renames_split_the_plan_on_sql_server",
         "drop_requirements2400_mssql::a_table_drop_honors_its_removed_columns_requirements_on_sql_server",
-        "drop_requirements2400_mssql::guarded_drops_follow_the_table_uid_through_a_rename_on_sql_server"
+        "drop_requirements2400_mssql::guarded_drops_follow_the_table_uid_through_a_rename_on_sql_server",
+        "live_diff_mssql::a_matching_database_is_no_difference_and_nothing_is_written",
+        "live_diff_mssql::a_missing_column_is_one_added_column",
+        "live_diff_mssql::what_was_not_compared_is_listed_and_is_no_difference",
+        "live_diff_mssql::names_are_all_it_pairs_by_so_a_rename_is_a_drop_and_a_create",
+        "live_diff_mssql::a_respelled_text_is_reported_apart_from_the_changes",
+        "live_diff_mssql::a_ledger_does_not_change_the_answer"
       ]
     },
     {
