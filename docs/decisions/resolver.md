@@ -7232,3 +7232,18 @@ Rejected:
 - **Predicting the engine's fallback suffix loop.** Which arrival takes the first choice and which takes the suffix depends on statement order and existing catalog collisions; duplicating the engine's retry loop in the differ would be order-dependent and fragile.
 - **Assuming the first-choice name for existing relations.** A table whose first-choice primary key or sequence name was taken when it was created carries a suffixed catalog name, and a table rename leaves its owned sequence's name behind; guessing the un-suffixed name would miss readers of the real relation.
 - **Keeping separate collision checks for array types and engine-named relations.** Both fail for the same reason (two arrivals competing for one unallocated slot), and two checks would miss cross-kind collisions such as an array type and an unnamed primary key wanting the same name.
+
+<a id="dec-2987-4"></a>
+
+**DEC-2987.4. The plan's report gives the three reasons a surface is unaffected apart, and says in one line when a routine's body was not checked.**
+
+DEC-2987.1 made the assessment record why a surface is unaffected. Until now the report summed the three reasons into one count and worded the result as "this plan moves no name", which is false for a plan that moved names and was answered from the catalog.
+
+- **`resolver_assessment` carries two counts beside `unaffected`.** `proven_by_dependency` and `body_not_checked` are parts of the total, so a consumer that reads only `unaffected` reads what it read before. The envelope schema's fingerprint moves and no number is taken (DEC-2412.3).
+- **The sentence follows what happened.** With no proof by dependency it stays "this plan moves no name a kept binding could reach". With one it says that the dependencies the engine recorded show no kept binding reads what the plan moves, and how many surfaces were proven so.
+- **An unchecked body is said where the approver reads, whether or not a resolver ran.** One line, `Not checked:`, with the number of kept routines whose body the engine does not bind at creation. A resolver compares creation-time bindings, so its run does not check those bodies either, and its presence must not read as if it had.
+- **It is a line, not a finding.** Nearly every PostgreSQL project has procedural routines; a warning on every plan that moves a name would be noise that teaches the reader to skip warnings. The limit is the engine's and is stated in SPEC §9.3.2.
+
+Rejected:
+- **Three top-level counts that replace `unaffected`.** Every reader would have to sum them to get the number the report already had.
+- **Listing the routines by name.** The count tells the reader the limit applies; the names are every procedural routine the plan keeps, on every plan, which is the project's own inventory.

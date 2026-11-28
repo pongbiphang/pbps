@@ -1709,9 +1709,18 @@ pub(super) async fn plan_db_selected(
                 (&data.resolver_selection, &data.resolver_assessment)
             {
                 println!(
-                    "Resolver profile: {} ({:?}); not needed for binding, so the resolver did not run: this plan moves no name a kept binding could reach ({} unaffected, {} rebuilt from their declarations).",
-                    selection.name, selection.source, assessment.unaffected, assessment.rebuilt,
+                    "Resolver profile: {} ({:?}); not needed for binding, so the resolver did not run: {}.",
+                    selection.name,
+                    selection.source,
+                    assessment.not_needed_reason(),
                 );
+            }
+            if let Some(notice) = data
+                .resolver_assessment
+                .as_ref()
+                .and_then(crate::resolution::ResolverAssessment::body_notice)
+            {
+                println!("Not checked: {notice}");
             }
             if let Some(detail) = &data.rehearsal {
                 println!("Rehearsal: {}", crate::explain::rehearsal_line(detail));

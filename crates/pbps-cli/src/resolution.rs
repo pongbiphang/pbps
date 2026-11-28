@@ -17,7 +17,7 @@ pub mod retained;
 
 use pbps_cli::resolver::server::ProduceError;
 use pbps_config::resolver::ResolverSelection;
-use pbps_diff::resolver::{Answer, Assessment};
+use pbps_diff::resolver::{Answer, Assessment, UnaffectedReason};
 
 // The dialect brand survives the ordinary continuation and the publication recheck.
 pub(crate) trait Continuation:
@@ -122,8 +122,17 @@ pub fn unwrap_dependency_facts(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct ResolverAssessment {
     pub need: ResolutionNeed,
-    /// Kept surfaces nothing in the plan can rebind.
+    /// Kept surfaces nothing in the plan can rebind, whatever the reason.
     pub unaffected: usize,
+    /// Of `unaffected`, those the plan could have reached by name, and that
+    /// the dependencies the engine recorded prove it does not (DEC-2987.1).
+    /// Apart from the rest because it is a proof from the catalog, not from
+    /// the plan alone.
+    pub proven_by_dependency: usize,
+    /// Of `unaffected`, the routines whose body the engine did not bind when
+    /// it created them. Their headers were checked and their bodies were not
+    /// (DEC-2987.1), which a reader must be able to tell from a proof.
+    pub body_not_checked: usize,
     /// Kept surfaces the plan recreates from their declarations anyway.
     pub rebuilt: usize,
     /// The identity actually used by the successful resolver run.
@@ -169,6 +178,8 @@ impl ResolverAssessment {
         Self {
             need: ResolutionNeed::NotNeeded,
             unaffected: assessment.count(Answer::Unaffected),
+            proven_by_dependency: assessment.count_unaffected(UnaffectedReason::ByDependency),
+            body_not_checked: assessment.count_unaffected(UnaffectedReason::Unparsed),
             rebuilt: assessment.count(Answer::Rebuild),
             authorization: None,
             authorization_notice: None,
@@ -180,6 +191,44 @@ impl ResolverAssessment {
             need: ResolutionNeed::Resolved,
             ..Self::not_needed(assessment)
         }
+    }
+
+    /// Why no resolver ran, for the plan's text report. A plan that moves a
+    /// name and was answered from the catalog must not be described as one
+    /// that moves none: the reader would take a proof for an absence.
+    pub fn not_needed_reason(&self) -> String {
+        let rebuilt = self.rebuilt;
+        if self.proven_by_dependency == 0 {
+            format!(
+                "this plan moves no name a kept binding could reach ({} unaffected, {rebuilt} \
+                 rebuilt from their declarations)",
+                self.unaffected
+            )
+        } else {
+            format!(
+                "the dependencies the engine recorded show that no kept binding reads what \
+                 this plan moves ({} unaffected, {} of them proven by dependency; {rebuilt} \
+                 rebuilt from their declarations)",
+                self.unaffected, self.proven_by_dependency
+            )
+        }
+    }
+
+    /// The line that says what the answer above does not cover, or `None`
+    /// when it covers everything. Printed whether or not a resolver ran: a
+    /// resolver compares what a surface bound when it was created, and these
+    /// bodies bound nothing then (DEC-2987.1).
+    pub fn body_notice(&self) -> Option<String> {
+        let (count, noun) = match self.body_not_checked {
+            0 => return None,
+            1 => (1, "routine has a body"),
+            n => (n, "routines have bodies"),
+        };
+        Some(format!(
+            "{count} kept {noun} the engine does not bind at creation: the header was checked, \
+             the body was not. What such a body finds when it runs is for the routine's own \
+             tests."
+        ))
     }
 }
 
@@ -1270,10 +1319,180 @@ mod tests {
             ResolverAssessment {
                 need: ResolutionNeed::NotNeeded,
                 unaffected: 1,
+                proven_by_dependency: 0,
+                body_not_checked: 0,
                 rebuilt: 0,
                 authorization: None,
                 authorization_notice: None,
             }
+        );
+    }
+
+    /// A kept view, a second one and a procedural function, beside a routine
+    /// that arrives under a name none of them could reach.
+    fn arrival_beside_three_kept_surfaces() -> (Schema, Schema) {
+        let (mut base, _) = arrival();
+        let module = |kind, definition: &str| Module {
+            kind,
+            description: None,
+            definition: definition.into(),
+            options: Default::default(),
+        };
+        base.modules.insert(
+            "app.w".parse().unwrap(),
+            module(ModuleKind::View, "SELECT 1 AS one"),
+        );
+        base.modules.insert(
+            "app.p()".parse().unwrap(),
+            module(
+                ModuleKind::Function,
+                "RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$",
+            ),
+        );
+        let mut desired = base.clone();
+        desired.modules.insert(
+            "app.late()".parse().unwrap(),
+            module(ModuleKind::Function, "RETURNS int LANGUAGE sql RETURN 1"),
+        );
+        (base, desired)
+    }
+
+    /// The report must let a reader tell three answers apart: nothing moved,
+    /// the catalog proved it, and a body nobody checked (DEC-2987.1).
+    #[test]
+    fn the_report_counts_a_proof_by_dependency_and_an_unchecked_body_apart() {
+        use pbps_model::resolver::{
+            CatalogName, DependencyEdge, DependencyFacts, NameAvailability, ReadFact, Surface,
+            SurfaceDependencies,
+        };
+        use std::collections::{BTreeMap, BTreeSet};
+        let (base, desired) = arrival_beside_three_kept_surfaces();
+        let selected = selection();
+        let base_ids = ids(&base, &IdsFile::default());
+        let desired_ids = ids(&desired, &base_ids);
+        let base_side = pbps_diff::Side {
+            schema: &base,
+            ids: &base_ids,
+        };
+        let desired_side = pbps_diff::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        };
+        let dialect = pbps_pg::Postgres::new();
+        let ordinary =
+            pbps_diff::diff(base_side, desired_side, &dialect, &Hints::default()).unwrap();
+        let needed =
+            pbps_diff::resolver::needed_facts(base_side, desired_side, &ordinary, &dialect)
+                .expect("a routine arrives beside kept surfaces");
+        let procedural = Surface::Module("app.p()".parse().unwrap());
+        let reads_table = Surface::Module("app.v".parse().unwrap());
+        let facts = DependencyFacts {
+            surfaces: needed
+                .surfaces
+                .iter()
+                .map(|surface| {
+                    let edges = if *surface == reads_table {
+                        BTreeSet::from([DependencyEdge::Relation("app.t".parse().unwrap())])
+                    } else {
+                        BTreeSet::new()
+                    };
+                    let found = if *surface == procedural {
+                        SurfaceDependencies::Unparsed(edges)
+                    } else {
+                        SurfaceDependencies::Parsed(edges)
+                    };
+                    (surface.clone(), found)
+                })
+                .collect(),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: needed
+                .arriving_names
+                .iter()
+                .map(|name| (name.clone(), CatalogName::Clear))
+                .collect(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: needed
+                .arriving_candidates
+                .iter()
+                .map(|name| (name.clone(), NameAvailability::Free))
+                .collect(),
+        };
+
+        let Case::NotNeeded { assessment } = case_with_facts(
+            Some(&selected),
+            base_side,
+            desired_side,
+            &ordinary,
+            &dialect,
+            Some(&facts),
+        ) else {
+            panic!("the facts prove every kept surface");
+        };
+        let report = ResolverAssessment::not_needed(&assessment);
+        assert_eq!(
+            (
+                report.unaffected,
+                report.proven_by_dependency,
+                report.body_not_checked,
+                report.rebuilt
+            ),
+            (3, 2, 1, 0)
+        );
+        let reason = report.not_needed_reason();
+        assert!(
+            reason.contains("2 of them proven by dependency"),
+            "{reason}"
+        );
+        assert!(!reason.contains("moves no name"), "{reason}");
+        let notice = report.body_notice().expect("one body was not checked");
+        assert!(notice.starts_with("1 kept routine has a body"), "{notice}");
+
+        // Without the facts the same plan is a question, not a proof.
+        assert!(matches!(
+            case(
+                Some(&selected),
+                base_side,
+                desired_side,
+                &ordinary,
+                &dialect
+            ),
+            Case::Required { .. }
+        ));
+    }
+
+    /// A plan that moves no name has nothing to prove and nothing unchecked
+    /// to report, so neither wording appears.
+    #[test]
+    fn a_plan_that_moves_no_name_claims_no_proof_and_prints_no_body_line() {
+        let (base, _) = arrival_beside_three_kept_surfaces();
+        let selected = selection();
+        let Case::NotNeeded { assessment } = decide(Some(&selected), &base, &base) else {
+            panic!("an empty plan raises no question that needs an engine");
+        };
+        let report = ResolverAssessment::not_needed(&assessment);
+        assert_eq!(
+            (
+                report.unaffected,
+                report.proven_by_dependency,
+                report.body_not_checked
+            ),
+            (3, 0, 0)
+        );
+        assert!(
+            report
+                .not_needed_reason()
+                .starts_with("this plan moves no name")
+        );
+        assert_eq!(report.body_notice(), None);
+        let several = ResolverAssessment {
+            body_not_checked: 2,
+            ..report
+        };
+        assert!(
+            several
+                .body_notice()
+                .unwrap()
+                .starts_with("2 kept routines have bodies")
         );
     }
 
@@ -1410,6 +1629,8 @@ mod authorization_notice_tests {
         let mut report = ResolverAssessment {
             need: ResolutionNeed::NotNeeded,
             unaffected: 0,
+            proven_by_dependency: 0,
+            body_not_checked: 0,
             rebuilt: 0,
             authorization: None,
             authorization_notice: None,
