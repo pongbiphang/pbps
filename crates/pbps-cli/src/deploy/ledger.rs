@@ -157,11 +157,15 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         // has only this one typed failure, but preserve any future operational
         // error as an inability to answer rather than misclassifying it as a
         // policy finding.
+        // The record says which standalone sequences are pbps's here, as it
+        // says which tables are.
+        let recorded_sequences = baseline.snapshot.schema.sequences.keys().collect();
         let unmanaged_inventory = unmanaged_objects(
             &scoped,
             &managed.unreadable,
             &recorded_ids,
             &recorded_modules,
+            Some(&recorded_sequences),
         );
         let unmanaged_refusal =
             match apply_unmanaged_policy(&unmanaged_inventory, project.config.unmanaged) {

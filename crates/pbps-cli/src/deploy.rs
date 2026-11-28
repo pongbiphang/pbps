@@ -64,6 +64,7 @@ pub(crate) use managed::*;
 pub(crate) use names::*;
 use pinned_movement::*;
 pub(crate) use plan_db::*;
+pub(crate) use scopes::count_omitted_relations;
 use scopes::*;
 pub(crate) use spelling::*;
 pub(crate) use walk::*;

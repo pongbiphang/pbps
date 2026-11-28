@@ -750,7 +750,7 @@ fn inventory_prose_shows_names_once_beside_rendered_module_errors() {
             &BTreeSet::new(),
             &Default::default(),
         );
-        let labels = unmanaged_objects(&scoped, &unreadable, &empty, &BTreeSet::new());
+        let labels = unmanaged_objects(&scoped, &unreadable, &empty, &BTreeSet::new(), None);
         assert_eq!(labels, std::slice::from_ref(&expected));
         let refusal = apply_unmanaged_policy(&labels, pbps_config::Unmanaged::Error).unwrap_err();
         let expected_refusal = format!(
@@ -12338,7 +12338,7 @@ fn every_unreadable_module_is_either_a_limitation_or_unmanaged() {
     let unreadable = unreadable_objects(&pulled);
 
     let limited = managed_limitations(&pulled, &IdsFile::default(), &modules, &BTreeSet::new());
-    let unmanaged = unmanaged_objects(&scoped, &unreadable, &IdsFile::default(), &modules);
+    let unmanaged = unmanaged_objects(&scoped, &unreadable, &IdsFile::default(), &modules, None);
     assert!(limited.iter().any(|l| l.contains("dbo.declared_secret")));
     assert!(!limited.iter().any(|l| l.contains("dbo.stray_secret")));
     assert!(unmanaged.iter().any(|u| u.contains("dbo.stray_secret")));
@@ -12426,7 +12426,7 @@ fn managed_omission_table_identities_do_not_capture_other_namespaces() {
     let scoped = pbps_diff::scope(&pulled.schema, &ids, &modules, &Default::default());
     assert!(scoped.schema.tables.is_empty());
     let unreadable = unreadable_objects(&pulled);
-    let outside = unmanaged_objects(&scoped, &unreadable, &ids, &modules);
+    let outside = unmanaged_objects(&scoped, &unreadable, &ids, &modules, None);
     assert_eq!(outside.len(), 4, "{outside:?}");
     for item in pulled.unmanaged_modules.iter().skip(1) {
         assert!(
@@ -12453,7 +12453,7 @@ fn managed_omission_table_identities_do_not_capture_other_namespaces() {
     let empty = IdsFile::default();
     let unscoped = pbps_diff::scope(&pulled.schema, &empty, &modules, &Default::default());
     assert_eq!(
-        unmanaged_objects(&unscoped, &unreadable, &empty, &modules).len(),
+        unmanaged_objects(&unscoped, &unreadable, &empty, &modules, None).len(),
         5
     );
     assert!(managed_limitations(&pulled, &empty, &modules, &BTreeSet::new()).is_empty());
@@ -12480,7 +12480,7 @@ fn omitted_types_are_managed_only_by_their_own_declared_identities() {
     let unreadable = unreadable_objects(&pulled);
     let scoped = pbps_diff::scope(&pulled.schema, &ids, &modules, &BTreeSet::new());
     assert_eq!(
-        unmanaged_objects(&scoped, &unreadable, &ids, &modules),
+        unmanaged_objects(&scoped, &unreadable, &ids, &modules, None),
         ["type app.mood (type app.mood cannot be represented)"]
     );
     let refusal = cut_report(
@@ -12503,7 +12503,7 @@ fn omitted_types_are_managed_only_by_their_own_declared_identities() {
         managed_limitations(&pulled, &ids, &modules, &BTreeSet::new()),
         ["type app.mood cannot be represented"]
     );
-    assert!(unmanaged_objects(&scoped, &unreadable, &ids, &modules).is_empty());
+    assert!(unmanaged_objects(&scoped, &unreadable, &ids, &modules, None).is_empty());
     cut_report(
         &pulled,
         &ids,
@@ -12566,7 +12566,7 @@ fn unreadable_inventory_keeps_overloads_trigger_parents_and_unnameable_identitie
         &Default::default(),
     );
     let unreadable = unreadable_objects(&pulled);
-    let unmanaged = unmanaged_objects(&scoped, &unreadable, &IdsFile::default(), &held);
+    let unmanaged = unmanaged_objects(&scoped, &unreadable, &IdsFile::default(), &held, None);
     assert_eq!(unmanaged.len(), 3, "{unmanaged:?}");
     assert!(unmanaged.iter().any(|s| s.contains("app.f(bigint)")));
     assert!(unmanaged.iter().any(|s| s.contains("app.other.audit")));
@@ -13629,4 +13629,118 @@ fn a_cell_left_to_its_default_is_held_there_at_the_close() {
         Settled::Closing,
     )
     .expect("inserted at its default, read back omitted");
+}
+
+/// The scope cut keeps every text search object and standalone sequence of the
+/// database (DEC-2728.1, DEC-2721.1), so the inventory names the ones nobody
+/// manages, as it names an undeclared table (#3038).
+#[test]
+fn undeclared_text_search_objects_and_sequences_are_unmanaged() {
+    use pbps_model::{SearchKind, SearchObject, SearchRef};
+    let mut live = pbps_model::Schema::default();
+    let ours = SearchRef::new(SearchKind::Dictionary, "app.ours".parse().unwrap());
+    let theirs = SearchRef::new(SearchKind::Dictionary, "app.theirs".parse().unwrap());
+    for key in [&ours, &theirs] {
+        live.search.insert(
+            key.clone(),
+            SearchObject::Dictionary {
+                template: "pg_catalog.simple".parse().unwrap(),
+                options: Default::default(),
+            },
+        );
+    }
+    let own: pbps_model::ObjectName = "app.own_no".parse().unwrap();
+    let other: pbps_model::ObjectName = "app.other_no".parse().unwrap();
+    for name in [&own, &other] {
+        live.sequences.insert(
+            name.clone(),
+            pbps_model::Sequence {
+                ty: pbps_model::ColumnType::simple("bigint"),
+                start: 1,
+                increment: 1,
+                options: Default::default(),
+            },
+        );
+    }
+    let mut ids = IdsFile::default();
+    ids.search.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Search),
+        ours.clone(),
+    );
+    let modules = BTreeSet::new();
+    let scoped = pbps_diff::scope(&live, &ids, &modules, &BTreeSet::new());
+    let managed: BTreeSet<_> = [&own].into();
+
+    let listed = unmanaged_objects(&scoped, &[], &ids, &modules, Some(&managed));
+    assert_eq!(
+        listed,
+        [
+            theirs.shown().to_string(),
+            format!("sequence {}", other.shown())
+        ],
+        "{listed:?}"
+    );
+    // Negative: one an identity names, and one the caller manages, are not.
+    assert!(!listed.iter().any(|label| label.contains("ours")));
+    assert!(!listed.iter().any(|label| label.contains("own_no")));
+    // Negative: with no reference, no sequence is judged at all.
+    let unjudged = unmanaged_objects(&scoped, &[], &ids, &modules, None);
+    assert_eq!(unjudged, [theirs.shown().to_string()], "{unjudged:?}");
+}
+
+/// A relation the read left out whole keeps its name, so the cut every reader
+/// goes through counts it as unmanaged and `unmanaged: error` refuses it; a
+/// managed one with the same limitation is a managed limitation instead
+/// (#3038, SPEC §7.6).
+#[test]
+fn an_omitted_relation_nobody_manages_is_unmanaged_in_every_cut() {
+    use pbps_db::catalog::{Limitation, LimitationTarget, Pulled};
+    let name: TableName = "app.ruled".parse().unwrap();
+    let pulled = Pulled {
+        limitations: vec![Limitation {
+            target: LimitationTarget::Relation(name.clone()),
+            detail: "table app.ruled has rewrite rules".into(),
+        }],
+        ..Default::default()
+    };
+    let modules = BTreeSet::new();
+    let mut ids = IdsFile::default();
+    let (scoped, _) = cut(
+        &pulled,
+        &ids,
+        &modules,
+        &BTreeSet::new(),
+        pbps_config::Unmanaged::Error.into(),
+    );
+    assert_eq!(scoped.unmanaged, std::slice::from_ref(&name));
+    assert_eq!(
+        unmanaged_objects(&scoped, &[], &ids, &modules, None),
+        [name.shown().to_string()]
+    );
+    let refusal = cut_report(
+        &pulled,
+        &ids,
+        &modules,
+        &BTreeSet::new(),
+        &[],
+        pbps_config::Unmanaged::Error.into(),
+        CatalogWarnings::Human,
+    )
+    .unwrap_err();
+    assert!(refusal.is::<UnmanagedPolicy>(), "{refusal:#}");
+    assert!(refusal.to_string().contains("app.ruled"), "{refusal:#}");
+
+    // Negative: once managed, it is no longer unmanaged.
+    ids.tables.insert(
+        pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.ruled", 0),
+        name.clone(),
+    );
+    let (scoped, _) = cut(
+        &pulled,
+        &ids,
+        &modules,
+        &BTreeSet::new(),
+        pbps_config::Unmanaged::Error.into(),
+    );
+    assert!(scoped.unmanaged.is_empty(), "{:?}", scoped.unmanaged);
 }

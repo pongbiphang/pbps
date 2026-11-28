@@ -129,17 +129,16 @@ pub fn cmd_live_diff(project: &Project, target: &Target, json: bool) -> anyhow::
         // unmanaged here: listing every role of the server as undeclared would
         // refuse, under `unmanaged: error`, a project that declares them all.
         managed.scoped.unmanaged_roles.clear();
-        // A relation the read left out (a PostgreSQL table with a rewrite
-        // rule) is still an object in the database: outside the declarations
-        // it is unmanaged, as `managed_state_once` counts it for a plan, so
-        // `unmanaged: error` cannot be passed by an object pbps cannot read.
-        managed
-            .scoped
-            .unmanaged
-            .extend(managed.unmanaged_relations.iter().cloned());
-        managed.scoped.unmanaged.sort();
-        managed.scoped.unmanaged.dedup();
-        let unmanaged = unmanaged_objects(&managed.scoped, &managed.unreadable, &scope, &modules);
+        // With no record, the declarations say which standalone sequences
+        // are the project's.
+        let declared_sequences = loaded.schema.sequences.keys().collect();
+        let unmanaged = unmanaged_objects(
+            &managed.scoped,
+            &managed.unreadable,
+            &scope,
+            &modules,
+            Some(&declared_sequences),
+        );
         let refusal = match apply_unmanaged_policy(&unmanaged, project.config.unmanaged) {
             Ok(()) => None,
             Err(error) => match error.downcast::<UnmanagedPolicy>() {

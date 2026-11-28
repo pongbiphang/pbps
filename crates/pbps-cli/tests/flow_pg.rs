@@ -18641,6 +18641,90 @@ fn omitted_modules_obey_unmanaged_policy_even_beside_a_managed_overload() {
     assert_omitted_modules(&after_role_drop, false);
 }
 
+/// Three kinds the unmanaged inventory used to miss (#3038): a table the read
+/// leaves out whole (a rewrite rule), a standalone sequence and a text search
+/// configuration, none declared. `verify` and `plan --db` name all three and
+/// refuse under `unmanaged: error`; once they are gone, neither names them.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn undeclared_omitted_tables_sequences_and_text_search_obey_unmanaged_policy() {
+    const OURS: [&str; 3] = ["app.ruled", "app.loose_no", "app.loose_cfg"];
+    // Roles are cluster-wide, so another test's role may refuse too: assert
+    // on this test's objects, never on the whole inventory.
+    let names_ours = |result: &Output| {
+        let message = stderr(result);
+        OURS.iter().filter(|name| message.contains(*name)).count()
+    };
+    let own = OwnDatabase::new(&server(), "unmanaged-kinds");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("unmanaged-kinds");
+    d.table(ONE_COLUMN);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", connection]));
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nunmanaged: error\n",
+    )
+    .unwrap();
+    d.commit();
+    assert_eq!(names_ours(&d.run(&["plan", "--db", connection])), 0);
+
+    on_server(
+        connection,
+        "CREATE TABLE app.ruled (id int NOT NULL); \
+         CREATE RULE ruled_insert AS ON INSERT TO app.ruled DO INSTEAD NOTHING; \
+         CREATE SEQUENCE app.loose_no; \
+         CREATE TEXT SEARCH CONFIGURATION app.loose_cfg (COPY = pg_catalog.simple)",
+    );
+
+    let planned = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&planned), 0, "{}", stdout(&planned));
+    assert!(
+        stderr(&planned).contains("`unmanaged: error`"),
+        "{}",
+        stderr(&planned)
+    );
+    assert_eq!(names_ours(&planned), 3, "{}", stderr(&planned));
+    let verified = d.run(&["verify", "--db", connection, "--format", "json"]);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&verified)).unwrap();
+    assert_eq!(code(&verified), 2, "{report}: {}", stderr(&verified));
+    let refused = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "state.unmanaged-refused")
+        .unwrap_or_else(|| panic!("{report}"));
+    let message = refused["message"].as_str().unwrap();
+    for name in OURS {
+        assert!(message.contains(name), "{name}: {message}");
+    }
+
+    // Negative: under `ignore` nothing is refused for them.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nunmanaged: ignore\n",
+    )
+    .unwrap();
+    d.commit();
+    succeeds(d.run(&["verify", "--db", connection]));
+
+    // Negative: once they are gone, `unmanaged: error` names none of them.
+    on_server(
+        connection,
+        "DROP TABLE app.ruled; DROP SEQUENCE app.loose_no; \
+         DROP TEXT SEARCH CONFIGURATION app.loose_cfg",
+    );
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nunmanaged: error\n",
+    )
+    .unwrap();
+    d.commit();
+    assert_eq!(names_ours(&d.run(&["verify", "--db", connection])), 0);
+}
+
 /// #1723: each relation-namespace occupant follows its table through the
 /// plan's renames in the plan's order. `s2.b` moves to `s3.c` and its
 /// index `n_ix` is rebuilt there, then `s1.a`, with an `n_ix` of its own,

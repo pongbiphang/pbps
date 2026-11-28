@@ -450,17 +450,48 @@ pub(crate) fn unreadable_objects(
 /// Names every representable or unreadable catalog object outside the managed
 /// set — tables, types, modules and roles alike — for applying the `unmanaged:`
 /// policy of SPEC §8.2.
+///
+/// `sequences` names the standalone sequences the command manages. A sequence
+/// has no identity (DEC-2721.1), so only the caller knows which are its own:
+/// the record for `verify` and `status`, the declarations for `diff`, both for
+/// `plan --db`. `None` judges none of them, for the read's own policy, which
+/// has no such reference.
 pub(crate) fn unmanaged_objects(
     scoped: &pbps_diff::Scoped,
     unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
     ids: &IdsFile,
     managed_modules: &std::collections::BTreeSet<ModuleId>,
+    sequences: Option<&std::collections::BTreeSet<&pbps_model::ObjectName>>,
 ) -> Vec<String> {
     let managed_tables = ids.tables.values().collect();
     scoped
         .unmanaged
         .iter()
         .map(|name| name.shown().to_string())
+        // The scope cut keeps every text search object and standalone
+        // sequence of the database, since a plan compares only the ones the
+        // declarations name (DEC-2728.1, DEC-2721.1). The rest are somebody
+        // else's, as an undeclared table is.
+        .chain(
+            scoped
+                .schema
+                .search
+                .keys()
+                .filter(|name| !ids.search.values().any(|held| held == *name))
+                .map(|name| name.shown().to_string()),
+        )
+        .chain(
+            sequences
+                .into_iter()
+                .flat_map(|managed| {
+                    scoped
+                        .schema
+                        .sequences
+                        .keys()
+                        .filter(move |name| !managed.contains(name))
+                })
+                .map(|name| format!("sequence {}", name.shown())),
+        )
         .chain(
             scoped
                 .unmanaged_types
@@ -519,9 +550,10 @@ pub(super) fn report_unmanaged(
     unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
     ids: &IdsFile,
     managed_modules: &std::collections::BTreeSet<ModuleId>,
+    sequences: Option<&std::collections::BTreeSet<&pbps_model::ObjectName>>,
     policy: pbps_config::Unmanaged,
 ) -> anyhow::Result<()> {
-    let names = unmanaged_objects(scoped, unreadable, ids, managed_modules);
+    let names = unmanaged_objects(scoped, unreadable, ids, managed_modules, sequences);
     apply_unmanaged_policy(&names, policy)
 }
 

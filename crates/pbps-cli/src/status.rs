@@ -325,12 +325,13 @@ async fn one(
     // that disagreed about which objects are managed would disagree about
     // whether an environment has drifted.
     let recorded_modules = recorded_modules(&entry);
-    let scoped = pbps_diff::scope(
+    let mut scoped = pbps_diff::scope(
         &pulled.schema,
         &recorded_ids,
         &recorded_modules,
         &pbps_diff::external_parents(&entry.snapshot.schema),
     );
+    crate::deploy::count_omitted_relations(&mut scoped, &pulled, &recorded_ids, &recorded_modules);
     // The rows too, under the recorded scope, as `verify` reads them. Only the
     // read happens here; what it means is decided beside every other catalog
     // fact, below, so that a read which failed cannot hide any of them.
@@ -487,8 +488,15 @@ fn record_catalog_findings(
     }
 
     let unreadable = crate::deploy::unreadable_objects(pulled);
-    let unmanaged_objects =
-        crate::deploy::unmanaged_objects(scoped, &unreadable, recorded_ids, &recorded_modules);
+    // The record says which standalone sequences are pbps's, as `verify` reads it.
+    let recorded_sequences = entry.snapshot.schema.sequences.keys().collect();
+    let unmanaged_objects = crate::deploy::unmanaged_objects(
+        scoped,
+        &unreadable,
+        recorded_ids,
+        &recorded_modules,
+        Some(&recorded_sequences),
+    );
     if unmanaged != pbps_config::Unmanaged::Ignore && !unmanaged_objects.is_empty() {
         record_status_issue(
             row,
