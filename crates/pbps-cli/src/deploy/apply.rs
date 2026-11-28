@@ -2,6 +2,7 @@
 //! share around the statements they run.
 
 use super::*;
+use crate::engine::features::data_triggers;
 
 /// What the operator asked `apply` to do, as typed.
 pub struct ApplyRequest<'a> {
@@ -490,7 +491,7 @@ pub(super) async fn apply_under_lock<D: crate::engine::ApplySession>(
         )
         .await
         .context("Nothing has been applied — the transaction was rolled back.")?;
-        if dialect.settle_writes(conn).await? {
+        if data_triggers::settle(dialect, conn).await? {
             let settled = managed_state(
                 conn,
                 &plan.ids,

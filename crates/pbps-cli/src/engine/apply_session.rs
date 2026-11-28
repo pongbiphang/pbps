@@ -51,10 +51,19 @@ pub(crate) struct TakenHistoryName {
 }
 
 /// Evidence lives for this attempt, while closing verification is always fresh.
-#[derive(Default)]
-pub(crate) struct Transaction {
-    pub data_guard: DataWriteGuard,
+pub(crate) struct Transaction<E: Features> {
+    pub data_guard: features::data_triggers::Guard<E>,
     pub defaults: BTreeMap<pbps_model::Uid, pbps_model::ManagedType>,
+}
+
+// Written by hand because `#[derive(Default)]` would require `E: Default`.
+impl<E: Features> Default for Transaction<E> {
+    fn default() -> Self {
+        Self {
+            data_guard: Default::default(),
+            defaults: BTreeMap::new(),
+        }
+    }
 }
 
 pub(crate) struct Opening<'a> {
@@ -66,10 +75,10 @@ pub(crate) struct Opening<'a> {
     pub original_ids: &'a IdsFile,
 }
 
-pub(crate) trait ApplySession: crate::emission::Engine {
+pub(crate) trait ApplySession: Features {
     type State: Default;
-    fn state<'s>(&self, state: &'s mut Self::State) -> &'s mut Transaction;
-    fn evidence<'s>(&self, state: &'s Self::State) -> &'s Transaction;
+    fn state<'s>(&self, state: &'s mut Self::State) -> &'s mut Transaction<Self>;
+    fn evidence<'s>(&self, state: &'s Self::State) -> &'s Transaction<Self>;
     fn retained_comparison<'s>(
         &self,
         state: &'s Self::State,
@@ -204,15 +213,15 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         crate::deploy::recheck_extension_creates(conn, plan).await?;
         self.drop_blockers(conn, plan, opening.scoped, opening.recorded_ids)
             .await?;
-        self.state(state).data_guard = self
-            .prepare_data_writes(
-                conn,
-                &opening.approved.admission(),
-                &plan.changes,
-                opening.baseline,
-                &plan.ids,
-            )
-            .await?;
+        self.state(state).data_guard = features::data_triggers::prepare(
+            self,
+            conn,
+            &opening.approved.admission(),
+            &plan.changes,
+            opening.baseline,
+            &plan.ids,
+        )
+        .await?;
         Ok(())
     }
     async fn after_statements(
@@ -342,10 +351,10 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         conn: &mut Conn,
         admission: &RoutineAdmission,
         stmt: &pbps_dialect::Statement,
-        guard: &DataWriteGuard,
+        guard: &features::data_triggers::Guard<Self>,
         plan: Option<&pbps_model::SavedPlan>,
     ) -> anyhow::Result<()> {
-        self.check_data_write(conn, admission, stmt, guard).await?;
+        features::data_triggers::check(self, conn, admission, stmt, guard).await?;
         before_statement(self, conn, admission, stmt, plan).await
     }
     #[allow(clippy::too_many_arguments)]
@@ -363,11 +372,16 @@ pub(crate) trait ApplySession: crate::emission::Engine {
             // The plan's own admission, so a routine its review pinned is
             // admitted here as it was at the start (DEC-2563.9).
             let admission = approved.admission();
-            let guard = self
-                .prepare_data_writes(conn, &admission, &plan.changes, baseline, &plan.ids)
-                .await?;
-            self.check_data_write(conn, &admission, stmt, &guard)
-                .await?;
+            let guard = features::data_triggers::prepare(
+                self,
+                conn,
+                &admission,
+                &plan.changes,
+                baseline,
+                &plan.ids,
+            )
+            .await?;
+            features::data_triggers::check(self, conn, &admission, stmt, &guard).await?;
         } else {
             self.hold_retained(
                 state,
@@ -384,11 +398,16 @@ pub(crate) trait ApplySession: crate::emission::Engine {
                 // the lock the guard takes, judged by the plan's own
                 // admission (DEC-2563.9).
                 let admission = approved.admission();
-                let guard = self
-                    .prepare_data_writes(conn, &admission, &plan.changes, baseline, &plan.ids)
-                    .await?;
-                self.check_data_write(conn, &admission, stmt, &guard)
-                    .await?;
+                let guard = features::data_triggers::prepare(
+                    self,
+                    conn,
+                    &admission,
+                    &plan.changes,
+                    baseline,
+                    &plan.ids,
+                )
+                .await?;
+                features::data_triggers::check(self, conn, &admission, stmt, &guard).await?;
             }
             if let Some(change) = &stmt.introduces {
                 // Judged by the plan's own admission before the statement
@@ -421,7 +440,7 @@ pub(crate) trait ApplySession: crate::emission::Engine {
                 // held the commit would run unchecked. The step commits right
                 // after, so settling here refuses nothing the commit would
                 // have allowed (473).
-                self.settle_writes(conn).await?;
+                features::data_triggers::settle(self, conn).await?;
                 Ok(())
             }
             Execution::StagedGuardedDdl { previous } => {
@@ -865,30 +884,6 @@ pub(crate) trait ApplySession: crate::emission::Engine {
         stored: &Schema,
         stored_ids: &IdsFile,
     ) -> anyhow::Result<()>;
-    /// Authenticates the data-write triggers in the caller's open transaction;
-    /// what it holds is evidence for [`Self::check_data_write`]. Required: an
-    /// engine that was never asked must not read as one with no trigger.
-    async fn prepare_data_writes(
-        &self,
-        conn: &mut Conn,
-        admission: &RoutineAdmission,
-        changes: &ChangeSet,
-        baseline: &StateSnapshot,
-        planned_ids: &IdsFile,
-    ) -> anyhow::Result<DataWriteGuard>;
-    /// Refuses a row write or a rewrite a trigger the guard did not
-    /// authenticate would run. Required, for the reason of
-    /// [`Self::prepare_data_writes`].
-    async fn check_data_write(
-        &self,
-        conn: &mut Conn,
-        admission: &RoutineAdmission,
-        statement: &pbps_dialect::Statement,
-        guard: &DataWriteGuard,
-    ) -> anyhow::Result<()>;
-    /// Whether deferred work was flushed and its effects need a managed-state
-    /// check. Required, for the reason of [`Self::prepare_data_writes`].
-    async fn settle_writes(&self, conn: &mut Conn) -> anyhow::Result<bool>;
     /// Refuses changed type prerequisites before replay proceeds; neutral code
     /// has already refused a changed `trusted_roles` and a type without a pin.
     /// `within` says who owns the transaction the reads run in. Required: an

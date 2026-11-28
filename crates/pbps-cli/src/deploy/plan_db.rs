@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::engine::PlanSession as _;
+use crate::engine::features::data_triggers;
 use pbps_diff::order::finish;
 
 /// Advisory only: a reused name supplies no identity intent (SPEC 14.3).
@@ -1107,6 +1108,18 @@ pub(super) async fn plan_db_selected(
             let checks = dialect
                 .check_final_order(&plan_state, &mut conn, cs.changes(), frame)
                 .await?;
+            // Authenticate data-write triggers inside the planning transaction
+            // so a trigger refusal stops plan creation rather than waiting for
+            // apply (DEC-2798.19).
+            data_triggers::prepare(
+                &dialect,
+                &mut conn,
+                dialect.site_admission(&plan_state),
+                cs.changes(),
+                frame.baseline,
+                frame.written.ids,
+            )
+            .await?;
             Ok::<_, anyhow::Error>((
                 cs,
                 rename_evidence,

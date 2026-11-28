@@ -1,11 +1,11 @@
 use super::*;
 
 impl ApplySession for pbps_mssql::Mssql {
-    type State = Transaction;
-    fn state<'s>(&self, state: &'s mut Self::State) -> &'s mut Transaction {
+    type State = Transaction<Self>;
+    fn state<'s>(&self, state: &'s mut Self::State) -> &'s mut Transaction<Self> {
         state
     }
-    fn evidence<'s>(&self, state: &'s Self::State) -> &'s Transaction {
+    fn evidence<'s>(&self, state: &'s Self::State) -> &'s Transaction<Self> {
         state
     }
     fn retained_comparison<'s>(
@@ -465,29 +465,6 @@ impl ApplySession for pbps_mssql::Mssql {
     ) -> anyhow::Result<()> {
         let found = plan_session::mssql::module_dependents(conn, changes).await?;
         refuse_unaccounted_dependents("SQL Server", changes, &found, names, stored, stored_ids)
-    }
-    /// SQL Server keeps its existing reference-data execution policy.
-    async fn prepare_data_writes(
-        &self,
-        _conn: &mut Conn,
-        _admission: &RoutineAdmission,
-        _changes: &ChangeSet,
-        _baseline: &StateSnapshot,
-        _planned_ids: &IdsFile,
-    ) -> anyhow::Result<DataWriteGuard> {
-        Ok(DataWriteGuard::default())
-    }
-    async fn check_data_write(
-        &self,
-        _conn: &mut Conn,
-        _admission: &RoutineAdmission,
-        _statement: &pbps_dialect::Statement,
-        _guard: &DataWriteGuard,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn settle_writes(&self, _conn: &mut Conn) -> anyhow::Result<bool> {
-        Ok(false)
     }
     async fn replay_type_pins(
         &self,

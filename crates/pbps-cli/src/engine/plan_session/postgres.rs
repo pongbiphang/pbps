@@ -825,149 +825,6 @@ pub(in crate::engine) async fn numbered_column_fills(
     Ok(fills_listed(&fills, &publications, &slots))
 }
 
-/// Holds only trigger identities authenticated in the caller's open transaction;
-/// apply asks it again (`ApplySession::prepare_data_writes`).
-pub(in crate::engine) async fn prepare_data_writes(
-    conn: &mut Conn,
-    admission: &pbps_dialect::routines::RoutineAdmission,
-    changes: &ChangeSet,
-    baseline: &StateSnapshot,
-    planned_ids: &pbps_model::IdsFile,
-) -> anyhow::Result<DataWriteGuard> {
-    use pbps_dialect::{RowOperation, RowWrite};
-    use pbps_model::Change;
-    use pbps_model::ConstraintChange;
-    use pbps_model::ModuleChange;
-    use pbps_model::RowChange;
-    use pbps_model::TableChange;
-    let mut writes = Vec::new();
-    let mut dropped = pbps_pg::data_triggers::Dropped::default();
-    // Asked once per row change and updated column: indexed once,
-    // not scanned per question (#1870).
-    let planned_names = planned_ids.index();
-    let baseline_names = baseline.ids.index();
-    // The plan's own name for a table, in the spelling the catalog
-    // still holds: the guard runs before the renames (DECISIONS 445).
-    let stored = |table: &pbps_model::TableName| {
-        planned_names
-            .table_uid(table)
-            .or_else(|| baseline_names.table_uid(table))
-            .and_then(|uid| baseline.ids.tables.get(uid))
-            .cloned()
-    };
-    let stored_column = |column: &pbps_model::ColumnRef| {
-        planned_names
-            .column_uid(column)
-            .or_else(|| baseline_names.column_uid(column))
-            .and_then(|uid| baseline.ids.columns.get(uid))
-            .map_or_else(
-                || column.name.raw().to_owned(),
-                |old| old.name.raw().to_owned(),
-            )
-    };
-    for planned in &changes.changes {
-        if let Change::Module(ModuleChange::DropModule { id, .. }) = &planned.change {
-            dropped.modules.insert(id.clone());
-        }
-        // Both are ordered ahead of every row change, so the
-        // referential action they carry cannot write when the row
-        // statement runs (DECISIONS 451).
-        if let Change::Constraint(ConstraintChange::DropForeignKey { table, name }) =
-            &planned.change
-            && let Some(old) = stored(table)
-        {
-            dropped.foreign_keys.insert((old, name.clone()));
-        }
-        if let Change::Table(TableChange::DropTable { name, .. }) = &planned.change {
-            dropped
-                .tables
-                .insert(stored(name).unwrap_or_else(|| name.clone()));
-        }
-        // The expressions the plan removes or replaces before a row is
-        // written or a table rewritten: `prepare` does not judge what
-        // will be gone by then, and `check` judges whatever is not
-        // (DEC-2563.9).
-        dropped.note_removed_expressions(&planned.change, &stored, &stored_column);
-        // A table the plan rewrites, scans or copies into runs its index
-        // expressions as the deploying role even though no row of the
-        // plan is written to it. One that did not exist has no stored
-        // name and is judged at its own statement instead.
-        if let Some(write) = pbps_pg::existing_expressions::rewrite_write(&planned.change)
-            && let Some(old) = stored(&write.table)
-        {
-            writes.push(RowWrite {
-                table: old,
-                operation: write.operation,
-            });
-        }
-        let (table, mut operation) = if let Change::Row(RowChange::InsertRow {
-            table,
-            key_column,
-            row,
-            ..
-        }) = &planned.change
-        {
-            // The columns the INSERT names: the guard judges the
-            // DEFAULT of no other (#2748).
-            (
-                table,
-                RowOperation::Insert {
-                    columns: std::iter::once(key_column.clone())
-                        .chain(row.columns().map(|(column, _)| column.clone()))
-                        .collect(),
-                },
-            )
-        } else if let Change::Row(RowChange::UpdateRow { table, columns, .. }) = &planned.change {
-            (
-                table,
-                RowOperation::Update {
-                    columns: columns.keys().cloned().collect(),
-                },
-            )
-        } else if let Change::Row(RowChange::DeleteRow { table, .. }) = &planned.change {
-            (table, RowOperation::Delete)
-        } else {
-            continue;
-        };
-        // The logical target has the plan's final spelling; locks are
-        // acquired before any rename, through the stable table uid.
-        // New tables receive no existing-trigger allowance.
-        if let Some(old) = stored(table).as_ref() {
-            // Like the table, an updated or inserted column may still
-            // carry its pre-plan name while the guard authenticates
-            // triggers.
-            if let RowOperation::Update { columns } | RowOperation::Insert { columns } =
-                &mut operation
-            {
-                *columns = columns
-                    .iter()
-                    .map(|name| {
-                        let column = pbps_model::ColumnRef {
-                            table: table.clone(),
-                            name: name.clone(),
-                        };
-                        planned_names
-                            .column_uid(&column)
-                            .or_else(|| baseline_names.column_uid(&column))
-                            .and_then(|uid| baseline.ids.columns.get(uid))
-                            .map_or_else(|| name.clone(), |old| old.name.clone())
-                    })
-                    .collect();
-            }
-            writes.push(RowWrite {
-                table: old.clone(),
-                operation,
-            });
-        }
-    }
-    Ok(DataWriteGuard {
-        postgres: Some(
-            pbps_pg::data_triggers::prepare(conn, admission, &writes, &baseline.schema, &dropped)
-                .await?,
-        ),
-    })
-}
-
 /// PostgreSQL's module rebuild keeps its catalog state only inside the one
 /// transaction a staged run does not have (ADR-0009 §3). Rebuilds must keep
 /// their locks, checks and DDL in one transaction, and so must the revoke that
@@ -2046,7 +1903,7 @@ impl PlanSession for pbps_pg::Postgres {
 
     async fn check_final_order(
         &self,
-        state: &PlanState,
+        _state: &PlanState,
         conn: &mut Conn,
         changes: &ChangeSet,
         frame: Frame<'_>,
@@ -2062,14 +1919,6 @@ impl PlanSession for pbps_pg::Postgres {
         .await?;
         let logical_slots = logical_slots(conn, changes).await?;
         let numbered_column_fills = numbered_column_fills(conn, changes, frame.written.ids).await?;
-        prepare_data_writes(
-            conn,
-            &state.admission,
-            changes,
-            frame.baseline,
-            frame.written.ids,
-        )
-        .await?;
         Ok(FinalOrderChecks {
             rebuilds,
             drop_blockers,

@@ -611,12 +611,12 @@ impl PlanSession for Sqlite {
         })
     }
 
-    /// Runs SQLite's five post-ordering checks inside the planning transaction:
+    /// Runs SQLite's four post-ordering checks inside the planning transaction:
     /// `rebuilds`, `drop_blockers` (shared with [`ApplySession::drop_blockers`]),
-    /// `logical_slots`, `numbered_column_fills` and `data_writes`.
+    /// `logical_slots` and `numbered_column_fills`.
     async fn check_final_order(
         &self,
-        state: &PlanState,
+        _state: &PlanState,
         conn: &mut Conn,
         changes: &ChangeSet,
         frame: Frame<'_>,
@@ -673,15 +673,6 @@ impl PlanSession for Sqlite {
             )),
             "{no_num}"
         );
-        let _ = self
-            .prepare_data_writes(
-                conn,
-                &state.admission,
-                changes,
-                frame.baseline,
-                frame.written.ids,
-            )
-            .await?;
         Ok(FinalOrderChecks {
             rebuilds,
             drop_blockers,
@@ -4365,7 +4356,7 @@ mod tests {
      {
         use pbps_model::{
             Change, Column, ColumnChange, IndexChange, ModuleChange, ModuleId, ModuleKind,
-            ModuleOptions, RowChange, TableChange, ValueSource,
+            ModuleOptions, TableChange, ValueSource,
         };
 
         let (tmp, mut conn) = TempDb::create();
@@ -4434,7 +4425,7 @@ mod tests {
             now(dialect.check_final_order(&PlanState::default(), conn, &cs, frame))
         };
 
-        // 1. View edit passes all five parts; rebuilds/slots/numbering/drop_blockers are not_applicable.
+        // 1. View edit passes all four parts; rebuilds/slots/numbering/drop_blockers are not_applicable.
         let edit_ok = run(
             &mut conn,
             vec![Change::Module(ModuleChange::AlterModule {
@@ -4514,7 +4505,7 @@ mod tests {
             );
         }
 
-        // 4. Foreign inputs across all five parts refuse naming SQLite.
+        // 4. Foreign inputs across all four parts refuse naming SQLite.
         let mut opt_mod = view_module("SELECT 1");
         opt_mod.options = ModuleOptions {
             schemabinding: true,
@@ -4554,14 +4545,6 @@ mod tests {
                     table: TableName::new("main", "solo"),
                     name: "seq".into(),
                     column: Box::new(id_col),
-                }),
-            ),
-            (
-                "row write",
-                Change::Row(RowChange::SetEnsureKeys {
-                    table: TableName::new("main", "solo"),
-                    from: BTreeSet::new(),
-                    to: BTreeSet::new(),
                 }),
             ),
         ] {

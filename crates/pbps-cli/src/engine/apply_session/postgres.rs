@@ -2,17 +2,17 @@ use super::*;
 
 #[derive(Default)]
 pub(crate) struct State {
-    transaction: Transaction,
+    transaction: Transaction<pbps_pg::Postgres>,
     retained: Option<pbps_pg::retained::Held>,
     verified: Option<pbps_pg::retained::Verified>,
 }
 
 impl ApplySession for pbps_pg::Postgres {
     type State = State;
-    fn state<'s>(&self, state: &'s mut Self::State) -> &'s mut Transaction {
+    fn state<'s>(&self, state: &'s mut Self::State) -> &'s mut Transaction<Self> {
         &mut state.transaction
     }
-    fn evidence<'s>(&self, state: &'s Self::State) -> &'s Transaction {
+    fn evidence<'s>(&self, state: &'s Self::State) -> &'s Transaction<Self> {
         &state.transaction
     }
     fn retained_comparison<'s>(
@@ -601,41 +601,6 @@ impl ApplySession for pbps_pg::Postgres {
     ) -> anyhow::Result<()> {
         let found = plan_session::postgres::module_dependents(conn, changes).await?;
         refuse_unaccounted_dependents("PostgreSQL", changes, &found, names, stored, stored_ids)
-    }
-    async fn prepare_data_writes(
-        &self,
-        conn: &mut Conn,
-        admission: &RoutineAdmission,
-        changes: &ChangeSet,
-        baseline: &StateSnapshot,
-        planned_ids: &IdsFile,
-    ) -> anyhow::Result<DataWriteGuard> {
-        plan_session::postgres::prepare_data_writes(conn, admission, changes, baseline, planned_ids)
-            .await
-    }
-    async fn check_data_write(
-        &self,
-        conn: &mut Conn,
-        admission: &RoutineAdmission,
-        statement: &pbps_dialect::Statement,
-        guard: &DataWriteGuard,
-    ) -> anyhow::Result<()> {
-        let Some(write) = statement.row_write.as_ref().or(statement.rewrites.as_ref()) else {
-            return Ok(());
-        };
-        let empty = pbps_pg::data_triggers::Guard::default();
-        pbps_pg::data_triggers::check(
-            conn,
-            admission,
-            write,
-            guard.postgres.as_ref().unwrap_or(&empty),
-        )
-        .await?;
-        Ok(())
-    }
-    async fn settle_writes(&self, conn: &mut Conn) -> anyhow::Result<bool> {
-        pbps_pg::data_triggers::settle(conn).await?;
-        Ok(true)
     }
     async fn replay_type_pins(
         &self,
