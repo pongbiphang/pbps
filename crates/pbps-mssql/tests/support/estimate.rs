@@ -506,6 +506,7 @@ async fn a_clustered_index_change_is_a_rewrite_only_where_the_catalog_says_so() 
                 name: "cx_v".into(),
                 index: Box::new(index("v")),
                 clustered: true,
+                rehearsal: None,
             })),
             PlannedChange::new(Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: table.clone(),

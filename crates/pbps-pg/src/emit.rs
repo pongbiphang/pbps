@@ -6516,7 +6516,7 @@ mod tests {
                 for statement in statements {
                     let carries = marked && statement.sql.contains("ATTACH PARTITION");
                     assert_eq!(
-                        statement.attach_pin.as_deref(),
+                        statement.rehearsal_pin.as_deref(),
                         carries.then_some(&change),
                         "{statement:?}"
                     );
@@ -7526,6 +7526,7 @@ mod tests {
                     name: "ix".into(),
                     index: Box::new(index.clone()),
                     clustered: false,
+                    rehearsal: None,
                 }),
             )
             .join("\n")
@@ -7543,6 +7544,7 @@ mod tests {
                     name: "ix".into(),
                     index: Box::new(index),
                     clustered: false,
+                    rehearsal: None,
                 }),
                 Strategy::default()
             )
@@ -7934,12 +7936,14 @@ mod tests {
                     name: "ix".into(),
                     index: Box::new(index.clone()),
                     clustered: true,
+                    rehearsal: None,
                 }),
                 Change::Index(IndexChange::AddIndex {
                     table: table.clone(),
                     name: "ix".into(),
                     index: Box::new(index.clone()),
                     clustered: false,
+                    rehearsal: None,
                 }),
             ),
             (
@@ -9992,6 +9996,7 @@ mod tests {
             name: "ix".into(),
             index: Box::new(index.clone()),
             clustered: false,
+            rehearsal: None,
         });
         let sql = sql_of(&Postgres::new(), &change).remove(0);
         assert!(
@@ -10075,6 +10080,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
+            rehearsal: None,
         });
         let sql = sql_of(&Postgres::new(), &change).remove(0);
         assert!(
@@ -10112,6 +10118,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             });
             sql_of(&Postgres::new(), &change).remove(0)
         };
@@ -10161,6 +10168,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             });
             Postgres::new().fixture_emit(&change, Strategy::default())
         };
@@ -10225,6 +10233,7 @@ mod tests {
                     name: "no_similar".into(),
                     from: None,
                     to: Some(Box::new(exclusion(operator))),
+                    rehearsal: None,
                 }),
             )
             .join("\n")
@@ -10278,6 +10287,7 @@ mod tests {
                 name: "no_overlap".into(),
                 from: None,
                 to: Some(Box::new(x)),
+                rehearsal: None,
             })
         };
         let sql = sql_of(
@@ -10333,6 +10343,7 @@ mod tests {
                     pbps_model::ExclusionTiming::Immediate,
                 ))),
                 to: None,
+                rehearsal: None,
             }),
         );
         assert_eq!(dropped.len(), 1, "{dropped:?}");
@@ -10379,6 +10390,7 @@ mod tests {
                 name: "no_overlap".into(),
                 from: from.map(Box::new),
                 to: to.map(Box::new),
+                rehearsal: None,
             });
             let refused = Postgres::new()
                 .fixture_emit(&change, Strategy::default())
@@ -10422,6 +10434,7 @@ mod tests {
                 name: "ix".into(),
                 index: Box::new(index),
                 clustered: false,
+                rehearsal: None,
             });
             sql_of(&Postgres::new(), &change).remove(0)
         };
@@ -10503,6 +10516,7 @@ mod tests {
             name: "ix".into(),
             index: Box::new(index),
             clustered: false,
+            rehearsal: None,
         });
         let offline = sql_of(&Postgres::new(), &change).remove(0);
         assert!(
@@ -10629,6 +10643,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             }),
         )
         .remove(0);

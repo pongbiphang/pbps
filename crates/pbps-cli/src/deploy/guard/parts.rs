@@ -630,6 +630,7 @@ mod local_name_key_tests {
                     name: format!("ix{RAW}").into(),
                     index: Box::new(index.clone()),
                     clustered: false,
+                    rehearsal: None,
                 })),
             ],
         };

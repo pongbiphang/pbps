@@ -88,13 +88,13 @@ impl ApplySession for pbps_pg::Postgres {
     async fn check_rehearsed(&self, conn: &mut Conn, changes: &ChangeSet) -> anyhow::Result<()> {
         Ok(pbps_pg::adoption::check(conn, changes).await?)
     }
-    async fn hold_attach(
+    async fn hold_rehearsed(
         &self,
         conn: &mut Conn,
         changes: &ChangeSet,
-        attach: &pbps_model::Change,
+        pinned: &pbps_model::Change,
     ) -> anyhow::Result<()> {
-        Ok(pbps_pg::adoption::hold(conn, changes, attach).await?)
+        Ok(pbps_pg::adoption::hold(conn, changes, pinned).await?)
     }
     /// Retention is a connected engine guard, never a second plan emitter.
     async fn hold_retained(

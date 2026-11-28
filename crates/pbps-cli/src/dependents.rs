@@ -915,6 +915,7 @@ fn restoration_of(
                     name: name.clone(),
                     index: Box::new(t.indexes.get(name).ok_or_else(unsupported)?.clone()),
                     clustered: false,
+                    rehearsal: None,
                 }),
                 Part::PrimaryKey(_)
                 | Part::Unique(_)
@@ -5165,6 +5166,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
+            rehearsal: None,
         })
     }
 
@@ -5854,6 +5856,7 @@ mod tests {
                         timing: pbps_model::ExclusionTiming::Immediate,
                     })
                 }),
+                rehearsal: None,
             })
         };
         let moved = |change: Change| {
@@ -6672,6 +6675,7 @@ mod tests {
                 name: "ev_3_extra".into(),
                 index: Box::new(index_on("extra")),
                 clustered: false,
+                rehearsal: None,
             }),
             // A table that is no partition of `app.ev`, with an index on a
             // column of the same name: free to go ahead (#1692 review).
@@ -6680,6 +6684,7 @@ mod tests {
                 name: "u_extra".into(),
                 index: Box::new(index_on("extra")),
                 clustered: false,
+                rehearsal: None,
             }),
             routine("app.f()", "SELECT 1"),
         ]);
@@ -7942,6 +7947,7 @@ mod tests {
                 name: name.into(),
                 from: None,
                 to: Some(x),
+                rehearsal: None,
             })
         };
         let names = |cs: &ChangeSet| -> Vec<String> {
@@ -7997,6 +8003,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             }),
             add(&ev, "parent", exclusion("=", immediate)),
         ]);
@@ -8011,6 +8018,7 @@ mod tests {
                 name: "parent".into(),
                 from: Some(exclusion("=", immediate)),
                 to: None,
+                rehearsal: None,
             }),
         ]);
         let before = cs.clone();
@@ -8074,6 +8082,7 @@ mod tests {
                 name: name.into(),
                 from,
                 to,
+                rehearsal: None,
             })
         };
         let add = |table: &TableName, name: &str, operator: &str| {
@@ -8197,6 +8206,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             })
         };
         let names = |cs: &ChangeSet| -> Vec<String> {

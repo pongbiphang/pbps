@@ -79,7 +79,7 @@ pub fn questions(
 /// to anything of `table`'s own. An index left standing under it would be in
 /// the way of what the drop made room for, so the answer would decide which
 /// plans can be applied and not only what they cost.
-fn taken(declared: &Schema, table: &TableName, name: &ObjectLocalName) -> bool {
+pub(super) fn taken(declared: &Schema, table: &TableName, name: &ObjectLocalName) -> bool {
     let relation = TableName::new(&table.schema, name.raw());
     declared.tables.contains_key(&relation)
         || declared.sequences.contains_key(&relation)

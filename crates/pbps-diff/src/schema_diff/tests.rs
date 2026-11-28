@@ -2683,6 +2683,7 @@ fn a_declared_exclusion_is_added_by_one_change_and_a_standing_one_plans_nothing(
             name,
             from: None,
             to: Some(to),
+            ..
         }),
     ] = cs
         .changes
@@ -3780,6 +3781,7 @@ fn a_column_drop_under_an_exclusion_is_refused_and_a_retype_states_its_rebuild()
         name: "no_overlap".into(),
         from: Some(Box::new(exclusion("int4range(a, b)", "&&"))),
         to: None,
+        rehearsal: None,
     });
     let declared = Some(&held.tables[&table]);
     let mut errs = Vec::new();
@@ -21966,6 +21968,7 @@ fn restoration_comparison_uses_each_parts_differ_equivalence() {
                     name: "ix".into(),
                     index: Box::new(after.indexes["ix"].clone()),
                     clustered: after.index_is_clustered("ix"),
+                    rehearsal: None,
                 }),
                 Part::Policy | Part::Exclusion => unreachable!(),
             };

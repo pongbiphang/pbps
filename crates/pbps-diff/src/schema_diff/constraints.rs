@@ -413,6 +413,7 @@ pub(super) fn diff_constraints_by(
                 name: n.clone(),
                 index: Box::new(ix.clone()),
                 clustered: declared.index_is_clustered(n.raw()),
+                rehearsal: None,
             })
         },
         changes,

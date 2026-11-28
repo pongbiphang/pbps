@@ -585,6 +585,7 @@ pub(super) fn recreate_retyped_dependents(
                     name: n.clone(),
                     index: Box::new(index.clone()),
                     clustered: after.index_is_clustered(n.raw()),
+                    rehearsal: None,
                 }));
             }
         }

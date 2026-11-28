@@ -321,6 +321,7 @@ fn add_index(
             filegroup: None,
         }),
         clustered: false,
+        rehearsal: None,
     })
 }
 

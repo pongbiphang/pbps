@@ -802,6 +802,7 @@ fn verify_names_catches_catalog_occupants_and_allows_freed_names_and_key_names()
             name: "__PBPS_STATE".into(),
             index: Box::new(ix),
             clustered: false,
+            rehearsal: None,
         }))],
     };
     let ix_side = pbps_diff::Side {

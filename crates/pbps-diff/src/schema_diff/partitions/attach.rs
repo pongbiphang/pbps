@@ -19,6 +19,11 @@ pub(in super::super) struct Attached {
     /// The table's key and unique constraints dropped before the attach,
     /// whose index an index of the parent's might take.
     pub(in super::super) released: Vec<Change>,
+    /// For each own index, key and exclusion above, the parent's indexes or
+    /// exclusions that might take it, which the plan says (DEC-1671.3). A
+    /// primary key the base holds no name for is under none.
+    pub(in super::super) by:
+        BTreeMap<Option<pbps_model::ObjectLocalName>, Vec<pbps_model::ObjectLocalName>>,
 }
 
 /// What the ordinary table `table` is once attached to `of.parent`, or what
@@ -489,6 +494,23 @@ pub(in super::super) fn attached(
             None => displaced.extend(mine),
         }
     }
+    // The parent's indexes that might take `own`, by name: `parents_indexes`
+    // holds their definitions in this order.
+    let taking = |own: &Index| -> Vec<pbps_model::ObjectLocalName> {
+        parent
+            .indexes
+            .keys()
+            .zip(&parents_indexes)
+            .filter(|(_, theirs)| takes(theirs, own))
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    let mut by: BTreeMap<_, _> = table
+        .indexes
+        .iter()
+        .filter(|(name, _)| displaced.contains(name))
+        .map(|(name, own)| (Some(name.clone()), taking(own)))
+        .collect();
     let indexes = table
         .indexes
         .iter()
@@ -499,19 +521,24 @@ pub(in super::super) fn attached(
     // An own exclusion the parent's might take is made its clone by `ATTACH`,
     // keeping its name, and then goes with the parent's (measured on 18.6,
     // DEC-2448.7), so it is dropped first like an index (DEC-1671.1).
-    let exclusions: Vec<pbps_model::ObjectLocalName> = table
-        .exclude
-        .iter()
-        .filter(|(_, own)| {
-            parent.exclude.iter().any(|(name, was)| {
+    let mut exclusions: Vec<pbps_model::ObjectLocalName> = Vec::new();
+    for (own_name, own) in &table.exclude {
+        let theirs: Vec<_> = parent
+            .exclude
+            .iter()
+            .filter(|(name, was)| {
                 may_adopt_exclusion(was, own, dialect)
                     || goal_parent
-                        .and_then(|goal| goal.exclude.get(name))
+                        .and_then(|goal| goal.exclude.get(*name))
                         .is_some_and(|now| may_adopt_exclusion(now, own, dialect))
             })
-        })
-        .map(|(n, _)| n.clone())
-        .collect();
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !theirs.is_empty() {
+            by.insert(Some(own_name.clone()), theirs);
+            exclusions.push(own_name.clone());
+        }
+    }
     let exclude = table
         .exclude
         .iter()
@@ -519,13 +546,12 @@ pub(in super::super) fn attached(
         .map(|(n, x)| (n.clone(), x.clone()))
         .collect();
     let mut released = Vec::new();
-    let contested = |columns: &[ColumnName]| {
-        let own = backing(columns);
-        parents_indexes.iter().any(|theirs| takes(theirs, &own))
-    };
+    let contested = |columns: &[ColumnName]| taking(&backing(columns));
     if let Some(key) = &table.primary_key
-        && contested(&key.columns)
+        && let theirs = contested(&key.columns)
+        && !theirs.is_empty()
     {
+        by.insert(key.name.clone(), theirs);
         released.push(Change::Constraint(ConstraintChange::SetPrimaryKey {
             table: declared_name.clone(),
             from: Some(key.clone()),
@@ -534,7 +560,9 @@ pub(in super::super) fn attached(
         }));
     }
     for (name, u) in &table.unique {
-        if contested(&u.columns) {
+        let theirs = contested(&u.columns);
+        if !theirs.is_empty() {
+            by.insert(Some(name.clone()), theirs);
             released.push(Change::Constraint(ConstraintChange::DropUnique {
                 table: declared_name.clone(),
                 name: name.clone(),
@@ -640,6 +668,7 @@ pub(in super::super) fn attached(
         displaced,
         exclusions,
         released,
+        by,
     })
 }
 

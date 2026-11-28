@@ -560,6 +560,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 storage_parameters: Default::default(),
                 timing: pbps_model::ExclusionTiming::Immediate,
             })),
+            rehearsal: None,
         }),
         vec![&table],
         vec![],
@@ -625,6 +626,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 filegroup: None,
             }),
             clustered: false,
+            rehearsal: None,
         }),
         vec![&table],
         vec![],
@@ -1454,6 +1456,7 @@ fn a_new_exclusion_reads_its_key_expressions_and_predicate_and_a_drop_reads_none
             name: "xc".into(),
             from: from.map(Box::new),
             to: to.map(Box::new),
+            rehearsal: None,
         })
     };
     let call = IndexColumn {

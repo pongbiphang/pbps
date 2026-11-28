@@ -41,6 +41,7 @@ fn set(from: Option<ExclusionConstraint>, to: Option<ExclusionConstraint>) -> Ch
         name: "x".into(),
         from: from.map(Box::new),
         to: to.map(Box::new),
+        rehearsal: None,
     })
 }
 

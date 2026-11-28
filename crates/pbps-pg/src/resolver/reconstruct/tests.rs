@@ -735,6 +735,7 @@ fn a_split_exclusion_is_a_step_of_its_own_after_its_table_and_a_drop_is_refused(
             name: "one_per_room".into(),
             from,
             to,
+            rehearsal: None,
         })
     };
     let create = Change::Table(TableChange::CreateTable {

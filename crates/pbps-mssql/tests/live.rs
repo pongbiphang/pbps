@@ -7515,6 +7515,7 @@ async fn a_unique_index_is_probed_and_a_filtered_one_only_over_the_rows_it_keeps
                 filegroup: None,
             }),
             clustered: false,
+            rehearsal: None,
         })
     };
     let one = |change: Change| ChangeSet {
@@ -7677,6 +7678,7 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
                         filegroup: None,
                     }),
                     clustered: false,
+                    rehearsal: None,
                 })),
             ],
         })

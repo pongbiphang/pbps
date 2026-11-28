@@ -3046,6 +3046,7 @@ mod consumer_contract_tests {
                         name: "ix".into(),
                         index: Box::new(after.indexes["ix"].clone()),
                         clustered: after.index_is_clustered("ix"),
+                        rehearsal: None,
                     }),
                     Part::Policy | Part::Exclusion => unreachable!(),
                 };

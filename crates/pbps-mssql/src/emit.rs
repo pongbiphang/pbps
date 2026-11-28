@@ -1987,6 +1987,7 @@ mod tests {
             name: "x".into(),
             from: Some(Box::new(held.clone())),
             to: None,
+            rehearsal: None,
         });
         let error = super::emit(&drop, Strategy::default())
             .unwrap_err()
@@ -2452,6 +2453,7 @@ mod tests {
             name: "ix_code".into(),
             index: Box::new(index),
             clustered: false,
+            rehearsal: None,
         }));
         assert_eq!(
             online[0],
@@ -2570,6 +2572,7 @@ mod tests {
                 name: "ix_a".into(),
                 index: Box::new(t.indexes["ix_a"].clone()),
                 clustered,
+                rehearsal: None,
             }))
         };
         assert_eq!(
@@ -2592,6 +2595,7 @@ mod tests {
                     name: "ix_a".into(),
                     index: Box::new(filtered),
                     clustered: true,
+                    rehearsal: None,
                 }),
                 Strategy::default()
             )
@@ -2637,6 +2641,7 @@ mod tests {
                 name: "cx".into(),
                 index: Box::new(index.clone()),
                 clustered: true,
+                rehearsal: None,
             }),
             Change::Constraint(ConstraintChange::AddUnique {
                 table: tname("dbo.t"),
@@ -3546,6 +3551,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
+            rehearsal: None,
         }));
         assert_eq!(
             index,
@@ -3585,6 +3591,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
+            rehearsal: None,
         }));
         assert_eq!(
             sql,
@@ -3749,6 +3756,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
+            rehearsal: None,
         })
     }
 

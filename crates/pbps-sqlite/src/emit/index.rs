@@ -13,6 +13,7 @@ pub(super) fn emit(change: &IndexChange) -> Sql {
             name,
             index,
             clustered,
+            ..
         } => {
             if *clustered {
                 return Err(unsupported("a clustered index"));

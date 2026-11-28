@@ -10467,6 +10467,9 @@ the ordering pass's tests in `dependents.rs`, and on 16 and 18 by
 or exclusion of an attached table that the scratch's engine takes is no longer
 dropped.*
 
+*Amended by [DEC-1671.3](#dec-1671-3): the plan says on each loose drop, and on
+the add after it, which of the parent's may take the index.*
+
 <a id="dec-1671-2"></a>
 
 **DEC-1671.2. With a resolver selected, an attach keeps each index, key and
@@ -10660,3 +10663,94 @@ Pinned by the tests of `schema_diff/partitions/rehearsal.rs` and
 `an_attach_that_records_a_rehearsal_marks_its_attach_statement_alone`, and on
 16 and 18 by `support/adoption1671.rs` (apply's hold on a record) and
 `support/rehearsal1671.rs` (the rehearsal, and the apply of what it keeps).
+
+*Amended by [DEC-1671.3](#dec-1671-3): every question put to a resolver gets an
+answer, one that keeps nothing where the scratch keeps or answers nothing, which
+the differ does not use and by which the plan offers no resolver. The statement
+pin and apply's two hooks serve a parent's addition's record as well.*
+
+<a id="dec-1671-3"></a>
+
+**DEC-1671.3. The plan says why an own is dropped for a parent's to take, and
+apply holds each partition to what a plan records of it under a parent's new
+index or exclusion (#1671; amends DEC-1671.1 and DEC-1671.2).**
+
+**Context.** A parent's new index or exclusion takes a standing partition's own
+as its copy where the engine holds the two equal, so DEC-1671.1 drops every own
+one it might take. The third part of #1671 asks a resolver's engine about those,
+as DEC-1671.2 does at an attach. The maintainer decided its design on
+2026-11-28 and it lands in two parts. This is the first: the record a plan will
+hold, its admission, apply's hold on it, and the reasons in the plan. The second
+adds the question, the rehearsal and the differ's use of the answer. **Until it
+does, no plan carries a record on a parent's addition**, and every such plan is
+DEC-1671.1's.
+
+The maintainer's answers that the record rests on: a declared own the addition
+does not take may stay standing **beside** the copy, and an own the declarations
+no longer hold may be **adopted** as it (Q5 of DEC-1671.2 then reads "no own
+becomes a copy under a declared name"); and a column the plan adds to the parent
+does not stop a rehearsal, while any other change to one does. A plan should be
+predictable, say why, and not rebuild what the user did not change. The refusals
+of a created partition's own index and of an own exclusion the same plan adds
+stay, with or without a resolver; lifting them for every user is #3108.
+
+**The reasons.** Each index, key or exclusion dropped because a parent's might
+take it says so on its step, and on the add after it where the declarations keep
+it: `- index c_idx, built again: the parent's new index p_idx may take it`, or
+`, since the parent's index p may take it` for one dropped for good. The pass
+that pushes the drop marks it, with the parent's that may take it, so nothing is
+derived again from the plan. A drop the declarations ask for, a redefinition
+included, says nothing. The words travel on the planned change and are not
+sealed, as a step's provenance is not (DEC-1958.3): a plan read back from its
+file has none, and `--format json` does not carry them.
+
+`(a resolver can keep it)` is added only where it is true: under an attach, for a
+name the declarations give to nothing, in a plan the attach's question is asked
+of, and where none was asked. Every question put gets an answer for that reason.
+A parent's new index offers no resolver until the second part.
+
+**The record** is a field of the parent's `AddIndex` or exclusion add: for each
+partition, its own indexes as planning read them, a parent's clones left out, and
+the names this addition adopts and leaves beside it. A field of the change rather
+than of the planned change, so that no pass that rebuilds a planned change can
+keep an own and lose the record. The plan format changes with the field, which
+the format fingerprint catches; no version number moves (DEC-2412.3).
+
+**Admission** refuses a record on another engine; on a change that adds nothing;
+with no partition, a partition twice, or the changed table among them; with a
+name twice in a list; that decides nothing for a partition; that claims a name
+outside its list or of another kind than the addition takes; that claims one the
+plan drops or adds; that claims what another record claims otherwise, one own
+adopted twice or both adopted and left beside; where two records hold different
+lists of one partition; and in a plan that alters a parent column other than by
+adding one, changes a storage parameter of a recorded partition, or holds a
+change `adoption::unsettles` names.
+
+**Apply** compares each recorded partition's own indexes with the record twice,
+read under the canonical path, and refuses by the partition and the first
+difference, as DEC-1671.2 does an attach's relations:
+
+1. Before the first statement, every list in full. The drift check cannot see an
+   index made again, which changes only the order.
+2. Just before each recorded addition, in its transaction: the record less what
+   earlier changes of the plan drop from that partition and what earlier recorded
+   additions adopt, then the names earlier changes add to it, which follow in
+   order with definitions the engine prints.
+
+Before the second, the parent is locked without `ONLY`, which locks its
+partitions, in `SHARE ROW EXCLUSIVE`, or in `ACCESS EXCLUSIVE` where any
+recorded addition on it is an exclusion, taken at the first so that no later
+statement upgrades it. The parent's own `CREATE INDEX` takes `SHARE`, which
+already holds off writes; `SHARE ROW EXCLUSIVE` also holds off `CREATE INDEX`
+and `REINDEX` on a partition and blocks no further writer (measured on 16.15 and
+18.6, `~/gate1671/pr3/locks.sh`). A staged step holding a recorded addition runs
+in a transaction of its own. A staged plan holds one change and such an addition
+is one statement, so no checkpoint stands ahead of it: a staged apply refused
+there is started again, and makes both comparisons again. An engine other than
+PostgreSQL refuses a plan that holds a record.
+
+Pinned by the record tests of `pbps-model/src/adoption.rs`, the compare and lock
+tests of `pbps-pg/src/adoption.rs`, `schema_diff/partitions/adoption/tests.rs`,
+the report tests of `report.rs`,
+`a_plan_holding_a_parents_addition_record_is_refused_on_sqlite_and_sql_server`,
+and on 16 and 18 by `support/adds1671.rs`.

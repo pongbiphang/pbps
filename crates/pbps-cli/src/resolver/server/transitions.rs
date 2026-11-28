@@ -579,7 +579,7 @@ Change::Partition(PartitionChange::RebuildPartitionedTable(_)) | Change::Index(I
                 table,
                 name,
                 from: None,
-                to: Some(_),
+                to: Some(_), ..
             }) => (
                 Surface::Index {
                     table: table.clone(),

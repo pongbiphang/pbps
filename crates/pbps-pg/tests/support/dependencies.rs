@@ -637,6 +637,7 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
             name: "p1_k_idx".into(),
             index: Box::new(index),
             clustered: false,
+            rehearsal: None,
         }),
         Change::Index(IndexChange::DropIndex {
             table: root.table.clone(),
@@ -909,6 +910,7 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
                     name: "p_idx".into(),
                     index: index.clone(),
                     clustered: false,
+                    rehearsal: None,
                 }),
             ),
             (

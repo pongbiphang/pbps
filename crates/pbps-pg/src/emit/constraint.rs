@@ -83,15 +83,20 @@ pub(super) fn emit(pg: &Postgres, change: &Change, constraint: &ConstraintChange
             name,
             from: None,
             to: Some(x),
-        } => one(
-            pg,
-            table,
-            format!(
-                "ALTER TABLE {} ADD {};",
-                qualified(table)?,
-                exclusion_clause(name.raw(), x)?
-            ),
-        ),
+            rehearsal,
+        } => {
+            let mut statement = on(
+                pg,
+                table,
+                &format!(
+                    "ALTER TABLE {} ADD {};",
+                    qualified(table)?,
+                    exclusion_clause(name.raw(), x)?
+                ),
+            )?;
+            statement.rehearsal_pin = rehearsal.is_some().then(|| Box::new(change.clone()));
+            Ok(vec![statement])
+        }
         // `DROP CONSTRAINT`, never `DROP INDEX`: the backing index is owned by
         // the constraint and the engine refuses to drop it alone (2BP01,
         // measured on 16.15 and 18.6). Both go together.
@@ -100,6 +105,7 @@ pub(super) fn emit(pg: &Postgres, change: &Change, constraint: &ConstraintChange
             name,
             from: Some(_),
             to: None,
+            ..
         } => one(
             pg,
             table,

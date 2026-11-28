@@ -307,6 +307,7 @@ pub(crate) fn changes(
                         clustered: table.index_is_clustered(index.raw()),
                         name: index,
                         index: Box::new(spec),
+                        rehearsal: None,
                     })
                 }));
                 if identity.is_some() {
@@ -553,6 +554,7 @@ pub(crate) fn changes(
                         name: name.clone(),
                         index: Box::new(index),
                         clustered: definition.index_is_clustered(name.raw()),
+                        rehearsal: None,
                     }),
                 ]
             }

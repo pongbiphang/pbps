@@ -271,6 +271,7 @@ fn add_index(table: &str) -> Change {
         name: "ix".into(),
         index: Box::new(index_on("id")),
         clustered: false,
+        rehearsal: None,
     })
 }
 

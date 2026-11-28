@@ -125,6 +125,7 @@ fn add(name: &str, index: Index) -> Change {
         name: name.into(),
         index: Box::new(index),
         clustered: false,
+        rehearsal: None,
     })
 }
 

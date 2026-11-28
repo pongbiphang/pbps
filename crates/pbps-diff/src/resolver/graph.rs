@@ -569,6 +569,7 @@ fn named_dependency_effects_keep_raw_check_and_index_surfaces_distinct_from_show
                     storage_parameters: Default::default(),
                     filegroup: None,
                 }),
+                rehearsal: None,
             }),
             Change::Index(IndexChange::DropIndex {
                 table: table.clone(),
@@ -608,6 +609,7 @@ fn a_new_exclusion_installs_an_expression_and_a_drop_does_not() {
             name: "no_overlap".into(),
             from,
             to,
+            rehearsal: None,
         })
     };
     assert!(installs_expression(&set(

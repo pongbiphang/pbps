@@ -283,6 +283,7 @@ mod tests {
                 name: "no_dup".into(),
                 from,
                 to,
+                rehearsal: None,
             })
         };
         let planned = |c| ChangeSet {

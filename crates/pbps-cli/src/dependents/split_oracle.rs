@@ -63,6 +63,7 @@ pub(super) fn split_new_tables(
                     name: index,
                     index: Box::new(spec),
                     clustered,
+                    rehearsal: None,
                 }));
             }
         }

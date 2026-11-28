@@ -22,6 +22,7 @@ use pbps_model::TableChange;
 use pbps_model::TablePropertyChange;
 use pbps_model::TypeChange;
 use pbps_model::TypeValueChange;
+use pbps_model::adoption::{AdditionRehearsal, Remark};
 use pbps_model::change::DeleteCause;
 use pbps_model::escape::Escaped;
 use pbps_model::plan_names::{At, Holder, PlanNames};
@@ -1385,7 +1386,10 @@ fn changes_with_remedy(cs: &ChangeSet, remedy: Option<&str>) -> String {
                     .join(", ")
             )
         };
-        out.push_str(&format!("    {}{}\n", describe(&p.change), risks));
+        // Why the loose rule drops an own index, on its step's line
+        // (DEC-1671.3).
+        let loose: String = p.remarks.iter().map(loose_clause).collect();
+        out.push_str(&format!("    {}{loose}{}\n", describe(&p.change), risks));
         if let Some(guard) = &p.drop_guard {
             for line in required_rows(guard) {
                 out.push_str(&format!("      {line}\n"));
@@ -1412,6 +1416,64 @@ fn changes_with_remedy(cs: &ChangeSet, remedy: Option<&str>) -> String {
                 Escaped(&finding.id),
                 finding.message
             ));
+        }
+    }
+    out
+}
+
+/// What the plan says after a step that drops, or adds again, an index one of a
+/// parent's may take.
+fn loose_clause(remark: &Remark) -> String {
+    let Remark::Loose {
+        by,
+        exclusions,
+        new,
+        again,
+        resolver_could_keep,
+    } = remark;
+    format!(
+        ", {lead} the parent's {new}{kind} {by} may take it{hint}",
+        lead = if *again { "built again:" } else { "since" },
+        new = if *new { "new " } else { "" },
+        kind = if *exclusions {
+            "exclusion constraint"
+        } else {
+            "index"
+        },
+        by = by
+            .iter()
+            .map(|name| name.shown().to_string())
+            .collect::<Vec<_>>()
+            .join(" or "),
+        hint = if *resolver_could_keep {
+            " (a resolver can keep it)"
+        } else {
+            ""
+        },
+    )
+}
+
+/// What a parent's new index or exclusion keeps standing of its partitions' own
+/// (DEC-1671.3).
+fn kept_under(rehearsal: Option<&AdditionRehearsal>, kind: &str) -> String {
+    let mut out = String::new();
+    for of in rehearsal.iter().flat_map(|r| &r.partitions) {
+        for (names, as_what) in [
+            (&of.adopted, "as the copy"),
+            (&of.beside, "beside the copy"),
+        ] {
+            for name in names {
+                out.push_str(&format!(
+                    ", {verb} {table}'s {kind} {name} {as_what}",
+                    verb = if as_what == "as the copy" {
+                        "keeping"
+                    } else {
+                        "leaving"
+                    },
+                    table = of.table.shown(),
+                    name = name.shown(),
+                ));
+            }
         }
     }
     out
@@ -2205,8 +2267,15 @@ pub fn describe(c: &Change) -> String {
             format!("- foreign key {name}", name = name.shown(),)
         }
         Change::Constraint(ConstraintChange::SetExclusion {
-            name, to: Some(_), ..
-        }) => format!("+ exclusion constraint {name}", name = name.shown()),
+            name,
+            to: Some(_),
+            rehearsal,
+            ..
+        }) => format!(
+            "+ exclusion constraint {name}{}",
+            kept_under(rehearsal.as_deref(), "exclusion constraint"),
+            name = name.shown()
+        ),
         Change::Constraint(ConstraintChange::SetExclusion { name, to: None, .. }) => {
             format!("- exclusion constraint {name}", name = name.shown())
         }
@@ -2216,8 +2285,14 @@ pub fn describe(c: &Change) -> String {
         Change::Constraint(ConstraintChange::DropCheck { name, .. }) => {
             format!("- check constraint {name}", name = name.shown(),)
         }
-        Change::Index(IndexChange::AddIndex { name, .. }) => {
-            format!("+ index {name}", name = name.shown(),)
+        Change::Index(IndexChange::AddIndex {
+            name, rehearsal, ..
+        }) => {
+            format!(
+                "+ index {name}{}",
+                kept_under(rehearsal.as_deref(), "index"),
+                name = name.shown(),
+            )
         }
         Change::Index(IndexChange::DropIndex { name, .. }) => {
             format!("- index {name}", name = name.shown(),)
@@ -3059,6 +3134,120 @@ mod tests {
             super::describe(&kept),
             "~ attach table app.t to app.ev as a partition, keeping its rows, and its index t_m \
              as the copy of ev_m, and its index t_n as the copy of ev_n"
+        );
+    }
+
+    fn addition_of(record: Option<pbps_model::adoption::AdditionRehearsal>) -> pbps_model::Change {
+        Change::Index(IndexChange::AddIndex {
+            table: "app.p".parse().unwrap(),
+            name: "p_idx".into(),
+            index: Box::new(pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn::column("n")],
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+                filegroup: None,
+            }),
+            clustered: false,
+            rehearsal: record.map(Box::new),
+        })
+    }
+
+    /// The reason is the plan's, carried on the step: an ordinary drop has none
+    /// to say (DEC-1671.3).
+    #[test]
+    fn a_loose_drop_says_why_on_its_line_and_an_ordinary_one_says_nothing() {
+        use pbps_model::adoption::Remark;
+        let drop = || {
+            pbps_model::PlannedChange::new(Change::Index(IndexChange::DropIndex {
+                table: "app.c".parse().unwrap(),
+                name: "c_idx".into(),
+            }))
+        };
+        let said = |remarks: Vec<Remark>| {
+            let mut planned = drop();
+            planned.remarks = remarks;
+            super::changes(&ChangeSet {
+                changes: vec![planned],
+            })
+        };
+        let ordinary = said(Vec::new());
+        assert!(
+            ordinary.contains("- index c_idx  [destructive]\n"),
+            "{ordinary}"
+        );
+        assert!(!ordinary.contains("may take"), "{ordinary}");
+        assert!(!ordinary.contains("rehearsed"), "{ordinary}");
+        let loose = |by: &[&str], exclusions, new, again, resolver_could_keep| Remark::Loose {
+            by: by.iter().map(|n| (*n).into()).collect(),
+            exclusions,
+            new,
+            again,
+            resolver_could_keep,
+        };
+        for (remark, line) in [
+            (
+                loose(&["p_idx"], false, true, true, true),
+                "- index c_idx, built again: the parent's new index p_idx may take it (a resolver \
+                 can keep it)  [destructive]",
+            ),
+            (
+                loose(&["p_idx"], false, false, true, false),
+                "- index c_idx, built again: the parent's index p_idx may take it  [destructive]",
+            ),
+            (
+                loose(&["p_a", "p_b"], false, false, false, true),
+                "- index c_idx, since the parent's index p_a or p_b may take it (a resolver can \
+                 keep it)  [destructive]",
+            ),
+            (
+                loose(&["p_x"], true, true, true, false),
+                "- index c_idx, built again: the parent's new exclusion constraint p_x may take \
+                 it  [destructive]",
+            ),
+        ] {
+            let text = said(vec![remark]);
+            assert!(text.contains(&format!("{line}\n")), "{line}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_parents_addition_says_what_it_keeps_of_its_partitions() {
+        use pbps_model::adoption::{AdditionRehearsal, PartitionOwns};
+        assert_eq!(super::describe(&addition_of(None)), "+ index p_idx");
+        let record = AdditionRehearsal {
+            partitions: vec![PartitionOwns {
+                table: "app.c".parse().unwrap(),
+                own: Vec::new(),
+                adopted: ["c_old".into()].into(),
+                beside: ["c_a".into()].into(),
+            }],
+        };
+        assert_eq!(
+            super::describe(&addition_of(Some(record.clone()))),
+            "+ index p_idx, keeping app.c's index c_old as the copy, leaving app.c's index c_a \
+             beside the copy"
+        );
+        let exclusion = Change::Constraint(ConstraintChange::SetExclusion {
+            table: "app.p".parse().unwrap(),
+            name: "p_x".into(),
+            from: None,
+            to: Some(Box::new(pbps_model::ExclusionConstraint {
+                method: Default::default(),
+                keys: Vec::new(),
+                include: Vec::new(),
+                filter: None,
+                storage_parameters: Default::default(),
+                timing: pbps_model::ExclusionTiming::Immediate,
+            })),
+            rehearsal: Some(Box::new(record)),
+        });
+        assert_eq!(
+            super::describe(&exclusion),
+            "+ exclusion constraint p_x, keeping app.c's exclusion constraint c_old as the copy, \
+             leaving app.c's exclusion constraint c_a beside the copy"
         );
     }
 

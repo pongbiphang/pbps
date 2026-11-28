@@ -36,6 +36,7 @@ fn planned(change: Change) -> PlannedChange {
         strategy: Default::default(),
         findings: Vec::new(),
         provenance: Default::default(),
+        remarks: Vec::new(),
     }
 }
 

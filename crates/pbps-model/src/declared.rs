@@ -1453,6 +1453,7 @@ mod tests {
             name: "ix_expr".into(),
             index: Box::new(expression_index("lower(x)")),
             clustered: false,
+            rehearsal: None,
         })]));
         assert_eq!(
             advanced.expressions.keys[&t()]["ix_expr"][0].as_deref(),
@@ -1932,6 +1933,7 @@ mod tests {
                     name: "no_overlap".into(),
                     from: Some(Box::new(excluded())),
                     to: None,
+                    rehearsal: None,
                 },
             ))],
         };
@@ -1946,6 +1948,7 @@ mod tests {
                     name: "no_overlap".into(),
                     from: None,
                     to: Some(Box::new(excluded())),
+                    rehearsal: None,
                 },
             ))],
         };

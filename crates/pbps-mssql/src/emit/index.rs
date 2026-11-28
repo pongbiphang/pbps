@@ -24,6 +24,7 @@ pub(super) fn emit(change: &Change, index: &IndexChange, strategy: Strategy) -> 
             name,
             index,
             clustered,
+            ..
         } => one(create_index(
             table,
             name.raw(),

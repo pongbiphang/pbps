@@ -1610,6 +1610,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             }));
             p.strategy = Strategy { online };
             p
@@ -1876,6 +1877,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             }))
         };
         let cs = ChangeSet {
@@ -2378,6 +2380,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             })
         };
         let online = Strategy { online: true };
@@ -2525,6 +2528,7 @@ mod tests {
             name: "x".into(),
             from: None,
             to: Some(Box::new(constraint.clone())),
+            rehearsal: None,
         });
         let e = estimate(&add, Strategy::default()).expect("an estimate");
         assert!(matches!(e.lock, Lock::AccessExclusive));
@@ -2535,6 +2539,7 @@ mod tests {
             name: "x".into(),
             from: Some(Box::new(constraint)),
             to: None,
+            rehearsal: None,
         });
         assert!(estimate(&drop, Strategy::default()).is_none());
     }

@@ -5450,6 +5450,7 @@ mod tests {
                     filegroup: None,
                 }),
                 clustered: false,
+                rehearsal: None,
             }),
             Change::Constraint(ConstraintChange::SetPrimaryKey {
                 table: table.clone(),
@@ -6789,6 +6790,7 @@ mod tests {
                         filegroup: None,
                     }),
                     clustered: false,
+                    rehearsal: None,
                 }),
             ),
             (
@@ -7195,6 +7197,7 @@ mod tests {
                 filegroup: None,
             }),
             clustered: false,
+            rehearsal: None,
         });
         let renamed = probes_with(&set(vec![rename, unique]), &partitions);
         assert_eq!(renamed.probes.len(), 1, "{renamed:#?}");

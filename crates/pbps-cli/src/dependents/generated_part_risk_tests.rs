@@ -105,6 +105,7 @@ fn fixture(kind: &str, writer: &str, late: bool) -> SavedPlan {
                 filegroup: None,
             }),
             clustered: false,
+            rehearsal: None,
         }),
         "foreign" => Change::Constraint(ConstraintChange::AddForeignKey {
             table: name.clone(),

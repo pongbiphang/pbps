@@ -150,6 +150,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
             name: format!("{text}ix").into(),
             index: Box::new(index),
             clustered: false,
+            rehearsal: None,
         }),
         Change::Index(IndexChange::DropIndex {
             table: name.clone(),
@@ -459,7 +460,11 @@ where
         .replace(", collation: None, opclass_parameters: {} }", " }")
         .replace(" exclude: {},", "")
         // SQL Server's `filegroup` (#2813), empty on every captured object.
-        .replace(", filegroup: None", "");
+        .replace(", filegroup: None", "")
+        // A parent addition's record (DEC-1671.3), which no captured plan
+        // carries, and what the report says of a step, which no file holds.
+        .replace(", rehearsal: None", "")
+        .replace(", remarks: []", "");
     let outputs = [
         ("schema.json", serde_json::to_string(&schema).unwrap()),
         (

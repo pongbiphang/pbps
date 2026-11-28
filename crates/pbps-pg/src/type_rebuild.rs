@@ -1053,6 +1053,7 @@ mod tests {
                 name: name.into(),
                 from: None,
                 to: None,
+                rehearsal: None,
             })
         };
         let judge = |level: Level, changes: Vec<Change>| {

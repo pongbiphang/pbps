@@ -63,6 +63,7 @@ fn qualified_index_claims_and_constraint_reads_preserve_raw_local_names() {
                 name: format!("ix{RAW}").into(),
                 index: Box::new(index),
                 clustered: false,
+                rehearsal: None,
             })),
         ],
     };

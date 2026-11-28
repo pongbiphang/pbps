@@ -23,6 +23,116 @@
 use super::super::constraints::may_adopt;
 use super::super::exclusions::may_adopt_exclusion;
 use super::super::*;
+use super::rehearsal::taken;
+use pbps_model::ObjectLocalName;
+use pbps_model::adoption::{Remark, adds, unsettles};
+
+/// An own index, key or exclusion the loose rule drops because one of the
+/// parent's may take it (DEC-1671.1): what the pass that pushes the drop knows
+/// of it, for the plan to say (DEC-1671.3).
+pub(in super::super) struct Loose {
+    drop: Change,
+    table: TableName,
+    /// None only for a primary key the base holds no name for.
+    name: Option<ObjectLocalName>,
+    /// The parent's that may take it.
+    by: Vec<ObjectLocalName>,
+    /// `by` names exclusion constraints.
+    exclusions: bool,
+    /// The parent's are ones this plan adds.
+    new: bool,
+    /// The declarations keep it, and the plan adds it again.
+    again: bool,
+}
+
+impl Loose {
+    /// For `drop` ahead of an attach. `declared` says whether the declarations
+    /// keep what it drops as it stood, and is `None` where they do not hold it,
+    /// as no partition holds a key. `None` is returned where they declare it
+    /// otherwise: that drop is the redefinition's and not the parent's.
+    pub(in super::super) fn attached(
+        drop: &Change,
+        table: &TableName,
+        name: Option<&ObjectLocalName>,
+        by: &[ObjectLocalName],
+        exclusions: bool,
+        declared: Option<bool>,
+    ) -> Option<Self> {
+        (declared != Some(false)).then(|| Loose {
+            drop: drop.clone(),
+            table: table.clone(),
+            name: name.cloned(),
+            by: by.to_vec(),
+            exclusions,
+            new: false,
+            again: declared.is_some(),
+        })
+    }
+}
+
+/// Says on the plan's steps why each own the loose rule drops is dropped: on the
+/// drop, and on the add after it. `base` is the side as the caller gave it, as
+/// a rehearsal's question is asked of it.
+///
+/// A resolver is offered only where it could keep the own and none was asked
+/// about the table: under a name the declarations give to nothing, in a plan the
+/// attach's question is asked of (DEC-1671.2). None is offered under a parent's
+/// new index, which no rehearsal answers for yet.
+pub(in super::super) fn say_why(
+    base: Side<'_>,
+    declared: &Schema,
+    hints: &Hints,
+    loose: &[Loose],
+    planned: &mut [PlannedChange],
+) {
+    for own in loose {
+        let attach = planned.iter().find_map(|p| {
+            if let Change::Partition(PartitionChange::AttachPartition {
+                uid, table, parent, ..
+            }) = &p.change
+                && *table == own.table
+            {
+                Some((uid, parent))
+            } else {
+                None
+            }
+        });
+        let askable = attach.is_some_and(|(uid, parent)| {
+            let reshaped = match (base.schema.tables.get(parent), declared.tables.get(parent)) {
+                (Some(was), Some(now)) => parent_shape_changes(was, now),
+                _ => true,
+            };
+            // A rehearsal could not leave out a key it has no name for.
+            let unnamed = planned.iter().any(|p| {
+                matches!(&p.change, Change::Constraint(ConstraintChange::SetPrimaryKey {
+                    table, from: Some(key), to: None, ..
+                }) if *table == own.table && key.name.is_none())
+            });
+            !reshaped
+                && !unnamed
+                && !hints.attach_rehearsals.iter().any(|a| a.uid == *uid)
+                && !planned.iter().any(|p| unsettles(&p.change))
+        });
+        let remark = Remark::Loose {
+            by: own.by.clone(),
+            exclusions: own.exclusions,
+            new: own.new,
+            again: own.again,
+            resolver_could_keep: askable
+                && own
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| !taken(declared, &own.table, name)),
+        };
+        for p in planned.iter_mut() {
+            let added =
+                own.again && own.name.is_some() && adds(&p.change, &own.table) == own.name.as_ref();
+            if added || p.change == own.drop {
+                p.remarks.push(remark.clone());
+            }
+        }
+    }
+}
 
 /// A partition standing under a parent that gains a part, on both sides of the
 /// plan.
@@ -115,7 +225,7 @@ pub(super) fn referencing_key<'a>(
 }
 
 /// Every standing partition's own index that a parent's new index might take,
-/// dropped and added again as declared. One the plan already drops, to remove or
+/// dropped and added again as declared, and marked as dropped for that. One the plan already drops, to remove or
 /// redefine it, is left as the plan has it, and one the declarations no longer
 /// hold is among those. One a foreign key references is left standing
 /// ([`referencing_key`]).
@@ -128,12 +238,16 @@ pub(in super::super) fn rebuild_adoptable_indexes(
     renames: &Renames,
     dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
+    loose: &mut Vec<Loose>,
 ) {
-    let mut added: BTreeMap<&TableName, Vec<&Index>> = BTreeMap::new();
+    let mut added: BTreeMap<&TableName, Vec<(&ObjectLocalName, &Index)>> = BTreeMap::new();
     let mut dropped = BTreeSet::new();
     for change in changes.iter() {
-        if let Change::Index(IndexChange::AddIndex { table, index, .. }) = change {
-            added.entry(table).or_default().push(index);
+        if let Change::Index(IndexChange::AddIndex {
+            table, name, index, ..
+        }) = change
+        {
+            added.entry(table).or_default().push((name, index));
         } else if let Change::Index(IndexChange::DropIndex { table, name }) = change {
             dropped.insert((table, name));
         }
@@ -144,24 +258,38 @@ pub(in super::super) fn rebuild_adoptable_indexes(
             let Some(index) = partition.now.indexes.get(name) else {
                 continue;
             };
+            let by: Vec<_> = partition
+                .parents
+                .iter()
+                .filter(|(_, p)| may_adopt(p, held, dialect))
+                .map(|(parent, _)| (*parent).clone())
+                .collect();
             if dropped.contains(&(partition.name, name))
-                || !partition
-                    .parents
-                    .iter()
-                    .any(|p| may_adopt(p, held, dialect))
+                || by.is_empty()
                 || referencing_key(declared.schema, partition.name, index).is_some()
             {
                 continue;
             }
-            rebuilt.push(Change::Index(IndexChange::DropIndex {
+            let drop = Change::Index(IndexChange::DropIndex {
                 table: partition.name.clone(),
                 name: name.clone(),
-            }));
+            });
+            loose.push(Loose {
+                drop: drop.clone(),
+                table: partition.name.clone(),
+                name: Some(name.clone()),
+                by,
+                exclusions: false,
+                new: true,
+                again: true,
+            });
+            rebuilt.push(drop);
             rebuilt.push(Change::Index(IndexChange::AddIndex {
                 table: partition.name.clone(),
                 name: name.clone(),
                 index: Box::new(index.clone()),
                 clustered: partition.now.index_is_clustered(name.raw()),
+                rehearsal: None,
             }));
         }
     }
@@ -181,8 +309,10 @@ pub(in super::super) fn rebuild_adoptable_exclusions(
     renames: &Renames,
     dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
+    loose: &mut Vec<Loose>,
 ) {
-    let mut added: BTreeMap<&TableName, Vec<&pbps_model::ExclusionConstraint>> = BTreeMap::new();
+    let mut added: BTreeMap<&TableName, Vec<(&ObjectLocalName, &pbps_model::ExclusionConstraint)>> =
+        BTreeMap::new();
     let mut dropped = BTreeSet::new();
     for change in changes.iter() {
         if let Change::Constraint(ConstraintChange::SetExclusion {
@@ -190,12 +320,13 @@ pub(in super::super) fn rebuild_adoptable_exclusions(
             name,
             from,
             to,
+            ..
         }) = change
         {
             if from.is_some() {
                 dropped.insert((table, name));
             } else if let Some(to) = to {
-                added.entry(table).or_default().push(to);
+                added.entry(table).or_default().push((name, to));
             }
         }
     }
@@ -205,26 +336,41 @@ pub(in super::super) fn rebuild_adoptable_exclusions(
             let Some(exclusion) = partition.now.exclude.get(name) else {
                 continue;
             };
-            if dropped.contains(&(partition.name, name))
-                || !partition
-                    .parents
-                    .iter()
-                    .any(|p| may_adopt_exclusion(p, held, dialect))
-            {
+            let by: Vec<_> = partition
+                .parents
+                .iter()
+                .filter(|(_, p)| may_adopt_exclusion(p, held, dialect))
+                .map(|(parent, _)| (*parent).clone())
+                .collect();
+            if dropped.contains(&(partition.name, name)) || by.is_empty() {
                 continue;
             }
-            for (from, to) in [
-                (Some(Box::new(held.clone())), None),
-                (None, Some(Box::new(exclusion.clone()))),
-            ] {
-                rebuilt.push(Change::Constraint(ConstraintChange::SetExclusion {
+            let part = |from, to| {
+                Change::Constraint(ConstraintChange::SetExclusion {
                     table: partition.name.clone(),
                     name: name.clone(),
                     from,
                     to,
-                }));
-            }
+                    rehearsal: None,
+                })
+            };
+            let drop = part(Some(Box::new(held.clone())), None);
+            loose.push(Loose {
+                drop: drop.clone(),
+                table: partition.name.clone(),
+                name: Some(name.clone()),
+                by,
+                exclusions: true,
+                new: true,
+                again: true,
+            });
+            rebuilt.push(drop);
+            rebuilt.push(part(None, Some(Box::new(exclusion.clone()))));
         }
     }
     changes.extend(rebuilt);
 }
+
+#[cfg(test)]
+#[allow(clippy::wildcard_enum_match_arm)]
+mod tests;

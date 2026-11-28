@@ -50,6 +50,9 @@ pub(super) struct TableFacts<'a> {
     /// The base tables that hold an exclusion, as this plan's renames leave
     /// them: the exclusion hazards read them.
     pub(super) standing: BTreeMap<TableName, Table>,
+    /// The own indexes, keys and exclusions an attach drops because a parent's
+    /// might take them: the plan says why (DEC-1671.3).
+    pub(super) loose: Vec<Loose>,
 }
 
 /// The tables phase of `diff_partial_rebuilding`: the tables only the base
@@ -226,6 +229,7 @@ pub(super) fn diff_tables<'a>(
                     name: exclusion,
                     from: None,
                     to: Some(Box::new(constraint)),
+                    rehearsal: None,
                 }));
             }
         }
@@ -235,6 +239,7 @@ pub(super) fn diff_tables<'a>(
     // compared.
     let renames = renames_of(base, declared);
     let mut standing: BTreeMap<TableName, Table> = BTreeMap::new();
+    let mut loose = Vec::new();
     for (name, table) in &declared.schema.tables {
         if table.unlogged {
             continue;
@@ -287,6 +292,7 @@ pub(super) fn diff_tables<'a>(
             uid,
             declared_name,
             &mut standing,
+            &mut loose,
             &mut changes,
             &mut errs,
         );
@@ -296,6 +302,7 @@ pub(super) fn diff_tables<'a>(
             index,
             renames,
             standing,
+            loose,
         },
         changes,
         errs,
@@ -327,6 +334,7 @@ fn diff_surviving_table<D: Dialect + ?Sized>(
     uid: &Uid,
     declared_name: &TableName,
     standing: &mut BTreeMap<TableName, Table>,
+    loose: &mut Vec<Loose>,
     mut changes: &mut Vec<Change>,
     mut errs: &mut Vec<DiffError>,
 ) {
@@ -496,6 +504,7 @@ fn diff_surviving_table<D: Dialect + ?Sized>(
                 displaced,
                 exclusions,
                 released,
+                by,
             }) => {
                 // Its own exclusions' retirements, as the base held them: asked
                 // of the table's original definition, as for a standing table
@@ -506,33 +515,71 @@ fn diff_surviving_table<D: Dialect + ?Sized>(
                         .get(key)
                         .is_some_and(|held| declared.ids.exclusion_retired(uid, key, held))
                 };
-                changes.extend(released);
+                // Each drop the parent's might take is marked as it is pushed,
+                // for the plan to say why (DEC-1671.3).
+                let mut mark = |drop: &Change,
+                                name: Option<&pbps_model::ObjectLocalName>,
+                                exclusions: bool,
+                                kept: Option<bool>| {
+                    if let Some(by) = by.get(&name.cloned()) {
+                        loose.extend(Loose::attached(
+                            drop,
+                            declared_name,
+                            name,
+                            by,
+                            exclusions,
+                            kept,
+                        ));
+                    }
+                };
+                for change in released {
+                    if let Change::Constraint(ConstraintChange::DropUnique { name, .. }) = &change {
+                        mark(&change, Some(name), false, None);
+                    } else if let Change::Constraint(ConstraintChange::SetPrimaryKey {
+                        from: Some(key),
+                        ..
+                    }) = &change
+                    {
+                        mark(&change, key.name.as_ref(), false, None);
+                    }
+                    changes.push(change);
+                }
+                let held = renames.apply(base_table, base_name);
                 // Gone before the attach, so the engine adopts at most the
                 // certain index left for one of its parent's and builds the
                 // rest; one the declaration keeps as its own is added after.
                 for name in displaced {
-                    changes.push(Change::Index(IndexChange::DropIndex {
+                    let kept = declared_table
+                        .indexes
+                        .get(&name)
+                        .map(|now| held.indexes.get(&name) == Some(now));
+                    let drop = Change::Index(IndexChange::DropIndex {
                         table: declared_name.clone(),
-                        name,
-                    }));
+                        name: name.clone(),
+                    });
+                    mark(&drop, Some(&name), false, kept);
+                    changes.push(drop);
                 }
                 // The same for an exclusion the parent's might take
                 // (DEC-1671.1). One the declarations keep is added back after
                 // the attach by `diff_exclusions` below, as one they retire is
                 // dropped here; any other is left on the attached table, so that
                 // same pass refuses the drop for want of a recorded reason.
-                let held = renames.apply(base_table, base_name);
                 for name in exclusions {
                     let Some(own) = held.exclude.get(&name) else {
                         continue;
                     };
                     if declared_table.exclude.contains_key(&name) || retired(&name) {
-                        changes.push(Change::Constraint(ConstraintChange::SetExclusion {
+                        let kept = declared_table.exclude.get(&name).map(|now| now == own);
+                        let drop = Change::Constraint(ConstraintChange::SetExclusion {
                             table: declared_name.clone(),
-                            name,
+                            name: name.clone(),
                             from: Some(Box::new(own.clone())),
                             to: None,
-                        }));
+                            rehearsal: None,
+                        });
+                        mark(&drop, Some(&name), true, kept);
+                        changes.push(drop);
                     } else if let Some(own) = base_table.exclude.get(&name) {
                         table.exclude.insert(name, own.clone());
                     }

@@ -26,6 +26,7 @@ fn index(unique: bool, filtered: bool) -> Change {
             filegroup: None,
         }),
         clustered: false,
+        rehearsal: None,
     })
 }
 
