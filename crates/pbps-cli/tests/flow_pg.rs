@@ -156,6 +156,12 @@ mod rebuild_members;
 #[path = "support/conversions2331.rs"]
 mod conversions2331;
 
+#[path = "support/rebinding2987.rs"]
+mod rebinding2987;
+on_both_servers! {
+    a_mention_the_engine_did_not_bind_is_not_rebuilt => |pg| rebinding2987::a_mention_the_engine_did_not_bind_is_not_rebuilt(&pg.url()),
+}
+
 #[path = "support/existing_expressions2563.rs"]
 mod existing_expressions2563;
 #[path = "support/table_expressions2563.rs"]

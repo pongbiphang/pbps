@@ -1112,6 +1112,12 @@ pub struct Hints {
     /// the swap, as a trigger whose table changes hands does (DEC-1635.7).
     pub enum_dependents: std::collections::BTreeSet<crate::ModuleId>,
 
+    /// Unchanged modules a connected plan proved its arrivals cannot rebind,
+    /// from the dependencies the engine recorded when it created them
+    /// (DEC-2987.5). The differ leaves these out of the rebuilds a dialect
+    /// asks for by text. Absent offline, where the text is all there is.
+    pub rebinding_proven: std::collections::BTreeSet<crate::ModuleId>,
+
     /// The packages each declared-but-absent extension's control file requires,
     /// read from the target's package catalog at plan time. A fact about the
     /// target, absent offline: it is what lets a create wait for the prerequisite

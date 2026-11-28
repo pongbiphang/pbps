@@ -554,8 +554,10 @@ pub(crate) trait PlanSession: Features {
 
     /// Reads connected catalog dependency facts for the lightweight binding
     /// assessment (DEC-2987.1). `Ok(None)` means this engine supplies no facts,
-    /// keeping the plan-level answer (DEC-1515.1). Called only when a resolver
-    /// is selected and [`pbps_diff::resolver::needed_facts`] returns `Some`.
+    /// keeping the plan-level answer (DEC-1515.1) and every candidate rebuild
+    /// (DEC-2987.5). Called only when
+    /// [`pbps_diff::resolver::needed_facts`] returns `Some`, for a plan a
+    /// selected resolver assesses or one whose candidate rebuilds are narrowed.
     async fn dependency_facts(
         &self,
         _conn: &mut Conn,
