@@ -10699,8 +10699,11 @@ take it says so on its step, and on the add after it where the declarations keep
 it: `- index c_idx, built again: the parent's new index p_idx may take it`, or
 `, since the parent's index p may take it` for one dropped for good. The pass
 that pushes the drop marks it, with the parent's that may take it, so nothing is
-derived again from the plan. A drop the declarations ask for, a redefinition
-included, says nothing. The words travel on the planned change and are not
+derived again from the plan. One the declarations no longer hold is such a
+drop too, and is the one a resolver may keep (below): the parent's might take it
+before the attach, so the loose rule drops it there, whatever else asks for it.
+A redefinition's drop, which the declarations ask for whatever the parents hold,
+says nothing, nor does any drop of an own no parent's may take. The words travel on the planned change and are not
 sealed, as a step's provenance is not (DEC-1958.3): a plan read back from its
 file has none, and `--format json` does not carry them.
 
