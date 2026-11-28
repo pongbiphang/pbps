@@ -8,8 +8,8 @@
 //! function over a built-in, a relation arriving on a type's name, a column
 //! arriving, an overload, the forms that record no edge, an inherited, a
 //! partitioned and a typed table, the array type of an arriving table, an
-//! owned sequence carried across schemas, a routine header) stands beside a
-//! neighbour proven unaffected.
+//! engine-named relation, colliding unnamed primary keys, an owned sequence
+//! carried across schemas, a routine header) stands beside a neighbour.
 
 use std::collections::BTreeMap;
 
@@ -19,7 +19,8 @@ use pbps_model::resolver::Surface;
 use pbps_model::{
     Change, ChangeSet, CheckConstraint, Column, ColumnChange, IdsFile, Index, IndexColumn,
     IndexKey, ManagedType, Module, ModuleChange, ModuleId, ModuleKind, OwnedSequence,
-    PlannedChange, Schema, Table, TableChange, TableName, TypeChange, Uid, UidKind, ValueSource,
+    PlannedChange, PrimaryKey, Schema, Table, TableChange, TableName, TypeChange, Uid, UidKind,
+    ValueSource,
 };
 use pbps_pg::Postgres;
 
@@ -1743,7 +1744,297 @@ fn corpus() -> Vec<Case> {
         });
     }
 
-    // 17. Owned sequence + table moved across schemas (`ALTER TABLE app.t SET SCHEMA early`).
+    // 17a. Arriving table with unnamed primary key and identity column whose
+    //      predicted first-choice names are free.
+    {
+        let mut base = Schema::default();
+        base.tables.insert(
+            "late.other".parse().unwrap(),
+            plain_table(&[("id", "integer")]),
+        );
+        base.modules.insert(
+            "app.v_pk_ref".parse().unwrap(),
+            view_mod("SELECT 'fresh_pkey'::regclass AS r"),
+        );
+        base.modules.insert(
+            "app.v_other".parse().unwrap(),
+            view_mod("SELECT id FROM late.other"),
+        );
+        let mut arriving = Table::default();
+        let mut id_col = Column::new("integer".parse().unwrap());
+        id_col.nullable = false;
+        id_col.value_source = ValueSource::Identity(pbps_model::Identity::new(1, 1));
+        arriving.columns.insert("id".into(), id_col);
+        arriving.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        let mut desired = base.clone();
+        desired
+            .tables
+            .insert("early.fresh".parse().unwrap(), arriving.clone());
+        cases.push(Case {
+            name: "engine_named_free",
+            min_version: 0,
+            search_path: "early, late, app, public",
+            setup_sql: vec![
+                "CREATE SCHEMA early; CREATE SCHEMA late; CREATE SCHEMA app;".into(),
+                "CREATE TABLE late.fresh_pkey (id int); CREATE TABLE late.other (id int);".into(),
+                "CREATE VIEW app.v_pk_ref AS SELECT 'fresh_pkey'::regclass AS r;".into(),
+                "CREATE VIEW app.v_other AS SELECT id FROM late.other;".into(),
+            ],
+            base,
+            desired,
+            changes: vec![Change::Table(TableChange::CreateTable {
+                uid: Uid::generate(UidKind::Table),
+                name: "early.fresh".parse().unwrap(),
+                table: Box::new(arriving),
+                beside_default: None,
+                moves_at_most: None,
+            })],
+            change_sql: vec![
+                "CREATE TABLE early.fresh (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY);"
+                    .into(),
+            ],
+            tracked: vec![
+                TrackedSurface::kept_same(
+                    mod_surface("app.v_pk_ref"),
+                    "DROP VIEW app.v_pk_ref",
+                    "CREATE VIEW app.v_pk_ref AS SELECT 'fresh_pkey'::regclass AS r",
+                    Expect::Resolve,
+                ),
+                TrackedSurface::kept_same(
+                    mod_surface("app.v_other"),
+                    "DROP VIEW app.v_other",
+                    "CREATE VIEW app.v_other AS SELECT id FROM late.other",
+                    Expect::UnaffectedByDep,
+                ),
+            ],
+        });
+    }
+
+    // 17b. Predicted first-choice name held: `early.fresh_pkey` already exists,
+    //      so the engine chooses `early.fresh_pkey1` and the plan is not narrowed.
+    {
+        let mut base = Schema::default();
+        base.tables.insert(
+            "late.other".parse().unwrap(),
+            plain_table(&[("id", "integer")]),
+        );
+        base.modules.insert(
+            "app.v_pk1_ref".parse().unwrap(),
+            view_mod("SELECT 'fresh_pkey1'::regclass AS r"),
+        );
+        base.modules.insert(
+            "app.v_other".parse().unwrap(),
+            view_mod("SELECT id FROM late.other"),
+        );
+        let mut arriving = plain_table(&[("id", "integer")]);
+        arriving.columns.get_mut("id").unwrap().nullable = false;
+        arriving.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        let mut desired = base.clone();
+        desired
+            .tables
+            .insert("early.fresh".parse().unwrap(), arriving.clone());
+        cases.push(Case {
+            name: "engine_named_held",
+            min_version: 0,
+            search_path: "early, late, app, public",
+            setup_sql: vec![
+                "CREATE SCHEMA early; CREATE SCHEMA late; CREATE SCHEMA app;".into(),
+                "CREATE TABLE early.fresh_pkey (id int);".into(),
+                "CREATE TABLE late.fresh_pkey1 (id int); CREATE TABLE late.other (id int);".into(),
+                "CREATE VIEW app.v_pk1_ref AS SELECT 'fresh_pkey1'::regclass AS r;".into(),
+                "CREATE VIEW app.v_other AS SELECT id FROM late.other;".into(),
+            ],
+            base,
+            desired,
+            changes: vec![Change::Table(TableChange::CreateTable {
+                uid: Uid::generate(UidKind::Table),
+                name: "early.fresh".parse().unwrap(),
+                table: Box::new(arriving),
+                beside_default: None,
+                moves_at_most: None,
+            })],
+            change_sql: vec!["CREATE TABLE early.fresh (id int PRIMARY KEY);".into()],
+            tracked: vec![
+                TrackedSurface::kept_same(
+                    mod_surface("app.v_pk1_ref"),
+                    "DROP VIEW app.v_pk1_ref",
+                    "CREATE VIEW app.v_pk1_ref AS SELECT 'fresh_pkey1'::regclass AS r",
+                    Expect::Resolve,
+                ),
+                TrackedSurface::kept_same(
+                    mod_surface("app.v_other"),
+                    "DROP VIEW app.v_other",
+                    "CREATE VIEW app.v_other AS SELECT id FROM late.other",
+                    Expect::Resolve,
+                ),
+            ],
+        });
+    }
+
+    // 17c. Existing engine-named relations carrying suffixes (`t_pkey1`,
+    //      `t_id_seq1`) because their first choices were taken: actual catalog
+    //      names are read so the reader of `t_id_seq1` stays `Resolve` while
+    //      the unrelated neighbour is proven unaffected.
+    {
+        let mut base = Schema::default();
+        let mut tbl = Table::default();
+        let mut id_col = Column::new("integer".parse().unwrap());
+        id_col.nullable = false;
+        id_col.value_source = ValueSource::Identity(pbps_model::Identity::new(1, 1));
+        tbl.columns.insert("id".into(), id_col);
+        tbl.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        base.tables.insert("app.t".parse().unwrap(), tbl);
+        base.tables
+            .insert("app.u".parse().unwrap(), plain_table(&[("id", "integer")]));
+        base.modules.insert(
+            "app.v_seq1".parse().unwrap(),
+            view_mod("SELECT 't_id_seq1'::regclass AS r"),
+        );
+        base.modules
+            .insert("app.v_u".parse().unwrap(), view_mod("SELECT id FROM app.u"));
+        let mut desired = base.clone();
+        desired.tables.remove(&"app.t".parse().unwrap());
+        cases.push(Case {
+            name: "touched_suffixed_engine_named",
+            min_version: 0,
+            search_path: "app, late, public",
+            setup_sql: vec![
+                "CREATE SCHEMA app; CREATE SCHEMA late;".into(),
+                "CREATE TABLE app.t_pkey (id int); CREATE SEQUENCE app.t_id_seq;".into(),
+                "CREATE TABLE app.t (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY);".into(),
+                "CREATE TABLE app.u (id int);".into(),
+                "CREATE SEQUENCE late.t_id_seq1;".into(),
+                "CREATE VIEW app.v_seq1 AS SELECT 't_id_seq1'::regclass AS r;".into(),
+                "CREATE VIEW app.v_u AS SELECT id FROM app.u;".into(),
+            ],
+            base,
+            desired,
+            changes: vec![Change::Table(TableChange::DropTable {
+                uid: Uid::generate(UidKind::Table),
+                name: "app.t".parse().unwrap(),
+                detach_from: None,
+            })],
+            change_sql: vec!["DROP TABLE app.t CASCADE;".into()],
+            tracked: vec![
+                TrackedSurface::kept_same(
+                    mod_surface("app.v_seq1"),
+                    "DROP VIEW IF EXISTS app.v_seq1",
+                    "CREATE VIEW app.v_seq1 AS SELECT 't_id_seq1'::regclass AS r",
+                    Expect::Resolve,
+                ),
+                TrackedSurface::kept_same(
+                    mod_surface("app.v_u"),
+                    "DROP VIEW app.v_u",
+                    "CREATE VIEW app.v_u AS SELECT id FROM app.u",
+                    Expect::UnaffectedByDep,
+                ),
+            ],
+        });
+    }
+
+    // 17d. Two 60-byte tables of one plan whose array types stay distinct
+    //      (61 bytes) while their unnamed primary keys clip to the same
+    //      63-byte first choice: the second takes a fallback (`_pkey1`), so
+    //      the collision keeps the plan-level answer.
+    {
+        let t1_name = format!("{}_1", "a".repeat(58));
+        let t2_name = format!("{}_2", "a".repeat(58));
+        let fallback_pk = format!("{}_pkey1", "a".repeat(57));
+        let mut base = Schema::default();
+        base.tables.insert(
+            "late.other".parse().unwrap(),
+            plain_table(&[("id", "integer")]),
+        );
+        base.modules.insert(
+            "app.v_pk_fallback".parse().unwrap(),
+            view_mod(&format!("SELECT '{fallback_pk}'::regclass AS r")),
+        );
+        base.modules.insert(
+            "app.v_other".parse().unwrap(),
+            view_mod("SELECT id FROM late.other"),
+        );
+        let mut arriving = plain_table(&[("id", "integer")]);
+        arriving.columns.get_mut("id").unwrap().nullable = false;
+        arriving.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        let mut desired = base.clone();
+        let t1_tbl: TableName = format!("early.{t1_name}").parse().unwrap();
+        let t2_tbl: TableName = format!("early.{t2_name}").parse().unwrap();
+        desired.tables.insert(t1_tbl.clone(), arriving.clone());
+        desired.tables.insert(t2_tbl.clone(), arriving.clone());
+        cases.push(Case {
+            name: "colliding_unnamed_primary_keys",
+            min_version: 0,
+            search_path: "early, late, app, public",
+            setup_sql: vec![
+                "CREATE SCHEMA early; CREATE SCHEMA late; CREATE SCHEMA app;".into(),
+                format!(
+                    "CREATE TABLE late.{fallback_pk} (id int); CREATE TABLE late.other (id int);"
+                ),
+                format!("CREATE VIEW app.v_pk_fallback AS SELECT '{fallback_pk}'::regclass AS r;"),
+                "CREATE VIEW app.v_other AS SELECT id FROM late.other;".into(),
+            ],
+            base,
+            desired,
+            changes: vec![
+                Change::Table(TableChange::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: t1_tbl,
+                    table: Box::new(arriving.clone()),
+                    beside_default: None,
+                    moves_at_most: None,
+                }),
+                Change::Table(TableChange::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: t2_tbl,
+                    table: Box::new(arriving),
+                    beside_default: None,
+                    moves_at_most: None,
+                }),
+            ],
+            change_sql: vec![
+                format!("CREATE TABLE early.{t1_name} (id int PRIMARY KEY);"),
+                format!("CREATE TABLE early.{t2_name} (id int PRIMARY KEY);"),
+            ],
+            tracked: vec![
+                TrackedSurface::kept_same(
+                    mod_surface("app.v_pk_fallback"),
+                    "DROP VIEW app.v_pk_fallback",
+                    format!(
+                        "CREATE VIEW app.v_pk_fallback AS SELECT '{fallback_pk}'::regclass AS r"
+                    ),
+                    Expect::Resolve,
+                ),
+                TrackedSurface::kept_same(
+                    mod_surface("app.v_other"),
+                    "DROP VIEW app.v_other",
+                    "CREATE VIEW app.v_other AS SELECT id FROM late.other",
+                    Expect::Resolve,
+                ),
+            ],
+        });
+    }
+
+    // 18. Owned sequence + table moved across schemas (`ALTER TABLE app.t SET SCHEMA early`).
     {
         let mut base = Schema::default();
         let mut tbl = plain_table(&[("id", "integer")]);
@@ -1804,7 +2095,7 @@ fn corpus() -> Vec<Case> {
         });
     }
 
-    // 18. Unparsed routine with a parameter default calling a function whose overload arrives.
+    // 19. Unparsed routine with a parameter default calling a function whose overload arrives.
     {
         let mut base = Schema::default();
         base.tables
@@ -1944,7 +2235,8 @@ async fn run_case_on(
 
     let pg = Postgres::new();
     let base_ids = resolve_ids(&case.base, &IdsFile::default(), &[]);
-    // A table the case renames keeps its identity, as a recorded rename does.
+    // A table the case renames keeps its identity, as a recorded rename
+    // does; one it drops is dropped on purpose, as a recorded drop is.
     let intents: Vec<pbps_model::Intent> = case
         .changes
         .iter()
@@ -1953,6 +2245,11 @@ async fn run_case_on(
                 Some(pbps_model::Intent::RenameTable {
                     from: from.clone(),
                     to: to.clone(),
+                })
+            } else if let Change::Table(TableChange::DropTable { name, .. }) = change {
+                Some(pbps_model::Intent::DropTable {
+                    table: name.clone(),
+                    reason: pbps_model::Reason::new("the case drops it").unwrap(),
                 })
             } else {
                 None

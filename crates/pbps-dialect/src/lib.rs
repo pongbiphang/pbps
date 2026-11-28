@@ -3356,6 +3356,19 @@ pub trait Dialect {
         sequence.name.clone()
     }
 
+    /// First-choice catalog name this engine generates for an unnamed primary
+    /// key's backing index on `table`, when index names share the relation
+    /// namespace. `None` on engines where no name is chosen there.
+    fn unnamed_primary_key_name(&self, _table: &TableName) -> Option<String> {
+        None
+    }
+
+    /// First-choice catalog name this engine generates for an identity column's
+    /// sequence on `table.column`, when sequences share the relation namespace.
+    fn identity_sequence_name(&self, _table: &TableName, _column: &str) -> Option<String> {
+        None
+    }
+
     /// First-choice companion type names this engine creates alongside an
     /// arriving relation or type (for example a row/element type's array type).
     /// Empty on engines that create no companion type.

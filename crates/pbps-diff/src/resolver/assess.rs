@@ -8,8 +8,8 @@ use super::prepare::{forward, invalidates, surfaces};
 use pbps_model::module::Lexis;
 use pbps_model::part_effects::PartEffect;
 use pbps_model::resolver::{
-    Ancestor, CatalogName, DependencyEdge, DependencyFacts, NameAvailability, ReadFact, Surface,
-    SurfaceDependencies,
+    Ancestor, CandidateName, CatalogName, DependencyEdge, DependencyFacts, EngineNamedRelation,
+    NameAvailability, NameSlotKind, ReadFact, Surface, SurfaceDependencies,
 };
 use pbps_model::{
     Change, ChangeSet, ColumnChange, ConstraintChange, ExtensionChange, GrantChange, GrantTarget,
@@ -118,11 +118,17 @@ pub struct FactsNeeded {
     /// nor answered without facts.
     pub surfaces: BTreeSet<Surface>,
     /// Unqualified names arriving in the plan to test against the system
-    /// catalog (including first-choice companion type names).
+    /// catalog (including first-choice names of arriving engine-named
+    /// relations and companion types).
     pub arriving_names: BTreeSet<String>,
-    /// First-choice companion type names for arriving relations and types,
-    /// each to be checked free in its schema.
-    pub arriving_companion_types: BTreeSet<ObjectName>,
+    /// Touched engine-named relations whose actual catalog names must be read.
+    /// The boolean is `true` when the owning table moves across schemas, so
+    /// the actual relation name also arrives in the destination schema and
+    /// must be checked against the system catalog.
+    pub touched_engine_named: BTreeMap<EngineNamedRelation, bool>,
+    /// Candidate first-choice names for arriving engine-named relations and
+    /// companion types, each to be checked free in its schema.
+    pub arriving_candidates: BTreeSet<CandidateName>,
 }
 
 /// What connected catalog facts [`assess_with_facts`] would consume for
@@ -153,7 +159,13 @@ pub fn needed_facts(
         Some(FactsNeeded {
             surfaces,
             arriving_names: classified.effects.arriving_names,
-            arriving_companion_types: classified.effects.arriving_companion_types,
+            touched_engine_named: classified
+                .effects
+                .touched_engine_named
+                .into_iter()
+                .map(|(k, dest)| (k, dest.is_some()))
+                .collect(),
+            arriving_candidates: classified.effects.arriving_candidates,
         })
     })
 }
@@ -165,8 +177,8 @@ pub fn needed_facts(
 /// these hold; anything else, and anything unreadable, stays a question:
 ///
 /// - the plan is of no class the facts do not describe (partitions, a type
-///   rebuild, a package, a computed column, a schema's visibility, a name the
-///   engine chooses);
+///   rebuild, a package, a computed column, a schema's visibility, an unknown
+///   engine-chosen name);
 /// - none of its recorded edges points at an object the plan touches, a
 ///   column of one, or a descendant of one;
 /// - no arriving name is the name of anything it has an edge on, nor one the
@@ -201,8 +213,32 @@ fn with_dialect<R>(
         bare_rank: &pbps_model::module::every_schema,
     };
     let normalize = |definition: &str| dialect.normalize_definition(definition);
-    let chooses_a_name =
-        |name: &TableName, table: &Table| !dialect.implicit_relation_names(name, table).is_empty();
+    // By name, not by count: a relation of another kind must not stand in
+    // for one of these.
+    let extra_implicit_relations = |name: &TableName, table: &Table| {
+        let unnamed_key = table
+            .primary_key
+            .as_ref()
+            .filter(|pk| pk.name.is_none())
+            .and_then(|_| dialect.unnamed_primary_key_name(name));
+        let handled: BTreeSet<String> = table
+            .columns
+            .iter()
+            .filter(|(_, c)| matches!(c.value_source, ValueSource::Identity(_)))
+            .filter_map(|(column, _)| dialect.identity_sequence_name(name, column.raw()))
+            .chain(unnamed_key)
+            .collect();
+        dialect
+            .implicit_relation_names(name, table)
+            .iter()
+            .any(|implicit| !handled.contains(&implicit.name))
+    };
+    let unnamed_pk_name = |table: &TableName| dialect.unnamed_primary_key_name(table);
+    let identity_seq_name =
+        |table: &TableName, col: &str| dialect.identity_sequence_name(table, col);
+    let owned_seq_name = |table: &TableName, col: &str, seq: &OwnedSequence| {
+        dialect.owned_sequence_name(table, col, seq)
+    };
     let companion_types = |name: &ObjectName| dialect.companion_type_names(name);
     let engine = Engine {
         indexes_are_relations: dialect.indexes_share_namespace_with_tables(),
@@ -211,7 +247,10 @@ fn with_dialect<R>(
     };
     let hooks = Hooks {
         lexis: &lexis,
-        chooses_a_name: &chooses_a_name,
+        extra_implicit_relations: &extra_implicit_relations,
+        unnamed_pk_name: &unnamed_pk_name,
+        identity_seq_name: &identity_seq_name,
+        owned_seq_name: &owned_seq_name,
         companion_types: &companion_types,
     };
     run(&engine, &hooks)
@@ -233,10 +272,15 @@ struct Hooks<'a> {
     /// The scanner the rebuild candidates are found with; the text test must
     /// read a body as that does.
     lexis: &'a Lexis<'a>,
-    /// Whether the engine creates a relation with this table under a name it
-    /// chooses. Its first choice is not the name it takes when that one is
-    /// held, so such a relation is never matched by name.
-    chooses_a_name: &'a dyn Fn(&TableName, &Table) -> bool,
+    /// Whether the engine generates any implicit relation for `table` beyond
+    /// an unnamed primary key and identity columns (which the facts cover).
+    extra_implicit_relations: &'a dyn Fn(&TableName, &Table) -> bool,
+    /// First-choice name for an unnamed primary key's backing index.
+    unnamed_pk_name: &'a dyn Fn(&TableName) -> Option<String>,
+    /// First-choice name for an identity column's sequence.
+    identity_seq_name: &'a dyn Fn(&TableName, &str) -> Option<String>,
+    /// First-choice name for an unnamed owned sequence.
+    owned_seq_name: &'a dyn Fn(&TableName, &str, &OwnedSequence) -> Option<String>,
     /// First-choice companion type names for an arriving relation or type.
     companion_types: &'a dyn Fn(&ObjectName) -> Vec<ObjectName>,
 }
@@ -256,7 +300,10 @@ fn assessed_with(
         engine,
         &Hooks {
             lexis: &pbps_model::module::SHARED,
-            chooses_a_name: &|_, _| false,
+            extra_implicit_relations: &|_, _| false,
+            unnamed_pk_name: &|_| None,
+            identity_seq_name: &|_, _| None,
+            owned_seq_name: &|_, _, _| None,
             companion_types: &|_| Vec::new(),
         },
         None,
@@ -352,40 +399,65 @@ struct Narrowing<'a> {
     facts: &'a DependencyFacts,
     effects: &'a PlanEffects,
     expanded_relations: BTreeSet<ObjectName>,
+    arriving_names: BTreeSet<String>,
+    arriving_relations_and_types: BTreeSet<ObjectName>,
 }
 
 impl<'a> Narrowing<'a> {
-    /// `None` when no surface of this plan can be proven: the ancestor ties
-    /// were not read, an arriving companion type's first choice is held or
-    /// unchecked, or an arriving name is held by the engine's own catalog (or
-    /// was not asked).
+    /// `None` when no surface of this plan can be proven: the plan is excluded
+    /// (including any within-plan candidate collision), the ancestor ties were
+    /// not read, an arriving candidate name is held or unchecked, a touched
+    /// engine-named relation's actual name is unknown or collides on move with
+    /// an arriving candidate, or an arriving name is held by the engine's own
+    /// catalog (or was not asked).
     fn prepare(facts: &'a DependencyFacts, effects: &'a PlanEffects) -> Option<Self> {
+        if effects.exclude_narrowing {
+            return None;
+        }
         let ReadFact::Known(ancestors) = &facts.relation_ancestors else {
             return None;
         };
         if !effects
-            .arriving_companion_types
+            .arriving_candidates
             .iter()
-            .all(|c| matches!(facts.companion_types.get(c), Some(NameAvailability::Free)))
+            .all(|c| matches!(facts.candidate_names.get(c), Some(NameAvailability::Free)))
         {
             return None;
         }
-        if !effects
-            .arriving_names
+        let mut touched_relations = effects.touched_relations.clone();
+        let mut arriving_names = effects.arriving_names.clone();
+        let mut arriving_relations_and_types = effects.arriving_relations_and_types.clone();
+        for (enr, move_to) in &effects.touched_engine_named {
+            let Some(ReadFact::Known(actual)) = facts.engine_named_relations.get(enr) else {
+                return None;
+            };
+            touched_relations.insert(actual.clone());
+            if let Some(dest_schema) = move_to {
+                let moved = ObjectName::new(dest_schema, &actual.name);
+                // A moved engine-named relation landing on another arrival's
+                // predicted first-choice name forces that arrival onto a
+                // fallback the pre-plan catalog read could not see.
+                if effects.arriving_candidates.iter().any(|c| c.name == moved) {
+                    return None;
+                }
+                arriving_names.insert(actual.name.clone());
+                arriving_relations_and_types.insert(moved);
+            }
+        }
+        if !arriving_names
             .iter()
             .all(|n| matches!(facts.catalog_names.get(n), Some(CatalogName::Clear)))
         {
             return None;
         }
-        let expanded_relations = expand_touched_relations(
-            &effects.touched_relations,
-            &effects.touched_types,
-            ancestors,
-        );
+        let expanded_relations =
+            expand_touched_relations(&touched_relations, &effects.touched_types, ancestors);
         Some(Self {
             facts,
             effects,
             expanded_relations,
+            arriving_names,
+            arriving_relations_and_types,
         })
     }
 
@@ -418,7 +490,6 @@ impl<'a> Narrowing<'a> {
             }
         });
         let found_first = self
-            .effects
             .arriving_names
             .iter()
             .any(|n| edges.iter().any(|e| e.matches_arriving_name(n)));
@@ -426,9 +497,9 @@ impl<'a> Narrowing<'a> {
             return None;
         }
         // Asked of an unparsed surface too: its header is part of the text.
-        if !self.effects.arriving_relations_and_types.is_empty() {
+        if !self.arriving_relations_and_types.is_empty() {
             let texts = surface_texts(kept_surface, schema, filter_binds)?;
-            if self.effects.arriving_relations_and_types.iter().any(|a| {
+            if self.arriving_relations_and_types.iter().any(|a| {
                 texts
                     .iter()
                     .any(|t| pbps_model::module::references_with(t, a, lexis))
@@ -584,8 +655,26 @@ struct PlanEffects {
     touched_types: BTreeSet<ObjectName>,
     arriving_names: BTreeSet<String>,
     arriving_relations_and_types: BTreeSet<ObjectName>,
-    /// First-choice companion type names for arriving relations and types.
-    arriving_companion_types: BTreeSet<ObjectName>,
+    /// Explicitly arriving relations and types, checked against candidate
+    /// first-choice names for within-plan collisions.
+    explicit_arrivals: BTreeSet<ObjectName>,
+    /// Explicitly arriving constraint names in their schema, checked against
+    /// constraint-backed engine-named relation candidates.
+    arriving_constraints: BTreeSet<ObjectName>,
+    /// Touched engine-named relations whose actual catalog names must be read.
+    /// Value is `Some(dest_schema)` when a cross-schema `RenameTable` moves
+    /// the relation into `dest_schema` under its existing catalog name.
+    touched_engine_named: BTreeMap<EngineNamedRelation, Option<String>>,
+    /// Candidate first-choice names for arriving engine-named relations and
+    /// companion types.
+    arriving_candidates: BTreeSet<CandidateName>,
+}
+
+#[derive(Clone, Copy)]
+enum TableRelationMode<'a> {
+    Arriving,
+    Touched,
+    MovingTo(&'a str),
 }
 
 /// Whether an index or a key on `table` is copied to other tables, or is such
@@ -616,27 +705,54 @@ impl PlanEffects {
         for planned in &ordinary.changes {
             effects.record(&planned.change, base, desired, engine, hooks);
         }
+        // A first choice another arrival of the same plan also claims (an
+        // explicit relation or type, or a constraint for a constraint-backed
+        // engine-named relation) forces the engine onto a fallback name nothing
+        // here knows. The catalog cannot say so: neither exists yet.
+        if effects.arriving_candidates.iter().any(|c| {
+            effects.explicit_arrivals.contains(&c.name)
+                || (c.kind == NameSlotKind::ConstraintRelation
+                    && effects.arriving_constraints.contains(&c.name))
+        }) {
+            effects.exclude_narrowing = true;
+        }
         effects
     }
 
     fn arrive_rel_or_type(&mut self, name: ObjectName) {
         self.arriving_names.insert(name.name.clone());
-        self.arriving_relations_and_types.insert(name);
+        self.arriving_relations_and_types.insert(name.clone());
+        self.explicit_arrivals.insert(name);
     }
 
     fn arrive_with_companions(&mut self, name: ObjectName, hooks: &Hooks<'_>) {
         let companions = (hooks.companion_types)(&name);
-        // A first choice two arrivals of one plan both want (two long names
-        // clipped alike, or a type declared under another's companion name)
-        // goes to one of them and the other takes a name nothing here knows.
-        // The catalog cannot say so: neither exists yet.
-        self.exclude_narrowing |= self.arriving_companion_types.contains(&name);
         self.arrive_rel_or_type(name);
         for comp in companions {
-            self.exclude_narrowing |= self.arriving_relations_and_types.contains(&comp);
-            self.arrive_rel_or_type(comp.clone());
-            self.arriving_companion_types.insert(comp);
+            self.add_candidate(CandidateName {
+                kind: NameSlotKind::CompanionType,
+                name: comp,
+            });
         }
+    }
+
+    fn add_candidate(&mut self, candidate: CandidateName) {
+        // Two arrivals of one plan wanting the same first-choice name (two
+        // long names clipped alike, or an engine-named relation and a
+        // companion type sharing a name) go to one of them and the other takes
+        // a fallback name nothing here knows. The catalog cannot say so:
+        // neither exists yet.
+        if self
+            .arriving_candidates
+            .iter()
+            .any(|existing| existing.name == candidate.name)
+        {
+            self.exclude_narrowing = true;
+        }
+        self.arriving_names.insert(candidate.name.name.clone());
+        self.arriving_relations_and_types
+            .insert(candidate.name.clone());
+        self.arriving_candidates.insert(candidate);
     }
 
     fn touch_module(&mut self, id: &ModuleId) {
@@ -656,7 +772,7 @@ impl PlanEffects {
         table_name: &TableName,
         table: &Table,
         hooks: &Hooks<'_>,
-        arriving: bool,
+        mode: TableRelationMode<'_>,
     ) {
         let names = table
             .indexes
@@ -666,63 +782,155 @@ impl PlanEffects {
             .chain(table.primary_key.as_ref().and_then(|pk| pk.name.as_ref()))
             .map(|n| n.raw().to_owned());
         for name in names {
-            let rel = ObjectName::new(&table_name.schema, name);
-            if arriving {
-                self.arrive_rel_or_type(rel);
-            } else {
-                self.touched_relations.insert(rel);
+            match mode {
+                TableRelationMode::Arriving => {
+                    self.arrive_rel_or_type(ObjectName::new(&table_name.schema, name));
+                }
+                TableRelationMode::Touched => {
+                    self.touched_relations
+                        .insert(ObjectName::new(&table_name.schema, name));
+                }
+                TableRelationMode::MovingTo(dest_schema) => {
+                    self.touched_relations
+                        .insert(ObjectName::new(&table_name.schema, &name));
+                    self.arrive_rel_or_type(ObjectName::new(dest_schema, name));
+                }
             }
         }
-        self.exclude_narrowing |= (hooks.chooses_a_name)(table_name, table)
-            || table
-                .primary_key
-                .as_ref()
-                .is_some_and(|pk| pk.name.is_none());
+        if let TableRelationMode::Arriving | TableRelationMode::MovingTo(_) = mode {
+            let dest_schema = match mode {
+                TableRelationMode::MovingTo(s) => s,
+                TableRelationMode::Arriving | TableRelationMode::Touched => &table_name.schema,
+            };
+            for cname in table
+                .checks
+                .keys()
+                .chain(table.foreign_keys.keys())
+                .chain(table.unique.keys())
+                .chain(table.exclude.keys())
+                .chain(table.primary_key.as_ref().and_then(|pk| pk.name.as_ref()))
+            {
+                self.arriving_constraints
+                    .insert(ObjectName::new(dest_schema, cname.raw()));
+            }
+        }
+        if table
+            .primary_key
+            .as_ref()
+            .is_some_and(|pk| pk.name.is_none())
+        {
+            match mode {
+                TableRelationMode::Arriving => self.arrive_unnamed_pk(table_name, hooks),
+                TableRelationMode::Touched => {
+                    self.touched_engine_named
+                        .insert(EngineNamedRelation::PrimaryKey(table_name.clone()), None);
+                }
+                TableRelationMode::MovingTo(dest_schema) => {
+                    self.touched_engine_named.insert(
+                        EngineNamedRelation::PrimaryKey(table_name.clone()),
+                        Some(dest_schema.to_owned()),
+                    );
+                }
+            }
+        }
+        self.exclude_narrowing |= (hooks.extra_implicit_relations)(table_name, table);
         // A sequence a column owns is a relation the table brings or takes
         // with it.
-        for spec in table.columns.values() {
-            self.record_column_sequence(table_name, spec, arriving);
+        for (col_name, spec) in &table.columns {
+            self.record_column_sequence(table_name, col_name.raw(), spec, hooks, mode);
         }
     }
 
-    fn record_pk(&mut self, schema: &str, pk: Option<&PrimaryKey>, arriving: bool) {
+    fn arrive_unnamed_pk(&mut self, table: &TableName, hooks: &Hooks<'_>) {
+        match (hooks.unnamed_pk_name)(table) {
+            Some(first) => self.add_candidate(CandidateName {
+                kind: NameSlotKind::ConstraintRelation,
+                name: ObjectName::new(&table.schema, first),
+            }),
+            None => self.exclude_narrowing = true,
+        }
+    }
+
+    fn record_pk(
+        &mut self,
+        table: &TableName,
+        pk: Option<&PrimaryKey>,
+        hooks: &Hooks<'_>,
+        arriving: bool,
+    ) {
         match pk.map(|p| &p.name) {
-            Some(Some(n)) if arriving => self.arrive_rel_or_type(ObjectName::new(schema, n.raw())),
+            Some(Some(n)) if arriving => {
+                let rel = ObjectName::new(&table.schema, n.raw());
+                self.arriving_constraints.insert(rel.clone());
+                self.arrive_rel_or_type(rel);
+            }
             Some(Some(n)) => {
                 self.touched_relations
-                    .insert(ObjectName::new(schema, n.raw()));
+                    .insert(ObjectName::new(&table.schema, n.raw()));
             }
-            Some(None) => self.exclude_narrowing = true,
+            Some(None) if arriving => self.arrive_unnamed_pk(table, hooks),
+            Some(None) => {
+                self.touched_engine_named
+                    .insert(EngineNamedRelation::PrimaryKey(table.clone()), None);
+            }
             None => {}
         }
     }
 
-    /// A sequence the column owns under a declared name is touched or
-    /// arrives with it. One the engine names (an identity column's, or a
-    /// sequence declared without a name) may take another name than its first
-    /// choice, so it is matched by none and the facts are not used.
+    /// A sequence the column owns under a declared name is touched or arrives
+    /// with it. One the engine names (an identity column's, or a sequence
+    /// declared without a name) is resolved from catalog facts: its actual
+    /// name when touched, and its first-choice availability when arriving.
+    /// Sequences have no row-type array companion (measured on PostgreSQL 16
+    /// and 18), so none brings a companion type.
     fn record_column_sequence(
         &mut self,
         table: &TableName,
+        col_name: &str,
         column: &pbps_model::Column,
-        arriving: bool,
+        hooks: &Hooks<'_>,
+        mode: TableRelationMode<'_>,
     ) {
-        let declared = match &column.value_source {
-            ValueSource::Sequence(OwnedSequence { name, .. }) => name.as_deref(),
-            ValueSource::Identity(_) => None,
+        let first_choice = match &column.value_source {
+            ValueSource::Sequence(OwnedSequence {
+                name: Some(declared),
+                ..
+            }) => {
+                let sequence = ObjectName::new(&table.schema, declared);
+                match mode {
+                    TableRelationMode::Arriving => self.arrive_rel_or_type(sequence),
+                    TableRelationMode::Touched => {
+                        self.touched_relations.insert(sequence);
+                    }
+                    TableRelationMode::MovingTo(dest_schema) => {
+                        self.touched_relations.insert(sequence);
+                        self.arrive_rel_or_type(ObjectName::new(dest_schema, declared));
+                    }
+                }
+                return;
+            }
+            ValueSource::Sequence(seq @ OwnedSequence { name: None, .. }) => {
+                (hooks.owned_seq_name)(table, col_name, seq)
+            }
+            ValueSource::Identity(_) => (hooks.identity_seq_name)(table, col_name),
             ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => return,
         };
-        let Some(declared) = declared else {
-            self.exclude_narrowing = true;
-            return;
-        };
-        let sequence = ObjectName::new(&table.schema, declared);
-        if arriving {
-            // A sequence has no row type an array type is made for
-            // (measured on PostgreSQL 16 and 18), so it brings no companion.
-            self.arrive_rel_or_type(sequence);
-        } else {
-            self.touched_relations.insert(sequence);
+        let key = EngineNamedRelation::ColumnSequence(table.column(col_name));
+        match mode {
+            TableRelationMode::Arriving => match first_choice {
+                Some(first) => self.add_candidate(CandidateName {
+                    kind: NameSlotKind::Relation,
+                    name: ObjectName::new(&table.schema, first),
+                }),
+                None => self.exclude_narrowing = true,
+            },
+            TableRelationMode::Touched => {
+                self.touched_engine_named.insert(key, None);
+            }
+            TableRelationMode::MovingTo(dest_schema) => {
+                self.touched_engine_named
+                    .insert(key, Some(dest_schema.to_owned()));
+            }
         }
     }
 
@@ -813,7 +1021,7 @@ impl PlanEffects {
                 self.exclude_narrowing |= beside_default.is_some() || is_excluded_table(table);
                 self.arrive_with_companions(name.clone(), hooks);
                 if engine.indexes_are_relations {
-                    self.record_table_relations(name, table, hooks, true);
+                    self.record_table_relations(name, table, hooks, TableRelationMode::Arriving);
                 }
             }
             Change::Table(TableChange::DropTable {
@@ -827,7 +1035,7 @@ impl PlanEffects {
                 if engine.indexes_are_relations
                     && let Some(t) = base_table
                 {
-                    self.record_table_relations(name, t, hooks, false);
+                    self.record_table_relations(name, t, hooks, TableRelationMode::Touched);
                 }
             }
             Change::Table(TableChange::RenameTable { from, to, .. }) => {
@@ -839,12 +1047,16 @@ impl PlanEffects {
                 self.arrive_with_companions(to.clone(), hooks);
                 // A move to another schema carries the table's indexes, keys
                 // and owned sequences with it: each leaves one schema's
-                // namespace and arrives in the other's.
+                // namespace and arrives in the other's under its catalog name.
                 if engine.indexes_are_relations && from.schema != to.schema {
                     match base.schema.tables.get(from) {
                         Some(table) => {
-                            self.record_table_relations(from, table, hooks, false);
-                            self.record_table_relations(to, table, hooks, true);
+                            self.record_table_relations(
+                                from,
+                                table,
+                                hooks,
+                                TableRelationMode::MovingTo(&to.schema),
+                            );
                         }
                         None => self.exclude_narrowing = true,
                     }
@@ -853,11 +1065,22 @@ impl PlanEffects {
             // A column change touches its table, not the column: a statement
             // can bind a table's columns and record an edge on the table only
             // (a `MERGE` target), and a row-type reference reads every column.
-            Change::Column(ColumnChange::AddColumn { table, column, .. }) => {
+            Change::Column(ColumnChange::AddColumn {
+                table,
+                name,
+                column,
+                ..
+            }) => {
                 self.moves_bindings = true;
                 self.touched_relations.insert(table.clone());
                 if engine.indexes_are_relations {
-                    self.record_column_sequence(table, column, true);
+                    self.record_column_sequence(
+                        table,
+                        name.raw(),
+                        column,
+                        hooks,
+                        TableRelationMode::Arriving,
+                    );
                 }
             }
             Change::Column(ColumnChange::DropColumn { column, .. }) => {
@@ -871,7 +1094,13 @@ impl PlanEffects {
                         .get(&column.table)
                         .and_then(|t| t.columns.get(&column.name))
                 {
-                    self.record_column_sequence(&column.table, spec, false);
+                    self.record_column_sequence(
+                        &column.table,
+                        column.name.raw(),
+                        spec,
+                        hooks,
+                        TableRelationMode::Touched,
+                    );
                 }
             }
             Change::Column(ColumnChange::AlterColumnType { column, .. }) => {
@@ -889,7 +1118,15 @@ impl PlanEffects {
                     ModuleId::Routine(r) => {
                         self.arriving_names.insert(r.name.name.clone());
                     }
-                    ModuleId::Trigger { .. } => {}
+                    ModuleId::Trigger { on, name } => {
+                        // A constraint trigger creates a constraint row under
+                        // its name in the table's schema. The declaration is
+                        // the trigger's text, which does not say which kind it
+                        // is, so every trigger counts: that can only keep a
+                        // question, never drop one.
+                        self.arriving_constraints
+                            .insert(ObjectName::new(&on.schema, name));
+                    }
                 }
             }
             Change::Module(ModuleChange::DropModule { id, .. }) => {
@@ -914,12 +1151,20 @@ impl PlanEffects {
                 if engine.indexes_are_relations {
                     self.moves_bindings = true;
                     self.exclude_narrowing |= copies_indexes(table, base, desired);
-                    self.record_pk(&table.schema, from.as_ref(), false);
-                    self.record_pk(&table.schema, to.as_ref(), true);
+                    self.record_pk(table, from.as_ref(), hooks, false);
+                    self.record_pk(table, to.as_ref(), hooks, true);
                 }
             }
-            Change::Constraint(ConstraintChange::AddUnique { table, name, .. })
-            | Change::Index(IndexChange::AddIndex { table, name, .. }) => {
+            Change::Constraint(ConstraintChange::AddUnique { table, name, .. }) => {
+                if engine.indexes_are_relations {
+                    self.moves_bindings = true;
+                    self.exclude_narrowing |= copies_indexes(table, base, desired);
+                    let rel = ObjectName::new(&table.schema, name.raw());
+                    self.arriving_constraints.insert(rel.clone());
+                    self.arrive_rel_or_type(rel);
+                }
+            }
+            Change::Index(IndexChange::AddIndex { table, name, .. }) => {
                 if engine.indexes_are_relations {
                     self.moves_bindings = true;
                     self.exclude_narrowing |= copies_indexes(table, base, desired);
@@ -949,6 +1194,7 @@ impl PlanEffects {
                         self.touched_relations.insert(rel.clone());
                     }
                     if to.is_some() {
+                        self.arriving_constraints.insert(rel.clone());
                         self.arrive_rel_or_type(rel);
                     }
                 }
@@ -979,6 +1225,15 @@ impl PlanEffects {
                     .insert(ObjectName::new(from.schema(), from.name()));
                 self.arrive_with_companions(ObjectName::new(to.schema(), to.name()), hooks);
             }
+            Change::Constraint(
+                ConstraintChange::AddCheck { table, name, .. }
+                | ConstraintChange::AddForeignKey { table, name, .. },
+            ) => {
+                // Moves no binding itself, but claims a constraint name in its
+                // schema that an arriving unnamed primary key would yield to.
+                self.arriving_constraints
+                    .insert(ObjectName::new(&table.schema, name.raw()));
+            }
             // An expression's own definition is its own question; changing it
             // brings no name anywhere. A check's or foreign key's name is a
             // constraint's, which no lookup in an expression reaches. A role
@@ -997,10 +1252,7 @@ impl PlanEffects {
             // as plpgsql's, finds nothing once the member is gone, which is
             // the resolver's documented observation limit (DEC-2447.8).
             Change::Constraint(
-                ConstraintChange::AddCheck { .. }
-                | ConstraintChange::DropCheck { .. }
-                | ConstraintChange::AddForeignKey { .. }
-                | ConstraintChange::DropForeignKey { .. },
+                ConstraintChange::DropCheck { .. } | ConstraintChange::DropForeignKey { .. },
             )
             | Change::Index(IndexChange::SetIndexStorageParameters { .. })
             | Change::Column(
@@ -1818,18 +2070,22 @@ mod dependency_facts_tests {
             surfaces,
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::new(),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         }
     }
 
-    fn plain_hooks<'a>(lexis: &'a Lexis<'a>, chooses_a_name: bool) -> Hooks<'a> {
+    fn plain_hooks<'a>(lexis: &'a Lexis<'a>, extra_implicit: bool) -> Hooks<'a> {
         Hooks {
             lexis,
-            chooses_a_name: if chooses_a_name {
+            extra_implicit_relations: if extra_implicit {
                 &|_, _| true
             } else {
                 &|_, _| false
             },
+            unnamed_pk_name: &|_| None,
+            identity_seq_name: &|_, _| None,
+            owned_seq_name: &|_, _, _| None,
             companion_types: &|_| Vec::new(),
         }
     }
@@ -2051,7 +2307,8 @@ mod dependency_facts_tests {
             surfaces,
             relation_ancestors: ReadFact::Known(ancestors),
             catalog_names: BTreeMap::new(),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
 
         let found = run(
@@ -2141,7 +2398,8 @@ mod dependency_facts_tests {
                 BTreeSet::from([Ancestor::Type(comp)]),
             )])),
             catalog_names: BTreeMap::from([("comp_v2".into(), CatalogName::Clear)]),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
 
         // Paired with a moving change on an unrelated third table so the plan
@@ -2242,7 +2500,8 @@ mod dependency_facts_tests {
             surfaces: base_surfaces.clone(),
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::from([("note".into(), CatalogName::Clear)]),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
         let found = run(
             &schema,
@@ -2268,7 +2527,8 @@ mod dependency_facts_tests {
             surfaces: base_surfaces.clone(),
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::from([("d".into(), CatalogName::Clear)]),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
         let found = run(
             &schema,
@@ -2290,7 +2550,8 @@ mod dependency_facts_tests {
             surfaces: base_surfaces.clone(),
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::from([("calc".into(), CatalogName::Clear)]),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
         let found = run(
             &schema,
@@ -2323,7 +2584,8 @@ mod dependency_facts_tests {
                 surfaces: base_surfaces.clone(),
                 relation_ancestors: ReadFact::Known(BTreeMap::new()),
                 catalog_names,
-                companion_types: BTreeMap::new(),
+                engine_named_relations: BTreeMap::new(),
+                candidate_names: BTreeMap::new(),
             };
             let found = run(
                 &schema,
@@ -2344,7 +2606,8 @@ mod dependency_facts_tests {
             surfaces: base_surfaces,
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::from([("unrelated_helper".into(), CatalogName::Clear)]),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
         let found = run(
             &schema,
@@ -2441,7 +2704,8 @@ mod dependency_facts_tests {
                 ("n".into(), CatalogName::Clear),
                 ("dom".into(), CatalogName::Clear),
             ]),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
 
         // Relation `early.n` arrives and type `early.dom` arrives.
@@ -2568,7 +2832,8 @@ mod dependency_facts_tests {
             surfaces,
             relation_ancestors: ReadFact::Unreadable,
             catalog_names: BTreeMap::new(),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
         let found = run(
             &schema,
@@ -2938,7 +3203,8 @@ mod dependency_facts_tests {
             ]),
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::from([("ix_new".into(), CatalogName::Clear)]),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
         let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
         let eng = Engine {
@@ -3040,7 +3306,8 @@ mod dependency_facts_tests {
                 ("t".into(), CatalogName::Clear),
                 ("t_n_seq".into(), CatalogName::Clear),
             ]),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
         let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
         let eng = Engine {
@@ -3168,7 +3435,8 @@ mod dependency_facts_tests {
                 ("g".into(), CatalogName::Clear),
                 ("h".into(), CatalogName::Clear),
             ]),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
         let arriving = |sig: &str| {
             vec![Change::Module(ModuleChange::CreateModule {
@@ -3259,7 +3527,8 @@ mod dependency_facts_tests {
                 ("t2".into(), CatalogName::Clear),
                 ("s".into(), CatalogName::Clear),
             ]),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
         let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
         let eng = Engine {
@@ -3357,7 +3626,8 @@ mod dependency_facts_tests {
         let needed = needed_facts(side, desired_side, &ordinary, &MinimalDialect).unwrap();
         assert_eq!(needed.surfaces, BTreeSet::from([module_surface("app.v_u")]));
         assert!(needed.arriving_names.is_empty());
-        assert!(needed.arriving_companion_types.is_empty());
+        assert!(needed.touched_engine_named.is_empty());
+        assert!(needed.arriving_candidates.is_empty());
     }
 
     /// An index on a partitioned table, or on a partition, has copies the
@@ -3389,7 +3659,8 @@ mod dependency_facts_tests {
             )]),
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::new(),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
         let changes = [
             Change::Index(IndexChange::DropIndex {
@@ -3443,7 +3714,10 @@ mod dependency_facts_tests {
         };
         let hooks = Hooks {
             lexis: &pbps_model::module::SHARED,
-            chooses_a_name: &|_, _| false,
+            extra_implicit_relations: &|_, _| false,
+            unnamed_pk_name: &|_| None,
+            identity_seq_name: &|_, _| None,
+            owned_seq_name: &|_, _, _| None,
             companion_types: &companion_types,
         };
         let create = |names: &[&str]| ChangeSet {
@@ -3472,9 +3746,22 @@ mod dependency_facts_tests {
                 .into_iter()
                 .map(|n| (n.to_owned(), CatalogName::Clear))
                 .collect(),
-            companion_types: BTreeMap::from([
-                ("early._t".parse().unwrap(), NameAvailability::Free),
-                ("early._x".parse().unwrap(), NameAvailability::Free),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::from([
+                (
+                    CandidateName {
+                        kind: NameSlotKind::CompanionType,
+                        name: "early._t".parse().unwrap(),
+                    },
+                    NameAvailability::Free,
+                ),
+                (
+                    CandidateName {
+                        kind: NameSlotKind::CompanionType,
+                        name: "early._x".parse().unwrap(),
+                    },
+                    NameAvailability::Free,
+                ),
             ]),
         };
         let answer = |names: &[&str]| {
@@ -3514,7 +3801,10 @@ mod dependency_facts_tests {
             |name: &ObjectName| vec![ObjectName::new(&name.schema, format!("_{}", name.name))];
         let hooks = Hooks {
             lexis: &pbps_model::module::SHARED,
-            chooses_a_name: &|_, _| false,
+            extra_implicit_relations: &|_, _| false,
+            unnamed_pk_name: &|_| None,
+            identity_seq_name: &|_, _| None,
+            owned_seq_name: &|_, _, _| None,
             companion_types: &companion_types,
         };
         let create = ChangeSet {
@@ -3528,7 +3818,10 @@ mod dependency_facts_tests {
                 },
             ))],
         };
-        let companion: ObjectName = "early._t".parse().unwrap();
+        let cand = CandidateName {
+            kind: NameSlotKind::CompanionType,
+            name: "early._t".parse().unwrap(),
+        };
         let make_facts = |avail: Option<NameAvailability>| DependencyFacts {
             surfaces: BTreeMap::from([
                 (
@@ -3554,8 +3847,9 @@ mod dependency_facts_tests {
                 ("t".into(), CatalogName::Clear),
                 ("_t".into(), CatalogName::Clear),
             ]),
-            companion_types: avail
-                .map(|a| BTreeMap::from([(companion.clone(), a)]))
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: avail
+                .map(|a| BTreeMap::from([(cand.clone(), a)]))
                 .unwrap_or_default(),
         };
         // First choice `_t` is free: readers of `late._t` and text mentions of `_t`
@@ -3584,5 +3878,597 @@ mod dependency_facts_tests {
             let found = assessed_with_facts(side, side, &create, &eng, &hooks, Some(&f));
             assert_eq!(found.count(Answer::Unaffected), 0, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn engine_named_relations_narrow_when_known_and_free_and_refuse_when_held_or_unknown() {
+        let mut schema = two_table_schema();
+        let t: TableName = "app.t".parse().unwrap();
+        let mut id_col = Column::new("int".parse().unwrap());
+        id_col.value_source = ValueSource::Identity(pbps_model::Identity::new(1, 1));
+        schema
+            .tables
+            .get_mut(&t)
+            .unwrap()
+            .columns
+            .insert("id".into(), id_col.clone());
+        schema.tables.get_mut(&t).unwrap().primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        let base_ids = resolve_ids(&schema, &IdsFile::default());
+        let side = crate::Side {
+            schema: &schema,
+            ids: &base_ids,
+        };
+        let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
+        let eng = Engine {
+            indexes_are_relations: true,
+            normalize: &normalize,
+            filter_binds: true,
+        };
+        let pk_name = |tbl: &TableName| Some(format!("{}_pkey", tbl.name));
+        let seq_name = |tbl: &TableName, col: &str| Some(format!("{}_{col}_seq", tbl.name));
+        let owned_name = |tbl: &TableName, col: &str, seq: &OwnedSequence| {
+            Some(
+                seq.name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_{col}_seq", tbl.name)),
+            )
+        };
+        let companion_types =
+            |name: &ObjectName| vec![ObjectName::new(&name.schema, format!("_{}", name.name))];
+        let hooks = Hooks {
+            lexis: &pbps_model::module::SHARED,
+            extra_implicit_relations: &|_, _| false,
+            unnamed_pk_name: &pk_name,
+            identity_seq_name: &seq_name,
+            owned_seq_name: &owned_name,
+            companion_types: &companion_types,
+        };
+
+        // 1. Arriving table with unnamed PK, identity column, and unnamed owned
+        //    sequence: sequences and indexes bring no companion array type.
+        let mut arriving = Table::default();
+        arriving.columns.insert("id".into(), id_col);
+        let mut ser_col = Column::new("int".parse().unwrap());
+        ser_col.value_source = ValueSource::Sequence(OwnedSequence::serial());
+        arriving.columns.insert("n".into(), ser_col);
+        arriving.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        let create = ChangeSet {
+            changes: vec![PlannedChange::new(Change::Table(
+                TableChange::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: "early.fresh".parse().unwrap(),
+                    table: Box::new(arriving),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+            ))],
+        };
+        let effects = PlanEffects::of(&create, side, side, &eng, &hooks);
+        let pk_cand = CandidateName {
+            kind: NameSlotKind::ConstraintRelation,
+            name: "early.fresh_pkey".parse().unwrap(),
+        };
+        let seq_cand = CandidateName {
+            kind: NameSlotKind::Relation,
+            name: "early.fresh_id_seq".parse().unwrap(),
+        };
+        let ser_cand = CandidateName {
+            kind: NameSlotKind::Relation,
+            name: "early.fresh_n_seq".parse().unwrap(),
+        };
+        let table_comp = CandidateName {
+            kind: NameSlotKind::CompanionType,
+            name: "early._fresh".parse().unwrap(),
+        };
+        // Only the table brings an array type; the PK index and sequences do not.
+        assert_eq!(
+            effects.arriving_candidates,
+            BTreeSet::from([
+                table_comp.clone(),
+                pk_cand.clone(),
+                seq_cand.clone(),
+                ser_cand.clone(),
+            ])
+        );
+        let mut facts = DependencyFacts {
+            surfaces: BTreeMap::from([
+                (
+                    module_surface("app.v_t"),
+                    parsed([DependencyEdge::Relation("late.fresh_pkey".parse().unwrap())]),
+                ),
+                (
+                    module_surface("app.v_u"),
+                    parsed([DependencyEdge::Column(
+                        "app.u".parse::<TableName>().unwrap().column("id"),
+                    )]),
+                ),
+            ]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: [
+                "fresh",
+                "_fresh",
+                "fresh_pkey",
+                "fresh_id_seq",
+                "fresh_n_seq",
+            ]
+            .into_iter()
+            .map(|n| (n.to_owned(), CatalogName::Clear))
+            .collect(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::from([
+                (table_comp, NameAvailability::Free),
+                (pk_cand.clone(), NameAvailability::Free),
+                (seq_cand, NameAvailability::Free),
+                (ser_cand, NameAvailability::Free),
+            ]),
+        };
+        let found = assessed_with_facts(side, side, &create, &eng, &hooks, Some(&facts));
+        assert_eq!(found.questions[&module_surface("app.v_t")], Answer::Resolve);
+        assert_eq!(
+            found.unaffected_reason(&module_surface("app.v_u")),
+            Some(UnaffectedReason::ByDependency)
+        );
+        // Held first choice refuses narrowing for the whole plan.
+        facts
+            .candidate_names
+            .insert(pk_cand, NameAvailability::Held);
+        let held = assessed_with_facts(side, side, &create, &eng, &hooks, Some(&facts));
+        assert_eq!(held.count(Answer::Unaffected), 0);
+
+        // 2. Touched (dropped) table with unnamed PK and identity column whose
+        //    actual catalog names were suffixed (`t_pkey1`, `t_id_seq1`).
+        let drop_t = ChangeSet {
+            changes: vec![PlannedChange::new(Change::Table(TableChange::DropTable {
+                uid: Uid::generate(UidKind::Table),
+                name: t.clone(),
+                detach_from: None,
+            }))],
+        };
+        let mut drop_facts = DependencyFacts {
+            surfaces: BTreeMap::from([
+                (
+                    module_surface("app.v_t"),
+                    parsed([DependencyEdge::Relation("app.t_id_seq1".parse().unwrap())]),
+                ),
+                (
+                    module_surface("app.v_u"),
+                    parsed([DependencyEdge::Column(
+                        "app.u".parse::<TableName>().unwrap().column("id"),
+                    )]),
+                ),
+            ]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: BTreeMap::new(),
+            engine_named_relations: BTreeMap::from([
+                (
+                    EngineNamedRelation::PrimaryKey(t.clone()),
+                    ReadFact::Known("app.t_pkey1".parse().unwrap()),
+                ),
+                (
+                    EngineNamedRelation::ColumnSequence(t.column("id")),
+                    ReadFact::Known("app.t_id_seq1".parse().unwrap()),
+                ),
+            ]),
+            candidate_names: BTreeMap::new(),
+        };
+        let found = assessed_with_facts(side, side, &drop_t, &eng, &hooks, Some(&drop_facts));
+        assert_eq!(found.questions[&module_surface("app.v_t")], Answer::Resolve);
+        assert_eq!(
+            found.unaffected_reason(&module_surface("app.v_u")),
+            Some(UnaffectedReason::ByDependency)
+        );
+        // Unreadable actual name refuses narrowing completely.
+        drop_facts.engine_named_relations.insert(
+            EngineNamedRelation::PrimaryKey(t.clone()),
+            ReadFact::Unreadable,
+        );
+        let unread = assessed_with_facts(side, side, &drop_t, &eng, &hooks, Some(&drop_facts));
+        assert_eq!(unread.count(Answer::Unaffected), 0);
+
+        // 3. Cross-schema move carries the actual engine-named relation names
+        //    into the destination schema and refuses if a moved actual name
+        //    lands on another arrival's predicted first choice.
+        let move_t = ChangeSet {
+            changes: vec![PlannedChange::new(Change::Table(
+                TableChange::RenameTable {
+                    uid: Uid::generate(UidKind::Table),
+                    from: t.clone(),
+                    to: "early.moved".parse().unwrap(),
+                    defaults: Vec::new(),
+                },
+            ))],
+        };
+        let move_facts = DependencyFacts {
+            surfaces: BTreeMap::from([
+                (
+                    module_surface("app.v_t"),
+                    parsed([DependencyEdge::Relation("late.t_pkey1".parse().unwrap())]),
+                ),
+                (
+                    module_surface("app.v_u"),
+                    parsed([DependencyEdge::Column(
+                        "app.u".parse::<TableName>().unwrap().column("id"),
+                    )]),
+                ),
+            ]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: ["moved", "_moved", "t_pkey1", "t_id_seq1"]
+                .into_iter()
+                .map(|n| (n.to_owned(), CatalogName::Clear))
+                .collect(),
+            engine_named_relations: BTreeMap::from([
+                (
+                    EngineNamedRelation::PrimaryKey(t.clone()),
+                    ReadFact::Known("app.t_pkey1".parse().unwrap()),
+                ),
+                (
+                    EngineNamedRelation::ColumnSequence(t.column("id")),
+                    ReadFact::Known("app.t_id_seq1".parse().unwrap()),
+                ),
+            ]),
+            candidate_names: BTreeMap::from([(
+                CandidateName {
+                    kind: NameSlotKind::CompanionType,
+                    name: "early._moved".parse().unwrap(),
+                },
+                NameAvailability::Free,
+            )]),
+        };
+        let moved = assessed_with_facts(side, side, &move_t, &eng, &hooks, Some(&move_facts));
+        assert_eq!(moved.questions[&module_surface("app.v_t")], Answer::Resolve);
+        assert_eq!(
+            moved.unaffected_reason(&module_surface("app.v_u")),
+            Some(UnaffectedReason::ByDependency)
+        );
+        // Same move paired with a new table whose unnamed PK wants the moved
+        // actual name (`early.t_pkey1`): refuses narrowing because the moved
+        // PK forces the arriving table's unnamed PK onto a fallback.
+        let mut collided_tbl = table_with_columns(&["id"]);
+        collided_tbl.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        });
+        let move_and_collide = ChangeSet {
+            changes: vec![
+                move_t.changes[0].clone(),
+                PlannedChange::new(Change::Table(TableChange::CreateTable {
+                    uid: Uid::generate(UidKind::Table),
+                    name: "early.other".parse().unwrap(),
+                    table: Box::new(collided_tbl),
+                    beside_default: None,
+                    moves_at_most: None,
+                })),
+            ],
+        };
+        let pk_colliding = |tbl: &TableName| {
+            if tbl.name == "other" {
+                Some("t_pkey1".to_owned())
+            } else {
+                Some(format!("{}_pkey", tbl.name))
+            }
+        };
+        let collide_hooks = Hooks {
+            unnamed_pk_name: &pk_colliding,
+            ..hooks
+        };
+        let mut move_collide_facts = move_facts;
+        move_collide_facts
+            .catalog_names
+            .insert("other".into(), CatalogName::Clear);
+        move_collide_facts
+            .catalog_names
+            .insert("_other".into(), CatalogName::Clear);
+        move_collide_facts.candidate_names.insert(
+            CandidateName {
+                kind: NameSlotKind::CompanionType,
+                name: "early._other".parse().unwrap(),
+            },
+            NameAvailability::Free,
+        );
+        move_collide_facts.candidate_names.insert(
+            CandidateName {
+                kind: NameSlotKind::ConstraintRelation,
+                name: "early.t_pkey1".parse().unwrap(),
+            },
+            NameAvailability::Free,
+        );
+        let collided = assessed_with_facts(
+            side,
+            side,
+            &move_and_collide,
+            &eng,
+            &collide_hooks,
+            Some(&move_collide_facts),
+        );
+        assert_eq!(collided.count(Answer::Unaffected), 0);
+    }
+
+    #[test]
+    fn within_plan_candidate_collisions_keep_plan_level_answer() {
+        let schema = two_table_schema();
+        let base_ids = resolve_ids(&schema, &IdsFile::default());
+        let side = crate::Side {
+            schema: &schema,
+            ids: &base_ids,
+        };
+        let normalize = |d: &str| pbps_dialect::Dialect::normalize_definition(&MinimalDialect, d);
+        let eng = Engine {
+            indexes_are_relations: true,
+            normalize: &normalize,
+            filter_binds: true,
+        };
+        // Short clipping rules so collisions are readable in small fixtures:
+        // PK uses the first char (`<c>_pkey`), identity seq uses `<tbl>_<col>_seq`,
+        // companion uses `_<name>`.
+        let pk_name = |tbl: &TableName| Some(format!("{}_pkey", &tbl.name[..1]));
+        let seq_name = |tbl: &TableName, col: &str| Some(format!("{}_{col}_seq", tbl.name));
+        let companion_types =
+            |name: &ObjectName| vec![ObjectName::new(&name.schema, format!("_{}", name.name))];
+        let hooks = Hooks {
+            lexis: &pbps_model::module::SHARED,
+            extra_implicit_relations: &|_, _| false,
+            unnamed_pk_name: &pk_name,
+            identity_seq_name: &seq_name,
+            owned_seq_name: &|_, _, _| None,
+            companion_types: &companion_types,
+        };
+        let table_with_unnamed_pk = || {
+            let mut tbl = table_with_columns(&["id"]);
+            tbl.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+                filegroup: None,
+            });
+            tbl
+        };
+        let table_with_identity = || {
+            let mut tbl = Table::default();
+            let mut id_col = Column::new("int".parse().unwrap());
+            id_col.value_source = ValueSource::Identity(pbps_model::Identity::new(1, 1));
+            tbl.columns.insert("id".into(), id_col);
+            tbl
+        };
+        let create_tbl = |name: &str, tbl: Table| {
+            PlannedChange::new(Change::Table(TableChange::CreateTable {
+                uid: Uid::generate(UidKind::Table),
+                name: name.parse().unwrap(),
+                table: Box::new(tbl),
+                beside_default: None,
+                moves_at_most: None,
+            }))
+        };
+        let add_check = |table: &str, name: &str| {
+            PlannedChange::new(Change::Constraint(ConstraintChange::AddCheck {
+                table: table.parse().unwrap(),
+                name: name.into(),
+                constraint: CheckConstraint {
+                    expression: "id > 0".into(),
+                },
+            }))
+        };
+        let facts = DependencyFacts {
+            surfaces: BTreeMap::from([(
+                module_surface("app.v_u"),
+                parsed([DependencyEdge::Column(
+                    "app.u".parse::<TableName>().unwrap().column("id"),
+                )]),
+            )]),
+            relation_ancestors: ReadFact::Known(BTreeMap::new()),
+            catalog_names: [
+                "a1",
+                "a2",
+                "b1",
+                "a_pkey",
+                "b_pkey",
+                "b1_id_seq",
+                "_a1",
+                "_a2",
+                "_b1",
+                "_a_pkey",
+                "_b1_id_seq",
+            ]
+            .into_iter()
+            .map(|n| (n.to_owned(), CatalogName::Clear))
+            .collect(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::from([
+                (
+                    CandidateName {
+                        kind: NameSlotKind::ConstraintRelation,
+                        name: "early.a_pkey".parse().unwrap(),
+                    },
+                    NameAvailability::Free,
+                ),
+                (
+                    CandidateName {
+                        kind: NameSlotKind::ConstraintRelation,
+                        name: "early.b_pkey".parse().unwrap(),
+                    },
+                    NameAvailability::Free,
+                ),
+                (
+                    CandidateName {
+                        kind: NameSlotKind::Relation,
+                        name: "early.b1_id_seq".parse().unwrap(),
+                    },
+                    NameAvailability::Free,
+                ),
+                (
+                    CandidateName {
+                        kind: NameSlotKind::CompanionType,
+                        name: "early._a1".parse().unwrap(),
+                    },
+                    NameAvailability::Free,
+                ),
+                (
+                    CandidateName {
+                        kind: NameSlotKind::CompanionType,
+                        name: "early._a2".parse().unwrap(),
+                    },
+                    NameAvailability::Free,
+                ),
+                (
+                    CandidateName {
+                        kind: NameSlotKind::CompanionType,
+                        name: "early._b1".parse().unwrap(),
+                    },
+                    NameAvailability::Free,
+                ),
+                (
+                    CandidateName {
+                        kind: NameSlotKind::CompanionType,
+                        name: "early._a_pkey".parse().unwrap(),
+                    },
+                    NameAvailability::Free,
+                ),
+                (
+                    CandidateName {
+                        kind: NameSlotKind::CompanionType,
+                        name: "early._b1_id_seq".parse().unwrap(),
+                    },
+                    NameAvailability::Free,
+                ),
+            ]),
+        };
+        let answer = |changes: Vec<PlannedChange>| {
+            let cs = ChangeSet { changes };
+            assessed_with_facts(side, side, &cs, &eng, &hooks, Some(&facts)).questions
+                [&module_surface("app.v_u")]
+        };
+
+        // Positive: two tables whose unnamed PKs take distinct names narrow.
+        assert_eq!(
+            answer(vec![
+                create_tbl("early.a1", table_with_unnamed_pk()),
+                create_tbl("early.b1", table_with_unnamed_pk()),
+            ]),
+            Answer::Unaffected
+        );
+        // Two tables whose unnamed PKs want the same first choice collide.
+        assert_eq!(
+            answer(vec![
+                create_tbl("early.a1", table_with_unnamed_pk()),
+                create_tbl("early.a2", table_with_unnamed_pk()),
+            ]),
+            Answer::Resolve
+        );
+        // Unnamed PK colliding with an explicit arrival, in either order.
+        assert_eq!(
+            answer(vec![
+                create_tbl("early.a1", table_with_unnamed_pk()),
+                create_tbl("early.a_pkey", table_with_columns(&["id"])),
+            ]),
+            Answer::Resolve
+        );
+        assert_eq!(
+            answer(vec![
+                create_tbl("early.a_pkey", table_with_columns(&["id"])),
+                create_tbl("early.a1", table_with_unnamed_pk()),
+            ]),
+            Answer::Resolve
+        );
+        // Unnamed PK colliding with an arriving non-relation constraint, in either order.
+        assert_eq!(
+            answer(vec![
+                create_tbl("early.a1", table_with_unnamed_pk()),
+                add_check("early.other", "a_pkey"),
+            ]),
+            Answer::Resolve
+        );
+        assert_eq!(
+            answer(vec![
+                add_check("early.other", "a_pkey"),
+                create_tbl("early.a1", table_with_unnamed_pk()),
+            ]),
+            Answer::Resolve
+        );
+        // Identity sequence colliding with an explicit arrival, in either order.
+        assert_eq!(
+            answer(vec![
+                create_tbl("early.b1", table_with_identity()),
+                create_tbl("early.b1_id_seq", table_with_columns(&["id"])),
+            ]),
+            Answer::Resolve
+        );
+        assert_eq!(
+            answer(vec![
+                create_tbl("early.b1_id_seq", table_with_columns(&["id"])),
+                create_tbl("early.b1", table_with_identity()),
+            ]),
+            Answer::Resolve
+        );
+        // An identity sequence does not yield to a non-relation CHECK constraint.
+        assert_eq!(
+            answer(vec![
+                create_tbl("early.b1", table_with_identity()),
+                add_check("early.other", "b1_id_seq"),
+            ]),
+            Answer::Unaffected
+        );
+        // Cross-kind collision: a companion array type (`_a_pkey` from table
+        // `early.a_pkey`) and an unnamed PK wanting `_a_pkey` collide via the
+        // same mechanism, and `needed_facts` returns `None` when colliding.
+        let pk_underscore = |_: &TableName| Some("_a_pkey".to_owned());
+        let cross_hooks = Hooks {
+            unnamed_pk_name: &pk_underscore,
+            ..hooks
+        };
+        let cross_cs = ChangeSet {
+            changes: vec![
+                create_tbl("early.a_pkey", table_with_columns(&["id"])),
+                create_tbl("early.b1", table_with_unnamed_pk()),
+            ],
+        };
+        let cross_effects = PlanEffects::of(&cross_cs, side, side, &eng, &cross_hooks);
+        assert!(cross_effects.exclude_narrowing);
+        assert_eq!(
+            assessed_with_facts(side, side, &cross_cs, &eng, &cross_hooks, Some(&facts)).questions
+                [&module_surface("app.v_u")],
+            Answer::Resolve
+        );
+
+        // `SetPrimaryKey` dropping an unnamed PK touches `PrimaryKey(table)`,
+        // and adding an unnamed PK requests a `ConstraintRelation` candidate.
+        let unnamed_pk = PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+            filegroup: None,
+        };
+        let replace_pk = ChangeSet {
+            changes: vec![PlannedChange::new(Change::Constraint(
+                ConstraintChange::SetPrimaryKey {
+                    table: "early.a1".parse().unwrap(),
+                    from: Some(unnamed_pk.clone()),
+                    to: Some(unnamed_pk),
+                    nonclustered: false,
+                },
+            ))],
+        };
+        let pk_effects = PlanEffects::of(&replace_pk, side, side, &eng, &hooks);
+        assert!(
+            pk_effects
+                .touched_engine_named
+                .contains_key(&EngineNamedRelation::PrimaryKey(
+                    "early.a1".parse().unwrap()
+                ))
+        );
+        assert!(pk_effects.arriving_candidates.contains(&CandidateName {
+            kind: NameSlotKind::ConstraintRelation,
+            name: "early.a_pkey".parse().unwrap(),
+        }));
     }
 }

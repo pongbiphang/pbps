@@ -83,9 +83,42 @@ pub enum CatalogName {
     Unreadable,
 }
 
-/// Whether a companion type's first-choice name is free in its schema before
-/// the plan runs. Absence from [`DependencyFacts::companion_types`] means
-/// unchecked, never [`Self::Free`].
+/// An existing relation whose name the engine chose rather than a declaration:
+/// an unnamed primary key's backing index, or an identity or unnamed owned
+/// sequence. Identified by its declared owner so the catalog reader can look up
+/// its actual catalog name without guessing it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EngineNamedRelation {
+    /// The backing index of a table's unnamed primary key.
+    PrimaryKey(ObjectName),
+    /// The sequence owned by a column (identity column or unnamed sequence).
+    ColumnSequence(ColumnRef),
+}
+
+/// Which namespace an arriving first-choice name must be free in for the engine
+/// to take that first choice rather than a fallback name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NameSlotKind {
+    /// A relation (such as an identity or unnamed owned sequence).
+    Relation,
+    /// A constraint-backed relation (such as an unnamed primary key's index),
+    /// which also yields to existing constraint names in its schema.
+    ConstraintRelation,
+    /// A companion type created alongside a relation or type.
+    CompanionType,
+}
+
+/// A first-choice name an arriving engine-named relation or companion type will
+/// take when that slot is free in its schema.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CandidateName {
+    pub kind: NameSlotKind,
+    pub name: ObjectName,
+}
+
+/// Whether a [`CandidateName`] is free in its schema before the plan runs.
+/// Absence from [`DependencyFacts::candidate_names`] means unchecked, never
+/// [`Self::Free`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NameAvailability {
     Free,
@@ -105,9 +138,13 @@ pub struct DependencyFacts {
     pub relation_ancestors: ReadFact<BTreeMap<ObjectName, BTreeSet<Ancestor>>>,
     /// System-catalog presence for each unqualified name arriving in the plan.
     pub catalog_names: BTreeMap<String, CatalogName>,
-    /// Availability of each arriving companion type's first-choice name in its
-    /// schema. Absence means unchecked, never [`NameAvailability::Free`].
-    pub companion_types: BTreeMap<ObjectName, NameAvailability>,
+    /// Actual catalog names held by touched engine-named relations. Absence
+    /// means unchecked; [`ReadFact::Unreadable`] means missing or unreadable.
+    pub engine_named_relations: BTreeMap<EngineNamedRelation, ReadFact<ObjectName>>,
+    /// Availability of each candidate first-choice name for an arriving
+    /// engine-named relation or companion type. Absence means unchecked, never
+    /// [`NameAvailability::Free`].
+    pub candidate_names: BTreeMap<CandidateName, NameAvailability>,
 }
 
 #[cfg(test)]
@@ -137,7 +174,8 @@ mod tests {
             surfaces,
             relation_ancestors: ReadFact::Known(BTreeMap::new()),
             catalog_names: BTreeMap::new(),
-            companion_types: BTreeMap::new(),
+            engine_named_relations: BTreeMap::new(),
+            candidate_names: BTreeMap::new(),
         };
 
         assert!(!facts.surfaces.contains_key(&absent));
