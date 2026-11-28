@@ -90,11 +90,13 @@ def selector(value):
     return index, count
 
 
-def fixture_env(suite, index, source):
+def fixture_env(suite, index, source, kinds=None):
+    """Assign names and ports to the suite's fixtures, or to `kinds` of them only."""
     env = dict(source)
     prefix = env.get("PBPS_LIVE_PREFIX") or "pbps-live"
     low, high = ephemeral_ports()
-    for name, port, kind, default in FIXTURES[suite]:
+    fixtures = [f for f in FIXTURES[suite] if kinds is None or f[2] in kinds]
+    for name, port, kind, default in fixtures:
         base = env.get(name)
         env[name] = f"{base}-s{index}" if base else f"{prefix}s{index}-{kind}"
         if name == "PBPS_TEST_MSSQL_SCRATCH_NAME" and not base:
@@ -104,8 +106,8 @@ def fixture_env(suite, index, source):
         require(0 < int(env[port]) < 65536, "fixture port outside 1..65535")
         require(not low <= int(env[port]) <= high,
                 f"fixture {env[name]}: {port}={env[port]} overlaps host ephemeral range {low}..{high}")
-    require(len({env[n] for n, _, _, _ in FIXTURES[suite]}) == 3, "fixture names collide")
-    require(len({env[p] for _, p, _, _ in FIXTURES[suite]}) == 3, "fixture ports collide")
+    require(len({env[n] for n, _, _, _ in fixtures}) == len(fixtures), "fixture names collide")
+    require(len({env[p] for _, p, _, _ in fixtures}) == len(fixtures), "fixture ports collide")
     return env
 
 
@@ -150,11 +152,21 @@ class FixtureRun:
             self.handlers[sig] = signal.signal(sig, self.interrupt)
         return self
 
-    def run(self, command, **kwargs):
+    def start(self, command, **kwargs):
+        """Start a process group this run owns: stop() ends it before any removal."""
         with self.lock:
             require(not self.stopped, "fixture run interrupted")
             process = subprocess.Popen(command, start_new_session=True, **kwargs)
             self.processes.append(process)
+        return process
+
+    def run(self, command, **kwargs):
+        process = self.start(command, **kwargs)
+        self.settle(process)
+        return process.wait()
+
+    def settle(self, process):
+        """Drain a started group before its leader is reaped."""
         try:
             # Leave the leader waitable until draining starts: its PID still
             # anchors ownership of the group even when only descendants run.
@@ -164,7 +176,6 @@ class FixtureRun:
                 pass  # stop() already drained and reaped this owned group.
         finally:
             self.drain([process])
-        return process.wait()
 
     def stop(self):
         with self.lock:
@@ -615,14 +626,14 @@ def load_resume(previous, tree, inputs, suites, flakes, unregistered=None):
     return proven, failures, waived, manifest
 
 
-def run_tests(command, assigned, *, on_failure=None, env=None):
+def run_tests(command, assigned, *, on_failure=None, env=None, start=subprocess.Popen, settle=None):
     reported, summaries, duplicates, headers = {}, [], [], []
     active = False
     started = last = time.monotonic()
     # The commutation harness writes directly to stderr during passing tests.
     # Merging it here splits libtest's partial "test name ... " stdout line.
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=None, env=env,
-                          text=True, bufsize=1) as process:
+    with start(command, stdout=subprocess.PIPE, stderr=None, env=env,
+               text=True, bufsize=1) as process:
         for line in process.stdout:
             header = re.fullmatch(r"running ([0-9]+) tests?\n?", line)
             if header:
@@ -645,6 +656,10 @@ def run_tests(command, assigned, *, on_failure=None, env=None):
             # Observed failures must reach the existing receipt protocol before
             # the line is forwarded: the proxy can die before its final receipt.
             print(line, end="", flush=True)
+        # An owned group is drained while its leader still holds the group id;
+        # reaping first would let a later signal reach a reused one.
+        if settle is not None:
+            settle(process)
         code = process.wait()
     passed = sum(r["status"] == "ok" for r in reported.values())
     failed = len(reported) - passed
@@ -1271,6 +1286,35 @@ def proof_environment(source):
     return env
 
 
+def run_with_resolver_fixtures(command, assigned, source):
+    """Run an isolated check as a SQL Server shard does: source the runner's
+    resolver fixtures, on containers this proof creates and removes (DEC-3088.1).
+
+    The connection variables and the image exist only in that child. The proof's
+    inputs digest stays the caller's environment, as the gate's does.
+    """
+    # Every name carries this process's id, the caller's prefix or names
+    # included: the sourced script reuses a container of its names, so two
+    # proofs on one name could share and remove each other's servers. A second
+    # proof on the same ports then fails to start and removes only its own.
+    pid = os.getpid()
+    env = dict(source, PBPS_LIVE_PREFIX=f"{source.get('PBPS_LIVE_PREFIX') or 'pbps-proof'}{pid}-")
+    for name in ("PBPS_TEST_MSSQL_NAME", "PBPS_TEST_MSSQL_SCRATCH_NAME"):
+        if env.get(name):
+            env[name] = f"{env[name]}-{pid}"
+    # The runner sets NAME to its own primary before sourcing the script; an
+    # inherited one would start, or reuse, a container outside the owned names.
+    env.pop("NAME", None)
+    # Only the two servers the script starts: an Express port the proof never
+    # uses must not refuse a caller's ports.
+    env = fixture_env("mssql", 0, env, kinds=("mssql", "mssql-scratch"))
+    # `set -e` first: a script that cannot be sourced must not reach the test.
+    shell = ["bash", "-c", 'set -e; source scripts/resolver-mssql-fixtures.sh; exec "$@"', "resolver-proof"]
+    with FixtureRun((env["PBPS_TEST_MSSQL_NAME"], env["PBPS_TEST_MSSQL_SCRATCH_NAME"])) as fixtures:
+        return run_tests([*shell, *command], assigned, env=env, start=fixtures.start,
+                         settle=fixtures.settle)
+
+
 def record_proof(argv):
     global ROOT
     parser = argparse.ArgumentParser(description="Record one isolated pass for rerun independence evidence")
@@ -1279,8 +1323,12 @@ def record_proof(argv):
     parser.add_argument("--python", help="whole Python check path, instead of a cargo test")
     parser.add_argument("--cargo-check", action="store_true", help="the whole canonical non-live Cargo step")
     parser.add_argument("--name", help="exact Rust test name")
+    parser.add_argument("--resolver-mssql-fixtures", action="store_true",
+                        help="start the SQL Server resolver fixtures for this one test, then remove them")
     parser.add_argument("cargo", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    require(not args.resolver_mssql_fixtures or not (args.python or args.cargo_check),
+            "--resolver-mssql-fixtures serves one exact Rust test, not a whole Python or Cargo check")
     args.output = args.output.resolve()
     if args.worktree is not None:
         ROOT = args.worktree.resolve(strict=True)
@@ -1308,9 +1356,14 @@ def record_proof(argv):
         require(args.name and args.cargo, "proof needs a cargo invocation and exact --name")
         cargo, flags, _ = libtest_args(args.cargo)
         name = args.name
-        results, code, _, valid, _ = run_tests(
-            ["cargo", *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
-             "--color=never", args.name], [args.name], env=proof_environment(env))
+        command = ["cargo", *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
+                   "--color=never", args.name]
+        child = proof_environment(env)
+        if args.resolver_mssql_fixtures:
+            ran = run_with_resolver_fixtures(command, [name], child)
+        else:
+            ran = run_tests(command, [name], env=child)
+        results, code, _, valid, _ = ran
     require(tree_identity(ROOT) == tree, "worktree changed during the isolated check")
     proof = {"version": 1, "commit": git_output(ROOT, "rev-parse", "HEAD").strip(),
              "tree": tree, "inputs": inputs, "cargo": cargo, "test": name,

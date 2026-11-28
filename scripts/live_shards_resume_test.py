@@ -14,6 +14,7 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import signal
 import subprocess
@@ -68,6 +69,9 @@ if os.environ.get("FAKE_STARTED"):
     Path(os.environ["FAKE_STARTED"]).touch()
 for name, expected in json.loads(os.environ.get("FAKE_REQUIRE_IMAGES", "{{}}")).items():
     assert os.environ.get(name) == expected, (name, os.environ.get(name), expected)
+if os.environ.get("FAKE_SIGNAL_PARENT"):
+    os.kill(os.getppid(), int(os.environ["FAKE_SIGNAL_PARENT"]))
+    time.sleep(120)
 ran = args[args.index("--color=never") + 1:]
 fail = set(json.loads(os.environ.get("FAKE_FAIL", "[]")))
 die = os.environ.get("FAKE_DIE")
@@ -144,6 +148,44 @@ cargo = ["cargo", "test", "-p", "demo", "--test", "tls", "--"]
 transport.run_case(cargo, "tls_verified", dict(os.environ))
 for _ in range(3):
     transport.run_case(cargo, "tls_untrusted", dict(os.environ))
+'''
+
+
+# The real SQL Server runner sources the resolver fixtures before its cargo calls.
+RESOLVER_RUNNER = '''#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n ${PBPS_LIVE_SHARD:-} && ${PBPS_LIVE_ACTIVE:-} != 1 ]]; then
+    exec python3 scripts/live-shards.py shard mssql "$@"
+fi
+NAME=${PBPS_TEST_MSSQL_NAME:-pbps-test-mssql}
+IMAGE=CURRENT_PIN
+export PBPS_TEST_DEV_IMAGE="${PBPS_TEST_DEV_IMAGE:-$IMAGE}"
+source scripts/resolver-mssql-fixtures.sh
+cargo test -p demo --lib -- --ignored "$@"
+cargo test -p demo --test second -- --ignored "$@"
+'''.replace("CURRENT_PIN", CURRENT_IMAGE)
+
+# One file per container, holding its image, so ownership and removal are visible.
+FAKE_DOCKER = '''#!PYTHON
+import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+state = Path(STATE)
+with open(str(state) + ".log", "a") as log:
+    log.write(json.dumps(args) + "\\n")
+if args[0] == "ps":
+    for container in sorted(state.iterdir()):
+        print(container.name)
+elif args[0] == "run":
+    with (state / args[args.index("--name") + 1]).open("x") as container:
+        container.write(args[-1])
+elif args[0] == "rm":
+    (state / args[-1]).unlink()
+elif args[0] == "exec":
+    if not (state / args[1]).exists():
+        sys.exit(1)
+    if "SELECT CONVERT" in args[-1]:
+        print("SQL_Latin1_General_CP1_CI_AS")
 '''
 
 
@@ -860,6 +902,301 @@ class IndependentFailures(Harness):
                 result, _ = self.drive("--resume", str(after), suite="python", check=int(fails))
                 if fails:
                     self.assertIn("targeted rerun failed", result.stderr)
+
+
+class ResolverFixtureProofs(Harness):
+    """A proof of a fixture-backed SQL Server test runs it as a shard does (DEC-3088.1).
+
+    The resolver fixtures script is the real one; only `docker`, the fixture
+    admission check and `cargo` are stand-ins.
+    """
+
+    SCRIPT = "scripts/resolver-mssql-fixtures.sh"
+    # The names a proof takes under an explicit prefix; by default the prefix
+    # carries the proof's process id (`owned`).
+    OWNED = ("pbps-proofs0-mssql", "pbps-proofs0-mssql-scratch")
+    DEFAULT_NAME = re.compile(r"pbps-proof([0-9]+)-s0-mssql(-scratch)?")
+    OTHER_IMAGE = "example/another-server@sha256:" + "5" * 64
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        shutil.copy(ROOT / cls.SCRIPT, cls.repo / cls.SCRIPT)
+        cls.image = re.search(r"^PBPS_RM_IMAGE=(.+)$", (ROOT / cls.SCRIPT).read_text(), re.MULTILINE)[1]
+        (cls.repo / "scripts/check-live-fixture.py").write_text(
+            "import os, sys\nsys.exit(int(os.environ.get('FAKE_FIXTURE_REFUSE', '0')))\n")
+        (cls.repo / "scripts/live-tests.sh").write_text(RESOLVER_RUNNER)
+        (cls.repo / "src").mkdir()
+        (cls.repo / "fixtures").mkdir()
+        (cls.repo / "src/cases.rs").write_text("\n".join(f"fn {n}() {{}}" for n in A_NAMES) + "\n")
+        (cls.repo / "fixtures/data.sql").write_text("SELECT 1;\n")
+        git(cls.repo, "add", "-A")
+        git(cls.repo, "commit", "-q", "-m", "resolver fixtures and a test module")
+        cls.master = git(cls.repo, "rev-parse", "HEAD")
+        git(cls.repo, "update-ref", "refs/remotes/origin/master", cls.master)
+        cls.containers = Path(cls.directory.name) / "containers"
+        cls.docker_log = Path(str(cls.containers) + ".log")
+        (cls.bin / "docker").write_text(FAKE_DOCKER.replace("PYTHON", sys.executable)
+                                        .replace("STATE", repr(str(cls.containers))))
+
+    evidence = IndependentFailures.evidence
+
+    def setUp(self):
+        IndependentFailures.setUp(self)
+        shutil.rmtree(self.containers, ignore_errors=True)
+        self.containers.mkdir()
+        self.docker_log.unlink(missing_ok=True)
+
+    def exported(self, port=26330, scratch_port=26332, image=None):
+        """What the runner's fixtures export to a test, on shard zero's default ports."""
+        server = "Server=localhost,{};User Id=sa;Password=Pbps!Test12345;TrustServerCertificate=true"
+        return {"PBPS_TEST_DB": server.format(port),
+                "PBPS_TEST_MSSQL_SCRATCH_DB": server.format(scratch_port),
+                "PBPS_TEST_RESOLVER_MSSQL_IMAGE": image or self.image}
+
+    def gate(self, *options, check, **settings):
+        env = {"FAKE_REQUIRE_IMAGES": json.dumps(self.exported())}
+        return self.drive(*options, suite="mssql", shards=1, env=env, check=check, **settings)[1]
+
+    def proof(self, *, worktree=None, env=None, requires=None, fixtures=True, check_args=None):
+        type(self).counter += 1
+        path = self.runs / f"resolver-proof-{self.counter}.json"
+        process_env = {k: v for k, v in os.environ.items()
+                       if not k.startswith(("PBPS_LIVE_", "PBPS_TEST_"))}
+        process_env.update(PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+                           FAKE_A=json.dumps(A_NAMES), FAKE_B=json.dumps(B_NAMES),
+                           FAKE_REQUIRE_IMAGES=json.dumps(requires or self.exported()))
+        process_env.update(env or {})
+        result = subprocess.run([sys.executable, str(self.repo / "scripts/live-shards.py"), "proof",
+            "--worktree", str(worktree or self.repo), "--output", str(path),
+            *(["--resolver-mssql-fixtures"] if fixtures else []),
+            *(check_args or ["--name", "a05", *CARGO, "--ignored"])],
+            env=process_env, text=True, capture_output=True, timeout=60)
+        return result, path
+
+    def docker_calls(self, verb):
+        if not self.docker_log.exists():
+            return []
+        return [c for c in map(json.loads, self.docker_log.read_text().splitlines()) if c[0] == verb]
+
+    def started(self):
+        return {c[c.index("--name") + 1]: c[-1] for c in self.docker_calls("run")}
+
+    def assertOwned(self, names):
+        """Both default names of one proof: its process id, shard zero."""
+        matches = [self.DEFAULT_NAME.fullmatch(n) for n in names]
+        self.assertTrue(all(matches), names)
+        self.assertEqual(len(names), 2, names)
+        self.assertEqual(len({m[1] for m in matches}), 1, names)
+        self.assertEqual({bool(m[2]) for m in matches}, {False, True}, names)
+
+    def remaining(self):
+        return sorted(p.name for p in self.containers.iterdir())
+
+    def refuse(self, before, evidence, label, path, message):
+        data = json.loads(evidence.read_text())
+        data["names"][0][label + "_pass"] = str(path)
+        evidence.write_text(json.dumps(data))
+        after = self.gate("--resume", str(before), "--rerun-unregistered", str(evidence), check=1)
+        self.assertIn(message, self.last_error)
+        self.assertFalse(after.exists())
+
+    def drive(self, *options, **settings):
+        result, output = super().drive(*options, **settings)
+        self.last_error = result.stderr
+        return result, output
+
+    def test_a_fixture_backed_proof_is_accepted_by_the_resume(self):
+        before = self.gate(fail=["a05"], check=1)
+        manifest = json.loads((before / "manifest.json").read_text())
+        self.gate("--resume", str(before), check=1)
+        self.assertIn("FAILED outside the unexpired known-flake register", self.last_error)
+        evidence = self.evidence(before)
+        data = json.loads(evidence.read_text())
+        master_tree = self.runs / f"master-resolver-{self.counter}"
+        git(self.repo, "worktree", "add", "--detach", str(master_tree), self.master)
+        for label, worktree in (("master", master_tree), ("head", self.repo)):
+            self.docker_log.unlink()
+            result, path = self.proof(worktree=worktree)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            proof = json.loads(path.read_text())
+            self.assertEqual((proof["status"], proof["inputs"]), ("ok", manifest["inputs"]))
+            self.assertOwned(set(self.started()))
+            self.assertEqual(set(self.started().values()), {self.image})
+            self.assertEqual(self.remaining(), [])
+            data["names"][0][label + "_pass"] = str(path)
+        evidence.write_text(json.dumps(data))
+        after = self.gate("--resume", str(before), "--rerun-unregistered", str(evidence), check=0)
+        self.assertEqual(self.summary(after)["mssql"]["union"], "exact")
+        self.assertEqual(self.summary(after)["run"]["targeted"][0]["test"], "a05")
+
+    def test_a_proof_with_a_different_resolver_image_is_refused(self):
+        before = self.gate(fail=["a05"], check=1)
+        refusal = "pass proof does not prove this exact isolated check"
+        # The script overrides a caller's image, as in a shard; the caller's
+        # value still marks the proof as taken in another environment.
+        result, path = self.proof(env={"PBPS_TEST_RESOLVER_MSSQL_IMAGE": self.OTHER_IMAGE})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(set(self.started().values()), {self.image})
+        self.refuse(before, self.evidence(before), "head", path, refusal)
+        # A tree that pins another image is another tree.
+        other = self.runs / f"other-resolver-{self.counter}"
+        git(self.repo, "worktree", "add", "--detach", str(other), "HEAD")
+        script = other / self.SCRIPT
+        script.write_text(script.read_text().replace(self.image, self.OTHER_IMAGE))
+        git(other, "commit", "-q", "-am", "another resolver image")
+        self.docker_log.unlink()
+        result, path = self.proof(worktree=other, requires=self.exported(image=self.OTHER_IMAGE))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(set(self.started().values()), {self.OTHER_IMAGE})
+        self.refuse(before, self.evidence(before), "head", path, refusal)
+
+    def test_connection_variables_exported_by_hand_still_change_the_inputs(self):
+        before = self.gate(fail=["a05"], check=1)
+        for name, value in self.exported().items():
+            for fixtures in (True, False):
+                with self.subTest(name=name, fixtures=fixtures):
+                    env = {name: value} if fixtures else self.exported()
+                    result, path = self.proof(env=env, fixtures=fixtures)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.refuse(before, self.evidence(before), "head", path,
+                                "pass proof does not prove this exact isolated check")
+
+    def test_a_pr_that_changes_the_resolver_fixtures_cannot_compare_two_servers(self):
+        script = self.repo / self.SCRIPT
+        script.write_text(script.read_text() + "# changed by the PR\n")
+        git(self.repo, "commit", "-q", "-am", "touch the resolver fixtures")
+        before = self.gate(fail=["a05"], check=1)
+        # The evidence's reviewed scope omits the script; the driver adds it.
+        after = self.gate("--resume", str(before), "--rerun-unregistered", str(self.evidence(before)), check=1)
+        self.assertIn("PR diff touches", self.last_error)
+        self.assertIn(self.SCRIPT, self.last_error)
+        self.assertFalse(after.exists())
+
+    def test_without_the_fixtures_the_test_gets_none_and_cannot_pass(self):
+        result, path = self.proof(fixtures=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(path.read_text())["status"], "FAILED")
+        self.assertFalse(self.docker_log.exists())
+
+    def test_a_fixture_that_does_not_start_runs_no_test_and_leaves_no_container(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                if missing:
+                    git(self.repo, "rm", "-q", self.SCRIPT)
+                    git(self.repo, "commit", "-q", "-m", "no resolver fixtures here")
+                started = self.runs / f"unexpected-test-{self.counter}"
+                result, path = self.proof(env={"FAKE_STARTED": str(started),
+                                               "FAKE_FIXTURE_REFUSE": str(int(not missing))})
+                self.assertNotEqual(result.returncode, 0)
+                proof = json.loads(path.read_text())
+                self.assertEqual((proof["status"], proof["valid"]), ("FAILED", False))
+                self.assertFalse(started.exists())
+                self.assertEqual(self.remaining(), [])
+
+    def test_a_failed_test_is_recorded_and_its_fixtures_are_removed(self):
+        result, path = self.proof(env={"FAKE_FAIL": '["a05"]'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(path.read_text())["status"], "FAILED")
+        self.assertOwned(set(self.started()))
+        self.assertEqual(self.remaining(), [])
+
+    def test_an_interrupted_proof_removes_its_fixtures_and_records_nothing(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signum=signum):
+                self.docker_log.unlink(missing_ok=True)
+                result, path = self.proof(env={"FAKE_SIGNAL_PARENT": str(int(signum))})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("fixture run interrupted", result.stderr)
+                self.assertOwned(set(self.started()))
+                self.assertEqual(self.remaining(), [])
+                self.assertFalse(path.exists())
+
+    def test_a_callers_prefix_or_names_never_lead_the_proof_to_anothers_containers(self):
+        # Another proof under the same prefix or names, or one of an older
+        # driver's fixed names (draft review round 2): none is reused or removed.
+        others = [*self.OWNED, "mine-s0", "mine-s0-scratch"]
+        for name in others:
+            (self.containers / name).write_text("another owner")
+        for env in ({"PBPS_LIVE_PREFIX": "pbps-proof"}, {"PBPS_TEST_MSSQL_NAME": "mine"}):
+            with self.subTest(env=env):
+                self.docker_log.unlink(missing_ok=True)
+                result, path = self.proof(env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(path.read_text())["status"], "ok")
+                self.assertFalse(set(self.started()) & set(others))
+                self.assertEqual(len(self.started()), 2)
+                self.assertFalse({c[-1] for c in self.docker_calls("rm")} & set(others))
+                self.assertEqual(self.remaining(), sorted(others))
+
+    def test_a_concurrent_proofs_default_containers_are_neither_reused_nor_removed(self):
+        # Another proof's servers, under the default names its own process id
+        # gives them (draft review round 1).
+        others = ("pbps-proof1-s0-mssql", "pbps-proof1-s0-mssql-scratch")
+        for name in others:
+            (self.containers / name).write_text("another proof")
+        result, path = self.proof()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(path.read_text())["status"], "ok")
+        self.assertOwned(set(self.started()))
+        self.assertFalse(set(self.started()) & set(others))
+        self.assertEqual(self.remaining(), sorted(others))
+        self.assertFalse({c[-1] for c in self.docker_calls("rm")} & set(others))
+
+    def test_an_inherited_name_cannot_point_the_proof_at_another_container(self):
+        (self.containers / "unrelated").write_text("another owner")
+        result, _ = self.proof(env={"NAME": "unrelated"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertOwned(set(self.started()))
+        self.assertEqual({c[1] for c in self.docker_calls("exec")}, set(self.started()))
+        self.assertEqual(self.remaining(), ["unrelated"])
+
+    def test_caller_chosen_fixture_names_and_ports_do_not_change_the_inputs(self):
+        before = self.gate(check=0)
+        self.docker_log.unlink(missing_ok=True)
+        result, path = self.proof(requires=self.exported(26350, 26352), env={
+            "PBPS_TEST_MSSQL_NAME": "mine", "PBPS_TEST_PORT": "26350",
+            "PBPS_TEST_MSSQL_SCRATCH_PORT": "26352"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(all(re.fullmatch(r"mine-[0-9]+-s0(-scratch)?", n) for n in self.started()),
+                        self.started())
+        self.assertEqual(len(self.started()), 2)
+        self.assertEqual(self.remaining(), [])
+        self.assertEqual(json.loads(path.read_text())["inputs"],
+                         json.loads((before / "manifest.json").read_text())["inputs"])
+
+    def test_a_port_only_the_unused_express_fixture_would_take_is_allowed(self):
+        # The proof starts no Express server, so the Express default port
+        # must not refuse a primary moved onto it (draft review round 3).
+        result, path = self.proof(requires=self.exported(26331, 26332),
+                                  env={"PBPS_TEST_PORT": "26331"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(path.read_text())["status"], "ok")
+        self.assertEqual(self.remaining(), [])
+
+    def test_a_proofs_test_group_is_drained_before_its_leader_is_reaped(self):
+        # Reaping first frees the group id, and the cleanup's signal could
+        # then reach a reused one (draft review round 3).
+        seen = []
+        with self.shards.FixtureRun(()) as fixtures:
+            def settle(process):
+                seen.append(process.returncode)
+                fixtures.settle(process)
+            ran = self.shards.run_tests(
+                [sys.executable, "-c", "print('running 0 tests')"], [],
+                start=fixtures.start, settle=settle)
+            self.assertEqual(seen, [None])
+            self.assertEqual(fixtures.processes, [])
+        self.assertEqual(ran[1], 0)
+
+    def test_a_whole_check_proof_refuses_the_resolver_fixtures(self):
+        for check_args in (["--cargo-check"], ["--python", "scripts/check-live-fixture.py"]):
+            with self.subTest(check_args=check_args):
+                result, path = self.proof(check_args=check_args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--resolver-mssql-fixtures serves one exact Rust test", result.stderr)
+                self.assertFalse(self.docker_log.exists())
+                self.assertFalse(path.exists())
 
 
 class WholeCargoChecks(Harness):
