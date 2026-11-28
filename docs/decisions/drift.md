@@ -223,6 +223,9 @@ direction. It never reads `__pbps_state`, takes no lock and writes nothing.
   before the comparison and reported as `diff.not-compared`, never as a
   create. An object the read holds is compared whatever part of it was left
   out. One rule for every kind of object the read can omit, not one per kind.
+  An undeclared relation the read left out still exists, so it is listed as
+  unmanaged and `unmanaged: error` refuses it, as the plan's read
+  (`managed_state_once`) counts it.
 - **Declaration problems are exit 1.** Exit 2 means the database differs;
   declarations that do not load leave the question unanswered.
 - **Outside the comparison:** roles, grants, row security and declared rows.

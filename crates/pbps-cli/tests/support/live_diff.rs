@@ -286,6 +286,35 @@ pub fn what_was_not_compared_is_listed_and_is_no_difference(server: &str, pg: bo
     let out = human(&d, own.connection(), 0);
     assert!(stdout(&out).contains("No differences."), "{}", stdout(&out));
     assert!(stderr(&out).contains(part), "{}", stderr(&out));
+
+    // A table the reader leaves out whole, outside the declarations, is
+    // still unmanaged: `unmanaged: error` refuses it like any other.
+    // `other` goes first, so that `ruled` alone is what is refused.
+    if pg {
+        on_server(own.connection(), "DROP TABLE app.other");
+        on_server(own.connection(), "CREATE TABLE app.ruled (id int NOT NULL)");
+        on_server(
+            own.connection(),
+            "CREATE RULE ruled_insert AS ON INSERT TO app.ruled DO INSTEAD NOTHING",
+        );
+        let report = answer(&d, own.connection(), 0);
+        let unmanaged = listed(&report, "unmanaged");
+        assert!(
+            unmanaged.len() == 1 && unmanaged[0].contains("ruled"),
+            "{report:#}"
+        );
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!("dialect: {dialect}\nunmanaged: error\n"),
+        )
+        .unwrap();
+        let report = answer(&d, own.connection(), 2);
+        assert!(
+            finding_ids(&report).contains(&"diff.unmanaged-refused"),
+            "{report:#}"
+        );
+        std::fs::write(d.dir.join("pbps.yml"), format!("dialect: {dialect}\n")).unwrap();
+    }
 }
 
 /// Acceptance 4, as amended: names are all this command pairs by.
