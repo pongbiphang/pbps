@@ -17,8 +17,8 @@ pub(super) fn cut_report(
     warnings.emit(permissions.into_iter().map(|message| {
         crate::output::Finding::warning("catalog.unexpressible-permission", message)
     }));
-    // No sequence is judged here: this read has no declarations or record to
-    // say which sequences are the project's, and calling every one of them
+    // No sequence is judged here: no caller passes this read its list of
+    // sequences yet (#3124), and with none, calling every one of them
     // unmanaged would refuse a valid apply (see `unmanaged_objects`).
     report_unmanaged(&scoped, unreadable, ids, modules, None, unmanaged.unmanaged)?;
     Ok(scoped)

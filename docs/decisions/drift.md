@@ -261,7 +261,9 @@ nor refused under `unmanaged: error`.
   identity (DEC-2721.1), so which ones are the project's is only known to the
   command: the record for `verify` and `status`, the declarations for `diff`,
   both for `plan --db` (a recorded one the declarations dropped is one the plan
-  drops). The read's own policy, which `apply` and `bootstrap` run inside the
-  managed read, has no such reference and judges no sequence: calling every one
-  unmanaged there would refuse a valid apply. Rejected: giving sequences an
+  drops). The policy that runs inside the managed read (`snapshot`,
+  `baseline`, `bootstrap`, `apply`) is passed no list and judges no sequence:
+  passing none is safe, while an empty or wrong list would call every sequence
+  unmanaged and refuse a valid apply, whose closing read holds no declarations.
+  Giving those callers their lists is #3124. Rejected: giving sequences an
   identity, which is a format change far larger than this gap.

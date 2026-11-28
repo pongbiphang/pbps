@@ -472,8 +472,8 @@ pub(crate) fn unreadable_objects(
 /// `sequences` names the standalone sequences the command manages. A sequence
 /// has no identity (DEC-2721.1), so only the caller knows which are its own:
 /// the record for `verify` and `status`, the declarations for `diff`, both for
-/// `plan --db`. `None` judges none of them, for the read's own policy, which
-/// has no such reference.
+/// `plan --db`. `None` judges none of them, for the policy inside the managed
+/// read, which is passed no list yet (#3124).
 pub(crate) fn unmanaged_objects(
     scoped: &pbps_diff::Scoped,
     unreadable: &[(pbps_db::catalog::LimitationTarget, String)],
