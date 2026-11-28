@@ -1164,8 +1164,6 @@ impl PlanSession for pbps_mssql::Mssql {
             frame.recorded.ids,
         )
         .await?;
-        // SQL Server keeps its existing reference-data execution policy, so
-        // no guard is prepared for the rows a plan writes.
         Ok(FinalOrderChecks {
             rebuilds,
             drop_blockers,

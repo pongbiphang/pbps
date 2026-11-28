@@ -244,3 +244,46 @@ fn a_partition_shaped_table_change_is_refused_and_a_stray_row_limit_is_ignored()
     });
     assert_eq!(answer(detach), Answer::Unsupported);
 }
+
+/// A managed row change is refused where its statements would be written,
+/// which is before any connection: nothing later in a plan or an apply has to
+/// refuse it again (DEC-2798.19). Negative: a table drop is written.
+#[test]
+fn a_managed_row_change_is_refused_by_the_emitter_before_any_connection() {
+    use pbps_model::{DataMode, RowChange};
+    use std::collections::BTreeSet;
+
+    let cases = [
+        (
+            "data mode",
+            RowChange::SetDataMode {
+                table: tn("t"),
+                from: None,
+                to: Some(DataMode::Exact),
+            },
+        ),
+        (
+            "ensure keys",
+            RowChange::SetEnsureKeys {
+                table: tn("t"),
+                from: BTreeSet::new(),
+                to: BTreeSet::new(),
+            },
+        ),
+    ];
+    for (label, change) in cases {
+        match statements(&Sqlite::default(), Change::Row(change)) {
+            Err(DialectError::NotBuilt { part, .. }) => {
+                assert!(part.contains("declared rows"), "{label}: {part}");
+            }
+            Err(other) => panic!("{label}: {other:?}"),
+            Ok(out) => panic!("{label}: a statement was written: {:?}", sql_text(&out)),
+        }
+    }
+    let drop = Change::Table(pbps_model::TableChange::DropTable {
+        uid: uid(UidKind::Table, "t"),
+        name: tn("t"),
+        detach_from: None,
+    });
+    assert!(statements(&Sqlite::default(), drop).is_ok());
+}

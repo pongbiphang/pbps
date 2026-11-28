@@ -33,13 +33,13 @@ fn has_partition_rebuild(changes: &ChangeSet) -> bool {
 }
 
 impl ApplySession for Sqlite {
-    type State = Transaction;
+    type State = Transaction<Self>;
     /// Trivial state accessor: returns the neutral transaction evidence.
-    fn state<'s>(&self, state: &'s mut Self::State) -> &'s mut Transaction {
+    fn state<'s>(&self, state: &'s mut Self::State) -> &'s mut Transaction<Self> {
         state
     }
     /// Trivial state accessor: returns the neutral transaction evidence.
-    fn evidence<'s>(&self, state: &'s Self::State) -> &'s Transaction {
+    fn evidence<'s>(&self, state: &'s Self::State) -> &'s Transaction<Self> {
         state
     }
     /// Does not exist on this engine: SQLite compares expressions as text and
@@ -700,42 +700,6 @@ impl ApplySession for Sqlite {
         }
         Ok(())
     }
-    /// Does not exist on this engine in v0: managed rows and triggers are both
-    /// refused by `pbps_sqlite::validate` as not built yet; refuses if a plan
-    /// carries row changes, otherwise returns an empty guard.
-    async fn prepare_data_writes(
-        &self,
-        _conn: &mut Conn,
-        _admission: &RoutineAdmission,
-        changes: &ChangeSet,
-        _baseline: &StateSnapshot,
-        _planned_ids: &IdsFile,
-    ) -> anyhow::Result<DataWriteGuard> {
-        refuse_if(
-            has_change(changes, |c| matches!(c, Change::Row(_))),
-            "SQLite does not support managed row writes yet",
-        )?;
-        Ok(DataWriteGuard::default())
-    }
-    /// Does not exist on this engine in v0: managed row writes are not built
-    /// yet; refuses a row-write statement and accepts non-row DDL.
-    async fn check_data_write(
-        &self,
-        _conn: &mut Conn,
-        _admission: &RoutineAdmission,
-        statement: &pbps_dialect::Statement,
-        _guard: &DataWriteGuard,
-    ) -> anyhow::Result<()> {
-        refuse_if(
-            statement.row_write.is_some(),
-            "SQLite does not support managed row writes yet",
-        )
-    }
-    /// Does not exist on this engine: SQLite has no PostgreSQL deferred
-    /// constraint triggers to settle before closing.
-    async fn settle_writes(&self, _conn: &mut Conn) -> anyhow::Result<bool> {
-        Ok(false)
-    }
     /// Does not exist on this engine: SQLite has no type, provider or
     /// trusted-role pins; refuses if a plan carries any.
     async fn replay_type_pins(
@@ -1251,7 +1215,7 @@ mod tests {
                 .expect("ok")
                 .is_none()
         );
-        assert!(!now(dialect.settle_writes(&mut conn)).expect("ok"));
+        assert!(!now(features::data_triggers::settle(&dialect, &mut conn)).expect("ok"));
         assert!(
             now(dialect.extension_prerequisites(&mut conn, &BTreeMap::new()))
                 .expect("ok")

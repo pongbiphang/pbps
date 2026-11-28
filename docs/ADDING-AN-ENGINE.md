@@ -60,6 +60,9 @@ writing code.
   `validate_plan_analysis`.
 - **`crates/pbps-cli/src/engine/profile.rs`**: add a full `Profile` value (no
   `..Default`) and wire it into `profile(driver)`.
+- **`crates/pbps-cli/src/engine/features.rs`**: implement `Features` for the
+  concrete dialect, choosing each feature's implementation or `Absent`
+  (DEC-2798.19).
 - **`crates/pbps-cli/src/engine/plan_session.rs`** and
   **`crates/pbps-cli/src/engine/apply_session.rs`**: implement `PlanSession`
   and `ApplySession` for the concrete dialect, and add the arm in
@@ -70,7 +73,8 @@ writing code.
 
 **Who tells you if you forget:**
 - The **compiler** fails on every exhaustive `match` on `DialectName`, `Driver`,
-  and `SelectedDialect`, on any missing `Profile` field, and on any required
+  and `SelectedDialect`, on any missing `Profile` field, when an engine has no
+  `impl Features` or omits a feature associated type, and on any required
   `Engine`, `PlanSession`, `ApplySession`, or `PlanningDialect` trait item.
 - `pbps-cli`'s `engine::engine_list_tests::every_cross_crate_engine_list_matches_dialect_name_all`
   fails if `Driver::ALL` or `support::Engine::ALL` is not in exact bijection

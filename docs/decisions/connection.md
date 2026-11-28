@@ -1786,3 +1786,66 @@ and CI/runner registries drift silently without failing a build.
   `scripts/engine-ci.json`, and appears in `docs/SPEC.md` §11.3 and
   `docs/ARCHITECTURE.md`. What no mechanical check can catch is documented in
   `docs/ADDING-AN-ENGINE.md`.
+
+<a id="dec-2798-19"></a>
+
+**DEC-2798.19. Optional connected engine features are associated types on
+`engine::features::Features`, with a zero-sized `Absent` marker and thin
+free-function entry points; `data_triggers` is the first (#2798).** Putting
+engine-specific operations directly on `ApplySession` forced every engine that
+lacks a mechanism to carry boilerplate stub methods and cross-engine state
+wrappers (`DataWriteGuard` holding an `Option<pbps_pg::data_triggers::Guard>`
+in `engine.rs`), while duplicating plan-time calls across `PlanSession`
+implementations.
+
+- **One associated type per feature on one trait.** `engine::features::Features`
+  declares one associated type per optional capability (starting with
+  `type DataTriggers: data_triggers::Feature<Self>`). Every engine implements
+  `Features` in `crates/pbps-cli/src/engine/features.rs`, choosing either a real
+  implementation (`data_triggers::Postgres`) or the module's `Absent` marker.
+  Associated types have no defaults in stable Rust, so adding a feature or an
+  engine stops the build until every engine makes an explicit, visible choice.
+- **`Absent` is a type, not a default method.** An engine without a feature
+  writes one line (`type DataTriggers = data_triggers::Absent;`) and zero method
+  bodies, yet its choice stays visible in `impl Features` and exhaustive under
+  the compiler.
+- **The guard belongs to the feature.** Each `Feature<E>` defines its own
+  associated `type Guard: Default`, projected as `data_triggers::Guard<E>` and
+  carried inside generic `Transaction<E: Features>`. `Absent::Guard` is `()`, so
+  engines without trigger authentication carry zero bytes and `engine.rs` no
+  longer names `pbps_pg::data_triggers::Guard`.
+- **Callers use the module's thin free functions.** `with_plan_dialect!` binds a
+  concrete `dialect` value without introducing a type parameter `D` in scope, so
+  callers cannot write `D::DataTriggers::prepare(...)` inside macro blocks.
+  Module-level `data_triggers::{prepare, check, settle}` dispatch through `E`
+  uniformly across `plan_db.rs`, `apply.rs`, `apply_session.rs` and tests
+  without importing `Feature`. Parity tests use a small
+  `const fn is_present<E: Features>() -> bool` helper to avoid `E0283` when an
+  engine's associated type normalizes to generic `Absent`.
+- **`Absent` refuses marked statements and never `Change::Row`.**
+  `Absent::prepare` returns `Ok(())` even when a plan carries `Change::Row(_)`,
+  because SQL Server applies managed reference-data rows without PostgreSQL's
+  trigger authenticator. `Absent::settle` returns `Ok(false)`. `Absent::check`
+  refuses any statement carrying `row_write` or `rewrites` annotations, naming
+  the engine through `PlanningDialect::NAME` (`"SQL Server"`, `"SQLite"`).
+- **SQLite's `Change::Row` refusal stays in `pbps-sqlite`, not in the session.**
+  The session does not have to refuse a row change on SQLite, because none
+  can be sealed or applied: `pbps_sqlite::validate` refuses a declared `data:`, so the
+  differ is given none; `SqliteEngine::read_rows` refuses any row scope a
+  recorded state carries; and `pbps_sqlite::emit::refused::row` refuses every
+  `RowChange` variant when a plan is lowered to statements, which `plan` does
+  before it seals and `apply` does before it connects. The session-level
+  `Change::Row` check repeated the last of these and was removed, and the emitter's
+  refusal is pinned in `pbps-sqlite`'s own refusal tests.
+
+Rejected:
+
+- **Default methods on the session trait**: an engine silently inherits "nothing
+  to do" when a new capability or a new engine is added, hiding omitted support
+  from the compiler.
+- **A runtime capability flag**: a forgotten check becomes a silent skip at run
+  time instead of a compile-time choice, and still forces every engine's
+  transaction state to carry unused guard storage.
+- **A macro that generates features**: one feature does not justify code
+  generation, and hiding trait definitions behind a macro obscures signatures
+  and compiler diagnostics.

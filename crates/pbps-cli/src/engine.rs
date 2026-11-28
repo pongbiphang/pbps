@@ -169,6 +169,9 @@ pub(crate) use profile::CommandFeature;
 // answer is a value; selected by `require_owned_test` (#2798).
 mod owned_test;
 pub(crate) use owned_test::OwnedTest;
+// Optional per-engine features: each engine names its implementation or Absent (DEC-2798.19).
+pub(crate) mod features;
+pub(crate) use features::Features;
 // The engine's steps of a connected plan, reached at named positions (#2798).
 pub(crate) mod apply_session;
 pub(crate) use apply_session::ApplySession;
@@ -2089,12 +2092,6 @@ fn refuse_unaccounted_dependents(
         );
     }
     Ok(())
-}
-
-/// Holds only trigger identities authenticated in the caller's open transaction.
-#[derive(Default)]
-pub struct DataWriteGuard {
-    postgres: Option<pbps_pg::data_triggers::Guard>,
 }
 
 /// Artifact readers route by the engine named in the saved file, without a

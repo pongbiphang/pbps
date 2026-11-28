@@ -83,6 +83,16 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   (`type Resolver = NoResolver<Self>` when it has none); resolver code reads
   those facts from that type and adds no `Driver` comparison for them
   (DEC-2798.5).
+- Optional connected capabilities that only some engines have (starting with
+  `data_triggers`) live as modules under `pbps-cli`'s `engine::features`,
+  declared as one associated type per feature on `engine::features::Features`
+  (DEC-2798.19). Each feature module owns its trait, its per-transaction guard
+  or state type, its real implementation(s), a zero-sized `Absent` marker, and
+  thin free functions callers invoke. An engine without a feature declares
+  `type <Feature> = <mod>::Absent;` in `impl Features` — one line and no method
+  bodies — while the compiler still refuses to build any engine that omits the
+  declaration. The next optional capability goes in a new module under
+  `engine::features/` with a new associated type on `Features`.
 - `pbps-sqlite` depends on `pbps-db`, `pbps-dialect` and `pbps-diff` (the
   sealed plan its emitter reads, as `pbps-pg` does). `DialectName`, `Driver`,
   `Conn`, `PlanSession`, `ApplySession` and `Profile` all carry SQLite, so

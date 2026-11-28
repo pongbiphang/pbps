@@ -243,7 +243,7 @@ pub(crate) struct MaintainedParent {
 /// The methods are listed in the order the pipeline calls them. See the module
 /// documentation for the rules.
 #[allow(async_fn_in_trait)]
-pub(crate) trait PlanSession: crate::emission::Engine {
+pub(crate) trait PlanSession: Features {
     /// What the engine keeps for itself from one position to a later one in
     /// the same plan. The pipeline creates it empty and passes it back.
     ///
@@ -671,10 +671,9 @@ pub(crate) trait PlanSession: crate::emission::Engine {
 
     /// The checks that read the final order, in the planning transaction: a
     /// module rebuild's catalog state, what a dropped or retyped object
-    /// blocks, the logical slots a row move is decoded by, the publications
-    /// and slots a numbered column's fill misses, and the guard that
-    /// authenticates the triggers the plan's row writes meet. The rows are
-    /// returned for neutral code to put in their contract order.
+    /// blocks, the logical slots a row move is decoded by, and the publications
+    /// and slots a numbered column's fill misses. The rows are returned for
+    /// neutral code to put in their contract order.
     ///
     /// A `not_applicable` row naming the engine for each when the plan asks
     /// nothing of it; refuses when it does and the engine has no step.
@@ -1579,24 +1578,6 @@ pub(crate) mod defaults {
         ))
     }
 
-    /// The changes the PostgreSQL guard prepares for: the row statements, and
-    /// whatever rewrites a table's stored rows (`rewrite_write`).
-    pub(crate) fn data_writes(engine: &str, changes: &ChangeSet) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !changes.changes.iter().any(|p| matches!(
-                p.change,
-                pbps_model::Change::Row(pbps_model::RowChange::InsertRow { .. })
-                    | pbps_model::Change::Row(pbps_model::RowChange::UpdateRow { .. })
-                    | pbps_model::Change::Row(pbps_model::RowChange::DeleteRow { .. })
-            ) || pbps_pg::existing_expressions::rewrite_write(
-                &p.change
-            )
-            .is_some()),
-            "{engine} has no step that authenticates the triggers a row write or rewrite of this plan meets"
-        );
-        Ok(())
-    }
-
     pub(crate) fn final_order(
         engine: &'static str,
         changes: &ChangeSet,
@@ -1606,7 +1587,6 @@ pub(crate) mod defaults {
         let drop_blockers = drop_blockers(engine, changes)?;
         let logical_slots = logical_slots(engine, changes)?;
         let numbered_column_fills = numbered_column_fills(engine, changes)?;
-        data_writes(engine, changes)?;
         Ok(FinalOrderChecks {
             rebuilds,
             drop_blockers,
@@ -2215,12 +2195,6 @@ mod tests {
         )]);
         let message = refusal(defaults::numbered_column_fills(THIRD, &numbered));
         assert!(message.contains("identity or serial"), "{message}");
-        let rewrite = retype_plan();
-        let message = refusal(defaults::data_writes(THIRD, &rewrite));
-        assert!(
-            message.contains(THIRD) && message.contains("triggers"),
-            "{message}"
-        );
         // The row checks are asked in order: the first refusal wins.
         let mut both = plan(vec![pbps_model::Change::Table(
             pbps_model::TableChange::DropTable {
@@ -2229,7 +2203,7 @@ mod tests {
                 detach_from: None,
             },
         )]);
-        both.changes.extend(retype_plan().changes);
+        both.changes.extend(numbered.changes);
         let message = refusal(defaults::final_order(THIRD, &both));
         assert!(message.contains("depends"), "{message}");
     }
@@ -2506,7 +2480,7 @@ mod tests {
     }
 
     #[test]
-    fn a_numbering_change_and_a_table_rewrite_are_read_by_the_final_order_defaults() {
+    fn a_numbering_change_is_read_by_the_final_order_defaults() {
         let renumbered = plan(vec![pbps_model::Change::Column(
             pbps_model::ColumnChange::AlterColumnNumbering {
                 uid: uid(pbps_model::UidKind::Column, "app.t.a"),
@@ -2527,18 +2501,6 @@ mod tests {
             },
         )]);
         defaults::drop_blockers(THIRD, &check).unwrap();
-        // A column type change rewrites the table's rows, which the guard
-        // authenticates the triggers for even though no row is written.
-        let retype = retype_plan();
-        assert!(
-            retype
-                .changes
-                .iter()
-                .all(|p| pbps_pg::existing_expressions::rewrite_write(&p.change).is_some())
-        );
-        let message = refusal(defaults::data_writes(THIRD, &retype));
-        assert!(message.contains("rewrite"), "{message}");
-        defaults::data_writes(THIRD, &check).unwrap();
     }
 
     fn row(name: &'static str) -> ConnectedCheck {
