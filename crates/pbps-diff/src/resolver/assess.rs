@@ -51,6 +51,7 @@ pub enum UnaffectedReason {
 pub struct Assessment {
     pub questions: BTreeMap<Surface, Answer>,
     unaffected_reasons: BTreeMap<Surface, UnaffectedReason>,
+    unbound_bodies: BTreeSet<Surface>,
 }
 
 impl Assessment {
@@ -75,6 +76,17 @@ impl Assessment {
             .values()
             .filter(|r| **r == reason)
             .count()
+    }
+
+    /// How many kept surfaces of a plan that moves names have a body the
+    /// engine did not bind when it created them, whatever the answer to their
+    /// header: a header that is a question, or that a resolver answers, leaves
+    /// the body as unchecked as a proven one does. Known only from the facts,
+    /// so zero without them; a plan that moves no name moves nothing such a
+    /// body could find either, and counts none.
+    #[must_use]
+    pub fn unbound_bodies(&self) -> usize {
+        self.unbound_bodies.len()
     }
 
     /// The surfaces only an engine can answer, in order.
@@ -363,7 +375,18 @@ fn assessed_with_facts(
     let narrowing = facts.and_then(|f| Narrowing::prepare(f, &classified.effects));
     let mut questions = BTreeMap::new();
     let mut unaffected_reasons = BTreeMap::new();
+    let mut unbound_bodies = BTreeSet::new();
     for (surface, kept, rebuilt) in classified.kept {
+        // Read from the facts and not from the answer below: the narrowing
+        // may be refused for the whole plan, or this header may be touched,
+        // and the body is unbound all the same.
+        if !rebuilt
+            && classified.effects.moves_bindings
+            && let Some(SurfaceDependencies::Unparsed(_)) =
+                facts.and_then(|f| f.surfaces.get(&surface))
+        {
+            unbound_bodies.insert(kept.clone());
+        }
         let (answer, reason) = if rebuilt {
             (Answer::Rebuild, None)
         } else if !classified.effects.moves_bindings {
@@ -391,6 +414,7 @@ fn assessed_with_facts(
     Assessment {
         questions,
         unaffected_reasons,
+        unbound_bodies,
     }
 }
 
@@ -3469,7 +3493,19 @@ mod dependency_facts_tests {
                 proven.then_some(UnaffectedReason::Unparsed),
                 "{label}"
             );
+            // Its body is unbound whether or not its header is a question.
+            assert_eq!(found.unbound_bodies(), 1, "{label}");
         }
+        // Without the facts nothing says which bodies are unbound, and a
+        // plan that moves no name counts none even with them.
+        assert_eq!(
+            run(&schema, &schema, arriving("early.h(int)"), None).unbound_bodies(),
+            0
+        );
+        assert_eq!(
+            run(&schema, &schema, Vec::new(), Some(&facts)).unbound_bodies(),
+            0
+        );
     }
 
     /// A table moved to another schema carries its indexes and owned

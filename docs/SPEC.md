@@ -3604,11 +3604,24 @@ DEC-1674.1).**
   to eliminate them is not the design. The questions are the default,
   generated, CHECK, expression-index and module surfaces the target holds and
   the plan keeps. One the plan recreates from its declaration is proven to
-  rebuild. The rest are proven unaffected only when the plan changes nothing a
+  rebuild. The rest are proven unaffected when the plan changes nothing a
   name lookup could reach — no relation, column, relation-namespace index
-  name, module or schema grant arrives, leaves or changes type; otherwise all
-  of them require resolution. ADR-0013's candidate rebuild of an unchanged
-  module is such a question, not its answer (DEC-1515.1).
+  name, module or schema grant arrives, leaves or changes type. ADR-0013's
+  candidate rebuild of an unchanged module is such a question, not its answer
+  (DEC-1515.1). When the plan does change such a name, a surface is still
+  proven unaffected where the engine supplies the dependencies it recorded at
+  creation and they show that the surface reads nothing the plan touches and
+  could not find an arriving name instead (PostgreSQL, DEC-2987.1); every
+  surface not so proven requires resolution. The plan's report gives the two
+  proofs apart.
+- **A routine body the engine does not bind at creation is not checked.** A
+  procedural or string-bodied routine has no creation-time binding, so neither
+  the assessment nor a resolver has anything of its body to compare. Its
+  header (parameter and return types, parameter defaults) is checked like any
+  other surface, and may be proven unaffected or need the resolver like one.
+  Whatever that answer, a plan that moves names says in its report how many
+  kept bodies were not checked, where the engine's dependency facts were
+  read; what a body finds when it runs is left to the routine's own tests.
 - A **selected** resolver that the plan requires but that is unavailable,
   incompatible or inconclusive prevents writing either deployable plan or SQL
   output. Diagnostics name the object, uncertainty and remedy. With no

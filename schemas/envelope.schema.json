@@ -1789,7 +1789,19 @@
           "$ref": "#/$defs/ResolutionNeed"
         },
         "unaffected": {
-          "description": "Kept surfaces nothing in the plan can rebind.",
+          "description": "Kept surfaces nothing in the plan can rebind, whatever the reason.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "proven_by_dependency": {
+          "description": "Of `unaffected`, those the plan could have reached by name, and that\nthe dependencies the engine recorded prove it does not (DEC-2987.1).\nApart from the rest because it is a proof from the catalog, not from\nthe plan alone.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "body_not_checked": {
+          "description": "Kept routines whose body the engine did not bind when it created\nthem, whatever the answer to their header: unaffected, or answered by\nthe resolver. Neither checks the body (DEC-2987.1), which a reader must\nbe able to tell from a proof. Known from the engine's dependency\nfacts, so zero where none were read.",
           "type": "integer",
           "format": "uint",
           "minimum": 0
@@ -1821,6 +1833,8 @@
       "required": [
         "need",
         "unaffected",
+        "proven_by_dependency",
+        "body_not_checked",
         "rebuilt"
       ]
     },
